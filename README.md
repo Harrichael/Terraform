@@ -112,9 +112,9 @@ src/
 | `Folder` | Directory |
 | `Module` | Rust `mod`, Python packages |
 | `File` | Source file |
-| `Class` | `struct`, `enum`, `trait`, `impl`, `class` |
-| `Function` | `fn`, method, `def` |
-| `Block` | `if`/`for`/`while`/`match`/`switch` constructs |
+| `Class` | `struct`, `enum`, `trait`, `impl`, `class`, `interface`, `type alias`, SQL table/view |
+| `Function` | `fn`, method, `def`, TypeScript method signature |
+| `Block` | `if`/`for`/`while`/`match`/`switch` constructs, SQL statements |
 | `Line` | Individual source lines |
 | `SymRef` | Symbolic reference pointing to a canonical lib definition |
 
@@ -126,7 +126,7 @@ src/
 |-----------|---------|
 | TUI framework | [ratatui](https://github.com/ratatui-org/ratatui) |
 | Terminal backend | [crossterm](https://github.com/crossterm-rs/crossterm) |
-| Parsing | [tree-sitter](https://tree-sitter.github.io/) (Rust, Python, JavaScript) |
+| Parsing | [tree-sitter](https://tree-sitter.github.io/) (Rust, Python, JavaScript, TypeScript, TSX, SQL) |
 | CLI arguments | [clap](https://github.com/clap-rs/clap) |
 
 ---

@@ -12,6 +12,9 @@ pub enum SourceLanguage {
     Rust,
     Python,
     JavaScript,
+    TypeScript,
+    Tsx,
+    Sql,
     PlainText,
 }
 
@@ -22,6 +25,9 @@ impl SourceLanguage {
             "rs" => SourceLanguage::Rust,
             "py" => SourceLanguage::Python,
             "js" | "mjs" | "cjs" => SourceLanguage::JavaScript,
+            "ts" => SourceLanguage::TypeScript,
+            "tsx" => SourceLanguage::Tsx,
+            "sql" => SourceLanguage::Sql,
             _ => SourceLanguage::PlainText,
         }
     }
@@ -255,6 +261,9 @@ fn ts_language(lang: &SourceLanguage) -> Language {
         SourceLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
         SourceLanguage::Python => tree_sitter_python::LANGUAGE.into(),
         SourceLanguage::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        SourceLanguage::Sql => tree_sitter_sequel::LANGUAGE.into(),
         SourceLanguage::PlainText => unreachable!(),
     }
 }
@@ -358,11 +367,48 @@ fn classify_ts_node<'a>(node: &Node<'a>) -> Option<(NodeKind, Option<Node<'a>>)>
         // JS-only basic constructs
         "for_in_statement" | "switch_statement" => Some((NodeKind::Block, None)),
 
-        // ── Shared Python + JS basic constructs ──────────────────────────
+        // ── TypeScript-only constructs ────────────────────────────────────
+        // TypeScript files are also matched by the JS patterns above; the
+        // entries below cover TS-specific node types not present in JS.
+        // Interfaces, type aliases, and enums map to Class.
+        "interface_declaration" => Some((NodeKind::Class, node.child_by_field_name("name"))),
+        "type_alias_declaration" => Some((NodeKind::Class, node.child_by_field_name("name"))),
+        "enum_declaration" => Some((NodeKind::Class, node.child_by_field_name("name"))),
+        // Namespaces / internal modules map to Module.
+        "internal_module" => Some((NodeKind::Module, node.child_by_field_name("name"))),
+        // Abstract / interface method signatures map to Function.
+        "abstract_method_signature" | "method_signature" => {
+            Some((NodeKind::Function, node.child_by_field_name("name")))
+        }
+
+        // ── SQL (tree-sitter-sequel) ──────────────────────────────────────
+        // Tables and views are class-level constructs; the name lives in the
+        // first `object_reference` named child.
+        "create_table" => {
+            let name_node = find_named_child_by_kind(node, "object_reference");
+            Some((NodeKind::Class, name_node))
+        }
+        "create_view" => {
+            let name_node = find_named_child_by_kind(node, "object_reference");
+            Some((NodeKind::Class, name_node))
+        }
+        // Individual SQL statements (SELECT, INSERT, …) are shown as Blocks.
+        "statement" => Some((NodeKind::Block, None)),
+
+        // ── Shared Python + JS + TS basic constructs ─────────────────────
+        // Note: Python uses `if_statement` / `for_statement` / `while_statement`,
+        // JS/TS use the same names, so these are truly shared across three languages.
         "if_statement" | "for_statement" | "while_statement" => Some((NodeKind::Block, None)),
 
         _ => None,
     }
+}
+
+/// Return the first named child whose `kind()` equals `kind_str`, if any.
+fn find_named_child_by_kind<'a>(node: &Node<'a>, kind_str: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind_str)
 }
 
 fn extract_node_text(node: Node<'_>, source: &[u8]) -> String {
@@ -477,6 +523,179 @@ fn example() {
         assert_eq!(SourceLanguage::from_extension("rs"), SourceLanguage::Rust);
         assert_eq!(SourceLanguage::from_extension("py"), SourceLanguage::Python);
         assert_eq!(SourceLanguage::from_extension("txt"), SourceLanguage::PlainText);
+        assert_eq!(SourceLanguage::from_extension("ts"), SourceLanguage::TypeScript);
+        assert_eq!(SourceLanguage::from_extension("tsx"), SourceLanguage::Tsx);
+        assert_eq!(SourceLanguage::from_extension("sql"), SourceLanguage::Sql);
+    }
+
+    const TYPESCRIPT_SRC: &str = r#"
+interface Animal {
+    name: string;
+    speak(): void;
+}
+
+type Result<T> = { value: T } | null;
+
+enum Direction {
+    Up,
+    Down,
+}
+
+class Dog implements Animal {
+    name: string;
+    constructor(name: string) { this.name = name; }
+    speak(): void { console.log("Woof"); }
+}
+
+function greet(person: string): string {
+    return "Hello " + person;
+}
+
+namespace Utils {
+    export function helper(): void {}
+}
+"#;
+
+    #[test]
+    fn test_typescript_parse_finds_interface() {
+        let tree = parse_source(TYPESCRIPT_SRC, &SourceLanguage::TypeScript, "test.ts").unwrap();
+        let classes: Vec<_> = tree
+            .all_nodes_dfs()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Class)
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(
+            classes.iter().any(|n| n == "Animal"),
+            "Expected 'Animal' interface: {classes:?}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_parse_finds_type_alias() {
+        let tree = parse_source(TYPESCRIPT_SRC, &SourceLanguage::TypeScript, "test.ts").unwrap();
+        let classes: Vec<_> = tree
+            .all_nodes_dfs()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Class)
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(
+            classes.iter().any(|n| n == "Result"),
+            "Expected 'Result' type alias: {classes:?}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_parse_finds_enum() {
+        let tree = parse_source(TYPESCRIPT_SRC, &SourceLanguage::TypeScript, "test.ts").unwrap();
+        let classes: Vec<_> = tree
+            .all_nodes_dfs()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Class)
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(
+            classes.iter().any(|n| n == "Direction"),
+            "Expected 'Direction' enum: {classes:?}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_parse_finds_class() {
+        let tree = parse_source(TYPESCRIPT_SRC, &SourceLanguage::TypeScript, "test.ts").unwrap();
+        let classes: Vec<_> = tree
+            .all_nodes_dfs()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Class)
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(
+            classes.iter().any(|n| n == "Dog"),
+            "Expected 'Dog' class: {classes:?}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_parse_finds_function() {
+        let tree = parse_source(TYPESCRIPT_SRC, &SourceLanguage::TypeScript, "test.ts").unwrap();
+        let fns: Vec<_> = tree
+            .all_nodes_dfs()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(
+            fns.iter().any(|n| n == "greet"),
+            "Expected 'greet' function: {fns:?}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_parse_finds_namespace() {
+        let tree = parse_source(TYPESCRIPT_SRC, &SourceLanguage::TypeScript, "test.ts").unwrap();
+        let modules: Vec<_> = tree
+            .all_nodes_dfs()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Module)
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(
+            modules.iter().any(|n| n == "Utils"),
+            "Expected 'Utils' namespace: {modules:?}"
+        );
+    }
+
+    const SQL_SRC: &str = r#"
+CREATE TABLE users (
+    id INT PRIMARY KEY,
+    name VARCHAR(100)
+);
+
+CREATE VIEW active_users AS
+SELECT * FROM users WHERE active = 1;
+
+SELECT id, name FROM users;
+"#;
+
+    #[test]
+    fn test_sql_parse_finds_table() {
+        let tree = parse_source(SQL_SRC, &SourceLanguage::Sql, "schema.sql").unwrap();
+        let classes: Vec<_> = tree
+            .all_nodes_dfs()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Class)
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(
+            classes.iter().any(|n| n == "users"),
+            "Expected 'users' table: {classes:?}"
+        );
+    }
+
+    #[test]
+    fn test_sql_parse_finds_view() {
+        let tree = parse_source(SQL_SRC, &SourceLanguage::Sql, "schema.sql").unwrap();
+        let classes: Vec<_> = tree
+            .all_nodes_dfs()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Class)
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(
+            classes.iter().any(|n| n == "active_users"),
+            "Expected 'active_users' view: {classes:?}"
+        );
+    }
+
+    #[test]
+    fn test_sql_parse_has_statements_as_blocks() {
+        let tree = parse_source(SQL_SRC, &SourceLanguage::Sql, "schema.sql").unwrap();
+        let has_block = tree
+            .all_nodes_dfs()
+            .iter()
+            .any(|n| n.kind == NodeKind::Block);
+        assert!(has_block, "Expected Block nodes for SQL statements");
     }
 
     #[test]
