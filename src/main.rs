@@ -20,8 +20,8 @@ use ui::{events::handle_event, render};
 #[derive(ClapParser, Debug)]
 #[command(author, version, about)]
 struct Cli {
-    /// Source file to open on startup.
-    file: Option<PathBuf>,
+    /// Source file or directory to open. Defaults to the current directory.
+    path: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -34,7 +34,9 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, cli.file);
+    // Default to the current directory when no path is given.
+    let path = cli.path.unwrap_or_else(|| PathBuf::from("."));
+    let result = run(&mut terminal, path);
 
     // Always restore terminal before propagating errors.
     disable_raw_mode()?;
@@ -44,13 +46,14 @@ fn main() -> Result<()> {
     result
 }
 
-fn run(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    initial_file: Option<PathBuf>,
-) -> Result<()> {
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, path: PathBuf) -> Result<()> {
     let mut state = AppState::new();
 
-    if let Some(path) = initial_file {
+    if path.is_dir() {
+        if let Err(e) = state.load_directory(path) {
+            state.status = format!("Error loading directory: {e}");
+        }
+    } else {
         if let Err(e) = state.load_file(path) {
             state.status = format!("Error loading file: {e}");
         }

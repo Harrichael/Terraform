@@ -12,10 +12,12 @@ Terraform is an open-source, terminal-based platform for reimagining how develop
 
 The first — and flagship — app treats every line of source code as a node in a dynamic tree. Users can:
 
-- **Switch granularity on demand** — Collapse/expand views to show modules, files, classes/structs, functions/methods, blocks, or individual lines.
-- **Filter nodes instantly** — Type a pattern to narrow the view to matching symbols, names, or content.
-- **Keyboard-driven navigation** — Fast, mouse-free movement through any codebase.
-- **Multi-language support** — Rust, Python, and JavaScript powered by [Tree-sitter](https://tree-sitter.github.io/).
+- **Open a directory or file directly** — Pass any path (or none to open `.`). Directory roots expand through Folder → File → code constructs.
+- **Switch granularity per node** — Use `l`/`Right` and `h`/`Left` to expand or shrink the detail level of a *single* node without affecting its siblings. Granularity levels: Folder → Module → File → Class/Struct → Function → Block (if/for/while) → Line.
+- **Filter nodes instantly** — Type a pattern to narrow the view to matching names or content.
+- **Symbolic references (Lib section)** — Symbols defined in multiple files are deduplicated; the canonical definition is promoted to a `[Lib]` section at the bottom, and duplicates become `[ref]` nodes. Press `Enter` on a `[ref]` node to jump to the definition.
+- **Multi-language support** — Rust, Python, and JavaScript powered by [Tree-sitter](https://tree-sitter.github.io/). Plain text files are shown line-by-line.
+- **Keyboard-driven** — Fast, mouse-free navigation throughout.
 
 ---
 
@@ -40,14 +42,21 @@ The binary will be at `target/release/terraform`.
 ## Usage
 
 ```bash
-# Open a source file
-terraform path/to/your/file.rs
-
-# No arguments — shows an empty viewer
+# Open the current directory (default)
 terraform
+
+# Open a specific directory
+terraform path/to/project/
+
+# Open a single source file
+terraform path/to/file.rs
 ```
 
-### Keyboard Shortcuts
+When opening a directory, the view starts at **File granularity** — only folders and files are shown. Use `l`/`Right` on a file to drill into its code constructs.
+
+---
+
+## Keyboard Shortcuts
 
 | Key | Action |
 |-----|--------|
@@ -57,13 +66,26 @@ terraform
 | `PgDn` | Page down |
 | `g` / `Home` | Jump to top |
 | `G` / `End` | Jump to bottom |
-| `Space` / `Enter` | Toggle collapse/expand node |
+| **`l` / `→`** | **Expand cursor node to next finer granularity** |
+| **`h` / `←`** | **Shrink cursor node to next coarser granularity** |
+| `Space` | Toggle full collapse/expand of cursor node |
+| `Enter` | Toggle collapse, or jump to SymRef definition |
 | `[` | Collapse all nodes |
 | `]` | Expand all nodes |
 | `/` | Enter filter mode |
 | `Esc` | Clear filter / cancel |
 | `?` / `F1` | Toggle help overlay |
 | `q` / `Ctrl+C` | Quit |
+
+### Granularity Levels
+
+From coarsest to finest:
+
+```
+Folder → Module → File → Class/Struct → Function/Method → Block (if/for/while) → Line
+```
+
+`l`/`Right` expands one step finer; `h`/`Left` shrinks one step coarser. Changes apply **only to the node under the cursor** — siblings are unaffected.
 
 ---
 
@@ -73,28 +95,28 @@ terraform
 src/
 ├── main.rs          # Entry point, terminal setup, render loop
 ├── app/
-│   ├── tree.rs      # CodeNode, CodeTree — hierarchical data model
-│   └── state.rs     # AppState — UI state, cursor, filter, mode
+│   ├── tree.rs      # CodeNode, CodeTree — data model with granularity + SymRef
+│   └── state.rs     # AppState — cursor, filter, mode, directory/file loading
 ├── parser/
-│   └── mod.rs       # Tree-sitter integration, language detection
+│   └── mod.rs       # Tree-sitter integration, directory walker, SymRef deduplication
 └── ui/
     ├── mod.rs        # Public UI surface
-    ├── mod_impl.rs   # ratatui rendering (tree panel, status bar, help)
+    ├── mod_impl.rs   # ratatui rendering (tree panel, Lib section, status bar, help)
     └── events.rs     # Keyboard event handling
 ```
 
 ### Node Kinds
 
-From coarsest to finest granularity:
-
 | Kind | Description |
 |------|-------------|
-| `Module` | Rust `mod` blocks or Python packages |
-| `File` | Root of a single source file |
+| `Folder` | Directory |
+| `Module` | Rust `mod`, Python packages |
+| `File` | Source file |
 | `Class` | `struct`, `enum`, `trait`, `impl`, `class` |
-| `Function` | `fn`, method definitions |
-| `Block` | `{ … }` blocks |
+| `Function` | `fn`, method, `def` |
+| `Block` | `if`/`for`/`while`/`match`/`switch` constructs |
 | `Line` | Individual source lines |
+| `SymRef` | Symbolic reference pointing to a canonical lib definition |
 
 ---
 
@@ -104,22 +126,20 @@ From coarsest to finest granularity:
 |-----------|---------|
 | TUI framework | [ratatui](https://github.com/ratatui-org/ratatui) |
 | Terminal backend | [crossterm](https://github.com/crossterm-rs/crossterm) |
-| Parsing | [tree-sitter](https://tree-sitter.github.io/) |
+| Parsing | [tree-sitter](https://tree-sitter.github.io/) (Rust, Python, JavaScript) |
 | CLI arguments | [clap](https://github.com/clap-rs/clap) |
 
 ---
 
 ## Roadmap
 
-Future apps and features planned for the Terraform platform:
-
-- [ ] In-place code editing (structural edits, rename, extract)
+- [ ] In-place structural code editing (rename, extract, inline)
 - [ ] Parameter add/remove with automatic propagation through callers
 - [ ] Git integration (blame, diff, stage)
-- [ ] LSP integration for richer symbol information
+- [ ] LSP integration for richer cross-file symbol references
 - [ ] AI-assisted edits
 - [ ] Live collaboration
-- [ ] Custom community-built TUI apps
+- [ ] Community-built TUI apps
 
 ---
 

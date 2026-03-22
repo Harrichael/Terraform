@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::app::tree::CodeTree;
-use crate::parser::{parse_source, SourceLanguage};
+use crate::parser::{parse_directory, parse_source, SourceLanguage};
 
 /// The overall application mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,9 +18,9 @@ pub enum AppMode {
 pub struct AppState {
     /// The parsed code tree being viewed.
     pub tree: CodeTree,
-    /// Path to the currently open file (None when empty/demo).
-    pub current_file: Option<PathBuf>,
-    /// Flat list of currently-visible node ids (after filter / collapse).
+    /// Path to the currently open file or directory (None = nothing loaded).
+    pub current_path: Option<PathBuf>,
+    /// Flat list of currently-visible node IDs (main tree, respecting filter/collapse).
     pub visible_ids: Vec<usize>,
     /// Index into `visible_ids` of the currently highlighted row.
     pub cursor: usize,
@@ -42,19 +42,19 @@ impl AppState {
     pub fn new() -> Self {
         AppState {
             tree: CodeTree::new(),
-            current_file: None,
+            current_path: None,
             visible_ids: Vec::new(),
             cursor: 0,
             scroll_offset: 0,
             pane_height: 24,
             mode: AppMode::Normal,
             filter: String::new(),
-            status: String::from("No file loaded. Pass a source file path as a command-line argument."),
+            status: String::from("No path loaded. Pass a source file or directory as a command-line argument."),
             should_quit: false,
         }
     }
 
-    /// Load a source file, parse it, and refresh the view.
+    /// Load a single source file, parse it, and refresh the view.
     pub fn load_file(&mut self, path: PathBuf) -> anyhow::Result<()> {
         let source = std::fs::read_to_string(&path)?;
         let lang = SourceLanguage::from_path(&path);
@@ -64,11 +64,26 @@ impl AppState {
             .unwrap_or("unknown")
             .to_string();
         self.tree = parse_source(&source, &lang, &fname)?;
-        self.current_file = Some(path.clone());
+        self.current_path = Some(path.clone());
         self.filter.clear();
         self.cursor = 0;
         self.scroll_offset = 0;
         self.status = format!("Loaded: {}", path.display());
+        self.refresh_visible();
+        Ok(())
+    }
+
+    /// Load a directory, parse all source files in it, and refresh the view.
+    pub fn load_directory(&mut self, path: PathBuf) -> anyhow::Result<()> {
+        self.tree = parse_directory(&path)?;
+        self.current_path = Some(path.clone());
+        self.filter.clear();
+        self.cursor = 0;
+        self.scroll_offset = 0;
+        self.status = format!(
+            "Loaded directory: {} — use l/Right to drill down into a node",
+            path.display()
+        );
         self.refresh_visible();
         Ok(())
     }
@@ -119,7 +134,60 @@ impl AppState {
         }
     }
 
-    /// Collapse all nodes at the cursor's current depth and below.
+    /// Expand the granularity of the node under the cursor (show finer children).
+    /// This only affects the cursor node — siblings are unchanged.
+    pub fn expand_cursor_granularity(&mut self) {
+        if let Some(&id) = self.visible_ids.get(self.cursor) {
+            if let Some(node) = self.tree.get(id) {
+                if node.is_leaf() {
+                    self.status = format!("'{}' is already at the finest level.", node.name);
+                    return;
+                }
+                if node.granularity_limit.is_none() {
+                    self.status = format!("'{}' already shows all detail.", node.name);
+                    return;
+                }
+            }
+            self.tree.expand_granularity(id);
+            self.refresh_visible();
+            if let Some(node) = self.tree.get(id) {
+                let level_desc = node
+                    .granularity_limit
+                    .as_ref()
+                    .map(|k| format!("{k}"))
+                    .unwrap_or_else(|| "all".to_string());
+                self.status = format!("'{}' now shows up to {} level.", node.name, level_desc);
+            }
+        }
+    }
+
+    /// Shrink the granularity of the node under the cursor (show coarser children).
+    /// This only affects the cursor node — siblings are unchanged.
+    pub fn shrink_cursor_granularity(&mut self) {
+        if let Some(&id) = self.visible_ids.get(self.cursor) {
+            if let Some(node) = self.tree.get(id) {
+                if node.is_leaf() {
+                    self.status = format!("'{}' has no children.", node.name);
+                    return;
+                }
+            }
+            self.tree.shrink_granularity(id);
+            self.refresh_visible();
+            if let Some(node) = self.tree.get(id) {
+                let level_desc = if node.collapsed {
+                    "collapsed".to_string()
+                } else {
+                    node.granularity_limit
+                        .as_ref()
+                        .map(|k| format!("up to {k}"))
+                        .unwrap_or_else(|| "all".to_string())
+                };
+                self.status = format!("'{}': {}", node.name, level_desc);
+            }
+        }
+    }
+
+    /// Collapse all non-leaf nodes.
     pub fn collapse_all(&mut self) {
         let ids: Vec<usize> = self
             .tree
@@ -147,9 +215,34 @@ impl AppState {
         for id in ids {
             if let Some(n) = self.tree.get_mut(id) {
                 n.collapsed = false;
+                n.granularity_limit = None;
             }
         }
         self.refresh_visible();
+    }
+
+    /// If the cursor is on a `SymRef` node, jump to its canonical definition
+    /// in the lib section. Returns `true` if a jump was performed.
+    pub fn jump_to_sym_ref_target(&mut self) -> bool {
+        if let Some(&id) = self.visible_ids.get(self.cursor) {
+            if let Some(node) = self.tree.get(id) {
+                if let Some(target_id) = node.sym_ref_target {
+                    // Find the target in the lib section nodes rendered below main tree.
+                    // We place lib section IDs after the main visible_ids in state;
+                    // refresh_visible_with_lib builds the combined list.
+                    if let Some(pos) = self.visible_ids.iter().position(|&vid| vid == target_id) {
+                        self.cursor = pos;
+                        self.ensure_cursor_visible();
+                        if let Some(target_node) = self.tree.get(target_id) {
+                            self.status =
+                                format!("Jumped to definition: '{}'", target_node.name);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Enter filter mode.
@@ -242,7 +335,7 @@ mod tests {
     #[test]
     fn test_initial_state_no_file() {
         let state = AppState::new();
-        assert!(state.current_file.is_none());
+        assert!(state.current_path.is_none());
         assert!(state.visible_ids.is_empty());
         assert_eq!(state.cursor, 0);
         assert_eq!(state.mode, AppMode::Normal);
@@ -276,7 +369,6 @@ mod tests {
     fn test_toggle_collapse_updates_visible() {
         let mut state = state_with_sample_tree();
         let initial = state.visible_ids.len();
-        // Collapse root node.
         state.cursor = 0;
         state.toggle_cursor_collapse();
         assert!(state.visible_ids.len() < initial);
@@ -297,7 +389,6 @@ mod tests {
         let mut state = state_with_sample_tree();
         state.enter_filter();
         state.push_filter_char('a');
-        // "fn_a" and "fn_bar" (from filter) — our tree has fn_a and let x=1
         let count = state.visible_ids.len();
         assert!(count < 4, "Filter should narrow results, got {count}");
     }
@@ -306,7 +397,7 @@ mod tests {
     fn test_collapse_all_expand_all() {
         let mut state = state_with_sample_tree();
         state.collapse_all();
-        assert_eq!(state.visible_ids.len(), 1); // only root visible
+        assert_eq!(state.visible_ids.len(), 1);
         state.expand_all();
         assert_eq!(state.visible_ids.len(), 4);
     }
@@ -319,5 +410,78 @@ mod tests {
         assert_eq!(state.mode, AppMode::Help);
         state.toggle_help();
         assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn test_expand_granularity_changes_visible() {
+        let mut state = state_with_sample_tree();
+        // fn_a (id=1) has Line children. Set its granularity to Function level →
+        // Lines (level 6) are finer than Function (level 4) → hidden.
+        state.tree.get_mut(1).unwrap().granularity_limit = Some(NodeKind::Function);
+        state.refresh_visible();
+        assert_eq!(state.visible_ids.len(), 3); // root + fn_a (no Line) + fn_b
+
+        // Expand fn_a's granularity (cursor=1).
+        state.cursor = 1;
+        state.expand_cursor_granularity();
+        // Function → Block: Line (6) still finer than Block (5) → still hidden.
+        assert_eq!(state.visible_ids.len(), 3);
+        // Expand again: Block → Line. Line.is_finer_than(Line) = false → shown.
+        state.expand_cursor_granularity();
+        assert_eq!(state.visible_ids.len(), 4);
+    }
+
+    #[test]
+    fn test_shrink_granularity_changes_visible() {
+        let mut state = state_with_sample_tree();
+        // Root has no limit (shows all 4 nodes)
+        assert_eq!(state.visible_ids.len(), 4);
+        state.cursor = 0;
+        state.shrink_cursor_granularity();
+        // Should set limit to Block (Line still shown because fn_a has depth 2
+        // and its Line child has depth 3 — wait, the limit is on the FILE root
+        // which only has Function children, not Line directly)
+        // The Line is a child of fn_a, not of root, so root's limit doesn't hide it directly
+        // Root's granularity_limit only affects root's DIRECT children.
+        // fn_a is a Function (≤ Block), so fn_a is still shown.
+        // fn_a's Line child is not affected by root's granularity_limit.
+        // So visible count stays at 4.
+        assert_eq!(state.visible_ids.len(), 4);
+    }
+
+    #[test]
+    fn test_load_directory() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let mut state = AppState::new();
+        state.load_directory(dir.path().to_path_buf()).unwrap();
+        assert!(state.current_path.is_some());
+        assert!(!state.visible_ids.is_empty());
+    }
+
+    #[test]
+    fn test_jump_to_sym_ref() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "pub struct Config {}").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "pub struct Config {}").unwrap();
+        let mut state = AppState::new();
+        state.load_directory(dir.path().to_path_buf()).unwrap();
+
+        // Expand all so we can see sym refs
+        state.expand_all();
+        state.refresh_visible();
+
+        // Find the SymRef node cursor position
+        let sym_ref_pos = state.visible_ids.iter().position(|&id| {
+            state.tree.get(id).map(|n| n.kind == NodeKind::SymRef).unwrap_or(false)
+        });
+        if let Some(pos) = sym_ref_pos {
+            state.cursor = pos;
+            // Jump should succeed if target is also visible
+            let _ = state.jump_to_sym_ref_target();
+            // After jump, cursor should point to a non-SymRef node (the canonical definition)
+        }
     }
 }

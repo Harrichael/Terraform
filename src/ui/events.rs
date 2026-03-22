@@ -1,6 +1,6 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::state::{AppMode, AppState};
+use crate::app::{state::{AppMode, AppState}, tree::NodeKind};
 
 /// Process one terminal event and mutate `state` accordingly.
 /// Returns `true` if the application should quit.
@@ -40,8 +40,30 @@ fn handle_normal_key(state: &mut AppState, key: KeyEvent) {
             }
         }
 
-        // Collapse / Expand
-        KeyCode::Char(' ') | KeyCode::Enter => state.toggle_cursor_collapse(),
+        // Collapse / Expand (full toggle for the current node)
+        KeyCode::Char(' ') => state.toggle_cursor_collapse(),
+
+        // Enter: toggle collapse, or jump to SymRef target
+        KeyCode::Enter => {
+            if let Some(&id) = state.visible_ids.get(state.cursor) {
+                if let Some(node) = state.tree.get(id) {
+                    if node.kind == NodeKind::SymRef {
+                        if !state.jump_to_sym_ref_target() {
+                            state.status = "Definition is not currently visible. Try expanding all ([]).".to_string();
+                        }
+                        return;
+                    }
+                }
+            }
+            state.toggle_cursor_collapse();
+        }
+
+        // Granularity: l / Right = expand (show finer detail on this node only)
+        //              h / Left  = shrink (show coarser detail on this node only)
+        KeyCode::Right | KeyCode::Char('l') => state.expand_cursor_granularity(),
+        KeyCode::Left | KeyCode::Char('h') => state.shrink_cursor_granularity(),
+
+        // Collapse/Expand all
         KeyCode::Char('[') => state.collapse_all(),
         KeyCode::Char(']') => state.expand_all(),
 
