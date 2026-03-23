@@ -81,6 +81,7 @@ impl std::fmt::Display for NodeKind {
 
 /// The kind of symbolic relationship between two nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub enum ReferenceKind {
     /// A function or method call.
     Call,
@@ -151,11 +152,13 @@ impl ReferenceGraph {
     }
 
     /// Return all edges that originate from `node_id`.
+    #[allow(dead_code)]
     pub fn refs_from(&self, node_id: usize) -> Vec<&Reference> {
         self.edges.iter().filter(|r| r.from == node_id).collect()
     }
 
     /// Return all edges that point to `node_id`.
+    #[allow(dead_code)]
     pub fn refs_to(&self, node_id: usize) -> Vec<&Reference> {
         self.edges.iter().filter(|r| r.to == node_id).collect()
     }
@@ -236,16 +239,15 @@ impl CodeNode {
 ///    Each edge records a directed symbolic relationship between two nodes
 ///    (calls, imports, type usage, …).  Use
 ///    [`CodeTree::aggregate_refs_at_granularity`] to collapse fine-grained
-///    edges to any desired resolution level.
+///    edges to any desired resolution level, or
+///    [`CodeTree::project_refs_onto_visible`] to dynamically project edges
+///    onto whichever nodes are currently expanded in the viewer.
 #[derive(Debug, Default)]
 pub struct CodeTree {
     /// Flat storage; index == node.id.
     nodes: Vec<CodeNode>,
     /// Root node index (always 0 when the tree is non-empty).
     pub root: Option<usize>,
-    /// IDs of nodes that serve as canonical "library" definitions —
-    /// referenced by one or more `SymRef` nodes in the main tree.
-    pub lib_nodes: Vec<usize>,
     /// Directed symbolic references between nodes (the reference graph).
     pub references: ReferenceGraph,
 }
@@ -339,13 +341,6 @@ impl CodeTree {
         }
     }
 
-    /// Register `id` as a canonical library definition.
-    pub fn mark_as_lib(&mut self, id: usize) {
-        if !self.lib_nodes.contains(&id) {
-            self.lib_nodes.push(id);
-        }
-    }
-
     /// Add a SymRef node pointing to `target_id` as a child of `parent_id`.
     #[allow(dead_code)]
     pub fn add_sym_ref(
@@ -402,14 +397,6 @@ impl CodeTree {
             }
         }
         result
-    }
-
-    /// Return the visible lib (library/canonical) nodes.
-    pub fn visible_lib_nodes(&self) -> Vec<&CodeNode> {
-        self.lib_nodes
-            .iter()
-            .filter_map(|&id| self.nodes.get(id))
-            .collect()
     }
 
     /// Return all nodes (visible or not) in DFS pre-order.
@@ -471,6 +458,7 @@ impl CodeTree {
     ///
     /// Returns `None` only when `granularity` is [`NodeKind::SymRef`] (which
     /// has no level) or when `node_id` is invalid.
+    #[allow(dead_code)]
     pub fn ancestor_at_granularity(
         &self,
         node_id: usize,
@@ -510,6 +498,7 @@ impl CodeTree {
     /// At [`NodeKind::File`] granularity, every call from any function inside
     /// `file_a` to any symbol inside `file_b` is reported as the single pair
     /// `(file_a_id, file_b_id)`.
+    #[allow(dead_code)]
     pub fn aggregate_refs_at_granularity(
         &self,
         granularity: &NodeKind,
@@ -529,6 +518,75 @@ impl CodeTree {
             }
             if seen.insert((from_anc, to_anc)) {
                 result.push((from_anc, to_anc));
+            }
+        }
+        result
+    }
+
+    /// Walk the parent chain of `node_id` upward and return the first ancestor
+    /// (inclusive) that appears in `visible_set`.
+    ///
+    /// Returns `None` if neither `node_id` nor any ancestor is visible (e.g.
+    /// the whole subtree is collapsed above the root).
+    fn first_visible_ancestor(
+        &self,
+        node_id: usize,
+        visible_set: &std::collections::HashSet<usize>,
+    ) -> Option<usize> {
+        let mut current = node_id;
+        loop {
+            if visible_set.contains(&current) {
+                return Some(current);
+            }
+            let node = self.nodes.get(current)?;
+            match node.parent {
+                Some(pid) => current = pid,
+                None => return None,
+            }
+        }
+    }
+
+    /// Project every reference edge onto the set of currently visible nodes.
+    ///
+    /// For each edge `(from, to)` in the [`ReferenceGraph`], both endpoints
+    /// are walked up the contains hierarchy until a visible node is reached.
+    /// This handles **mixed granularity**: if one file is expanded (its
+    /// functions are visible) while the other is collapsed (only the file node
+    /// is visible), the edge appears as `(fn_a, file_b)` rather than
+    /// `(file_a, file_b)`.
+    ///
+    /// Self-loops and edges where either endpoint has no visible ancestor are
+    /// dropped.  The result is deduplicated.
+    ///
+    /// Visible ancestors are cached per unique endpoint ID so that nodes
+    /// referenced by many edges (e.g. a widely-used function) only pay the
+    /// parent-chain traversal cost once.
+    pub fn project_refs_onto_visible(&self, visible_ids: &[usize]) -> Vec<(usize, usize)> {
+        use std::collections::{HashMap, HashSet};
+        let visible_set: HashSet<usize> = visible_ids.iter().copied().collect();
+
+        // Pre-compute the visible ancestor for each unique referenced node so that
+        // nodes appearing in many edges are traversed only once.
+        let mut ancestor_cache: HashMap<usize, Option<usize>> = HashMap::new();
+        for edge in self.references.references() {
+            for &node_id in &[edge.from, edge.to] {
+                ancestor_cache
+                    .entry(node_id)
+                    .or_insert_with(|| self.first_visible_ancestor(node_id, &visible_set));
+            }
+        }
+
+        let mut seen: HashSet<(usize, usize)> = HashSet::new();
+        let mut result = Vec::new();
+        for edge in self.references.references() {
+            let (Some(from_vis), Some(to_vis)) = (
+                ancestor_cache.get(&edge.from).copied().flatten(),
+                ancestor_cache.get(&edge.to).copied().flatten(),
+            ) else {
+                continue;
+            };
+            if from_vis != to_vis && seen.insert((from_vis, to_vis)) {
+                result.push((from_vis, to_vis));
             }
         }
         result
@@ -671,15 +729,6 @@ mod tests {
         let ref_node = tree.get(ref_id).unwrap();
         assert_eq!(ref_node.kind, NodeKind::SymRef);
         assert_eq!(ref_node.sym_ref_target, Some(1));
-    }
-
-    #[test]
-    fn test_lib_nodes() {
-        let mut tree = sample_tree();
-        tree.mark_as_lib(1); // fn_foo is a lib definition
-        let lib = tree.visible_lib_nodes();
-        assert_eq!(lib.len(), 1);
-        assert_eq!(lib[0].id, 1);
     }
 
     #[test]
@@ -879,5 +928,64 @@ mod tests {
         assert_eq!(ReferenceKind::TypeRef.to_string(), "type_ref");
         assert_eq!(ReferenceKind::VarRef.to_string(), "var_ref");
         assert_eq!(ReferenceKind::Generic.to_string(), "generic");
+    }
+
+    // -----------------------------------------------------------------------
+    // project_refs_onto_visible tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_project_refs_both_collapsed_gives_file_edge() {
+        let mut tree = two_file_tree();
+        // fn_a1 (2) → fn_b1 (5); both files collapsed → only folder(0), file_a(1), file_b(4) visible.
+        tree.add_reference(2, 5, ReferenceKind::Call);
+        let visible = vec![0usize, 1, 4]; // folder, file_a, file_b (functions collapsed)
+        let proj = tree.project_refs_onto_visible(&visible);
+        assert_eq!(proj.len(), 1);
+        assert!(proj.contains(&(1, 4)));
+    }
+
+    #[test]
+    fn test_project_refs_one_expanded_gives_mixed_edge() {
+        let mut tree = two_file_tree();
+        // fn_a1 (2) → fn_b1 (5); file_a expanded, file_b collapsed.
+        tree.add_reference(2, 5, ReferenceKind::Call);
+        let visible = vec![0usize, 1, 2, 3, 4]; // folder, file_a, fn_a1, fn_a2, file_b
+        let proj = tree.project_refs_onto_visible(&visible);
+        assert_eq!(proj.len(), 1);
+        // fn_a1 is visible, fn_b1 is not → walks up to file_b.
+        assert!(proj.contains(&(2, 4)));
+    }
+
+    #[test]
+    fn test_project_refs_both_expanded_gives_function_edge() {
+        let mut tree = two_file_tree();
+        tree.add_reference(2, 5, ReferenceKind::Call);
+        let visible = vec![0usize, 1, 2, 3, 4, 5, 6]; // all nodes
+        let proj = tree.project_refs_onto_visible(&visible);
+        assert_eq!(proj.len(), 1);
+        assert!(proj.contains(&(2, 5)));
+    }
+
+    #[test]
+    fn test_project_refs_intra_file_drops_self_loop_when_collapsed() {
+        let mut tree = two_file_tree();
+        // fn_a1 (2) → fn_a2 (3); both in file_a; when file_a is collapsed both map to file_a.
+        tree.add_reference(2, 3, ReferenceKind::Call);
+        let visible = vec![0usize, 1, 4]; // file_a collapsed
+        let proj = tree.project_refs_onto_visible(&visible);
+        // Both endpoints project to file_a (1) → self-loop, dropped.
+        assert!(proj.is_empty());
+    }
+
+    #[test]
+    fn test_project_refs_deduplicates() {
+        let mut tree = two_file_tree();
+        // Multiple function-level edges from a→b; all should deduplicate.
+        tree.add_reference(2, 5, ReferenceKind::Call);
+        tree.add_reference(3, 6, ReferenceKind::Call);
+        let visible = vec![0usize, 1, 4]; // both files collapsed
+        let proj = tree.project_refs_onto_visible(&visible);
+        assert_eq!(proj.len(), 1);
     }
 }

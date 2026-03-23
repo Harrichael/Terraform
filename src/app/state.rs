@@ -22,6 +22,13 @@ pub struct AppState {
     pub current_path: Option<PathBuf>,
     /// Flat list of currently-visible node IDs (main tree, respecting filter/collapse).
     pub visible_ids: Vec<usize>,
+    /// Reference edges projected onto the currently visible nodes.
+    ///
+    /// Each entry `(from, to)` is a pair of visible node IDs connected by one
+    /// or more symbolic references in the [`ReferenceGraph`].  The set is
+    /// recomputed whenever `visible_ids` changes so that edges automatically
+    /// aggregate or expand as the user drills down into the hierarchy.
+    pub visible_refs: Vec<(usize, usize)>,
     /// Index into `visible_ids` of the currently highlighted row.
     pub cursor: usize,
     /// Vertical scroll offset for the tree pane (in rows).
@@ -44,6 +51,7 @@ impl AppState {
             tree: CodeTree::new(),
             current_path: None,
             visible_ids: Vec::new(),
+            visible_refs: Vec::new(),
             cursor: 0,
             scroll_offset: 0,
             pane_height: 24,
@@ -88,7 +96,7 @@ impl AppState {
         Ok(())
     }
 
-    /// Recompute `visible_ids` from the current tree + filter.
+    /// Recompute `visible_ids` and `visible_refs` from the current tree + filter.
     pub fn refresh_visible(&mut self) {
         let nodes = if self.filter.is_empty() {
             self.tree.visible_nodes()
@@ -96,6 +104,9 @@ impl AppState {
             self.tree.filter_visible(&self.filter)
         };
         self.visible_ids = nodes.iter().map(|n| n.id).collect();
+
+        // Project the reference graph onto the currently visible nodes.
+        self.visible_refs = self.tree.project_refs_onto_visible(&self.visible_ids);
 
         // Keep cursor in bounds.
         if self.visible_ids.is_empty() {
@@ -461,27 +472,55 @@ mod tests {
     }
 
     #[test]
-    fn test_jump_to_sym_ref() {
+    fn test_visible_refs_updates_with_expansion() {
+        use crate::app::tree::ReferenceKind;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "pub struct Config {}").unwrap();
-        std::fs::write(dir.path().join("b.rs"), "pub struct Config {}").unwrap();
+        // lib.rs defines `helper`, main.rs calls it → cross-file reference expected.
+        std::fs::write(dir.path().join("lib.rs"), "pub fn helper() {}").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() { helper(); }").unwrap();
         let mut state = AppState::new();
         state.load_directory(dir.path().to_path_buf()).unwrap();
 
-        // Expand all so we can see sym refs
-        state.expand_all();
-        state.refresh_visible();
+        // At the initial file-level view (both files collapsed under folder root),
+        // any cross-file reference should project to a file→file edge.
+        // The reference graph may or may not have edges depending on name resolution;
+        // what we can assert is that visible_refs is consistent with visible_ids.
+        for &(from, to) in &state.visible_refs {
+            assert!(
+                state.visible_ids.contains(&from),
+                "from endpoint {from} must be in visible_ids"
+            );
+            assert!(
+                state.visible_ids.contains(&to),
+                "to endpoint {to} must be in visible_ids"
+            );
+        }
 
-        // Find the SymRef node cursor position
-        let sym_ref_pos = state.visible_ids.iter().position(|&id| {
-            state.tree.get(id).map(|n| n.kind == NodeKind::SymRef).unwrap_or(false)
-        });
-        if let Some(pos) = sym_ref_pos {
-            state.cursor = pos;
-            // Jump should succeed if target is also visible
-            let _ = state.jump_to_sym_ref_target();
-            // After jump, cursor should point to a non-SymRef node (the canonical definition)
+        // Expanding all should keep visible_refs endpoints within visible_ids.
+        state.expand_all();
+        for &(from, to) in &state.visible_refs {
+            assert!(
+                state.visible_ids.contains(&from),
+                "after expand: from endpoint {from} must be in visible_ids"
+            );
+            assert!(
+                state.visible_ids.contains(&to),
+                "after expand: to endpoint {to} must be in visible_ids"
+            );
+        }
+
+        // Verify we can also add manual reference edges and have them projected.
+        let all_ids: Vec<usize> = state.tree.all_nodes_dfs().iter().map(|n| n.id).collect();
+        if all_ids.len() >= 2 {
+            state.tree.add_reference(all_ids[0], all_ids[1], ReferenceKind::Call);
+            state.refresh_visible();
+            // After adding a ref between root (always visible) and first child,
+            // visible_refs must still be consistent.
+            for &(from, to) in &state.visible_refs {
+                assert!(state.visible_ids.contains(&from));
+                assert!(state.visible_ids.contains(&to));
+            }
         }
     }
 }

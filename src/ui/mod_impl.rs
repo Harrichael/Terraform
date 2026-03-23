@@ -66,7 +66,7 @@ fn render_tree(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    // Build list items: main tree rows + lib section.
+    // Build list items: main tree rows.
     let mut items: Vec<ListItem> = state
         .visible_ids
         .iter()
@@ -74,20 +74,14 @@ fn render_tree(frame: &mut Frame, area: Rect, state: &AppState) {
         .map(|(i, &id)| build_tree_item(state, id, i == state.cursor))
         .collect();
 
-    // Append lib section if there are lib nodes.
-    let lib_nodes = state.tree.visible_lib_nodes();
-    if !lib_nodes.is_empty() {
-        // Separator row.
-        let sep = ListItem::new(Line::from(vec![Span::styled(
-            "─── Lib (shared definitions) ────────────────────────────",
+    // Append a "References" section when the graph has visible edges.
+    if !state.visible_refs.is_empty() {
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            "─── References ──────────────────────────────────────────",
             Style::default().fg(Color::DarkGray),
-        )]));
-        items.push(sep);
-
-        let lib_start_idx = state.visible_ids.len() + 1; // +1 for separator
-        for (li, node) in lib_nodes.iter().enumerate() {
-            let is_selected = state.cursor == lib_start_idx + li;
-            items.push(build_tree_item(state, node.id, is_selected));
+        )])));
+        for &(from_id, to_id) in &state.visible_refs {
+            items.push(build_ref_item(state, from_id, to_id));
         }
     }
 
@@ -126,16 +120,7 @@ fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool) -> Lis
         "▼ "
     };
 
-    let kind_icon = match node.kind {
-        NodeKind::Folder => "dir",
-        NodeKind::Module => "mod",
-        NodeKind::File => "fil",
-        NodeKind::Class => "cls",
-        NodeKind::Function => "fn ",
-        NodeKind::Block => "{ }",
-        NodeKind::Line => "   ",
-        NodeKind::SymRef => "ref",
-    };
+    let kind_icon = kind_icon(&node.kind);
 
     // For a node with a granularity limit, show it as a small annotation.
     let limit_annotation = if node.kind != NodeKind::SymRef && !node.is_leaf() {
@@ -173,6 +158,48 @@ fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool) -> Lis
     ]);
 
     ListItem::new(line)
+}
+
+/// Build a list item showing a single reference edge `from → to`.
+fn build_ref_item(state: &AppState, from_id: usize, to_id: usize) -> ListItem<'static> {
+    let from_name = state
+        .tree
+        .get(from_id)
+        .map(|n| format!("[{}] {}", kind_icon(&n.kind), n.name))
+        .unwrap_or_else(|| format!("#{from_id}"));
+    let to_name = state
+        .tree
+        .get(to_id)
+        .map(|n| format!("[{}] {}", kind_icon(&n.kind), n.name))
+        .unwrap_or_else(|| format!("#{to_id}"));
+
+    let line = Line::from(vec![
+        Span::raw("  "),
+        Span::styled(from_name, Style::default().fg(Color::LightBlue)),
+        Span::styled(
+            "  ──→  ",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(to_name, Style::default().fg(Color::LightGreen)),
+    ]);
+    ListItem::new(line)
+}
+
+/// Map a [`NodeKind`] to the three-character icon string shown in both the
+/// tree rows and the reference-edge rows.
+fn kind_icon(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Folder => "dir",
+        NodeKind::Module => "mod",
+        NodeKind::File => "fil",
+        NodeKind::Class => "cls",
+        NodeKind::Function => "fn ",
+        NodeKind::Block => "{ }",
+        NodeKind::Line => "   ",
+        NodeKind::SymRef => "ref",
+    }
 }
 
 /// Render the one-line status bar at the bottom.
@@ -249,10 +276,13 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("  ]              Expand all"),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Symbolic References",
+            "  References",
             Style::default().add_modifier(Modifier::UNDERLINED),
         )]),
-        Line::from("  Enter (on [ref]) Jump to canonical definition in Lib"),
+        Line::from("  l / Right      Drill into node (finer granularity)"),
+        Line::from("  h / Left       Zoom out of node (coarser granularity)"),
+        Line::from("  References section below the tree updates automatically"),
+        Line::from("  as you expand/collapse nodes."),
         Line::from(""),
         Line::from(vec![Span::styled(
             "  Filter",
