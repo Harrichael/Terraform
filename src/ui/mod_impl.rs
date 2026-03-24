@@ -121,11 +121,9 @@ fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool, displa
     } else if node.is_leaf() {
         "  "
     } else if state.expanded_ids.contains(&id) {
-        if state.folded_ids.contains(&id) {
-            "▶ " // expanded but folded: Space to unfold
-        } else {
-            "▼ " // expanded and showing children: Space to fold
-        }
+        // Node is expanded+folded: visible as ▶. Space to unfold.
+        // (Expanded+unfolded nodes are invisible — their children replaced them.)
+        "▶ "
     } else {
         "▷ " // not yet expanded: Right/l to expand granularity
     };
@@ -292,8 +290,8 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         )]),
         Line::from("  l / Right      Expand granularity (show semantic children)"),
         Line::from("  h / Left       Collapse granularity"),
-        Line::from("  Space          Fold/unfold children (toggle visibility)"),
-        Line::from("  Enter          Fold/unfold or jump to SymRef"),
+        Line::from("  Space          Fold parent (hide siblings); unfold ▶ node"),
+        Line::from("  Enter          Same as Space, or jump to SymRef target"),
         Line::from("  [              Collapse all"),
         Line::from("  ]              Expand all"),
         Line::from(""),

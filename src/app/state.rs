@@ -166,23 +166,21 @@ impl AppState {
 
     fn build_view_entries(&mut self, node_id: usize, display_depth: usize) {
         if self.expanded_ids.contains(&node_id) {
-            let entries = self.tree.semantic_children_of(node_id);
-            let has_node_entries = entries.iter().any(|e| matches!(e, SemanticEntry::Node { .. }));
-            if !has_node_entries {
-                // Expanded but no semantic children — show the node itself
+            if self.folded_ids.contains(&node_id) {
+                // Expanded but visually folded: show the node itself as ▶, hide children.
                 self.visible_ids.push(node_id);
                 self.view_depths.push(display_depth);
                 return;
             }
-            // Always show the node itself as a fold handle (▼ or ▶)
-            self.visible_ids.push(node_id);
-            self.view_depths.push(display_depth);
-
-            if self.folded_ids.contains(&node_id) {
-                // Folded: hide children
+            // Expanded and unfolded: the node itself is invisible; its children replace it.
+            let entries = self.tree.semantic_children_of(node_id);
+            let has_node_entries = entries.iter().any(|e| matches!(e, SemanticEntry::Node { .. }));
+            if !has_node_entries {
+                // No semantic children — fall back to showing the node itself.
+                self.visible_ids.push(node_id);
+                self.view_depths.push(display_depth);
                 return;
             }
-            // Unfolded: show children below the fold handle
             for entry in entries {
                 match entry {
                     SemanticEntry::Node { id, depth } => {
@@ -204,8 +202,11 @@ impl AppState {
                         self.visible_ids.push(virtual_id);
                         self.view_depths.push(display_depth + depth);
 
-                        // If this SymRef's target is expanded, show specific referenced symbols
-                        if self.expanded_symref_targets.contains(&target_id) {
+                        // Auto-expand SymRef if the target node is itself expanded or
+                        // the user has explicitly requested its symbol listing.
+                        let show_symbols = self.expanded_symref_targets.contains(&target_id)
+                            || self.expanded_ids.contains(&target_id);
+                        if show_symbols {
                             let target_subtree = self.tree.subtree_ids(target_id);
                             let refs: Vec<_> = self.tree.references.references().to_vec();
                             let mut shown_targets: HashSet<usize> = HashSet::new();
@@ -274,29 +275,40 @@ impl AppState {
         self.toggle_fold();
     }
 
-    /// Fold or unfold the expanded node under the cursor.
+    /// Fold or unfold.
     ///
-    /// Folding hides children visually without removing the node from `expanded_ids`.
-    /// The node must already be in `expanded_ids`; use Right/l to expand first.
-    /// SymRef nodes are never semantically expanded so they are skipped unconditionally.
+    /// * If the cursor is on a `▶` node (expanded + folded): unfold it — the node
+    ///   disappears and its semantic children become visible again.
+    /// * If the cursor is on any other visible node: find its structural parent; if that
+    ///   parent is expanded, fold it so the parent reappears as `▶` and all its children
+    ///   are hidden.
+    ///
+    /// SymRef virtual nodes are skipped.
     pub fn toggle_fold(&mut self) {
         if let Some(&id) = self.visible_ids.get(self.cursor) {
-            // SymRef nodes cannot be folded — they are virtual and never in expanded_ids.
+            // SymRef nodes cannot be folded.
             if let Some(node) = self.tree.get(id) {
                 if node.kind == NodeKind::SymRef {
                     return;
                 }
             }
-            if !self.expanded_ids.contains(&id) {
-                self.status = "Use Right/l to expand granularity first.".to_string();
-                return;
-            }
-            if self.folded_ids.contains(&id) {
+
+            if self.expanded_ids.contains(&id) {
+                // Node is visible as ▶ (folded expanded). Unfold it: it goes invisible
+                // and its semantic children reappear.
                 self.folded_ids.remove(&id);
+                self.refresh_visible();
             } else {
-                self.folded_ids.insert(id);
+                // Node is a normal visible node. Fold its structural parent if the parent
+                // has been granularity-expanded.
+                let parent_id = self.tree.get(id).and_then(|n| n.parent);
+                if let Some(pid) = parent_id {
+                    if self.expanded_ids.contains(&pid) {
+                        self.folded_ids.insert(pid);
+                        self.refresh_visible();
+                    }
+                }
             }
-            self.refresh_visible();
         }
     }
 
@@ -339,6 +351,7 @@ impl AppState {
                 .any(|e| matches!(e, SemanticEntry::Node { .. }));
             if has_children {
                 self.expanded_ids.insert(id);
+                self.expanded_symref_targets.insert(id);
             }
         }
         self.refresh_visible();
@@ -378,6 +391,7 @@ impl AppState {
                 path.reverse();
                 for &anc in &path[..path.len().saturating_sub(1)] {
                     self.expanded_ids.insert(anc);
+                    self.expanded_symref_targets.insert(anc);
                 }
                 self.refresh_visible();
                 if let Some(pos) = self.visible_ids.iter().position(|&vid| vid == target_id) {
@@ -423,6 +437,9 @@ impl AppState {
                         return;
                     }
                     self.expanded_ids.insert(id);
+                    // Keep SymRef expansion in sync: any → arrow pointing into this
+                    // node's subtree will automatically show specific symbols.
+                    self.expanded_symref_targets.insert(id);
                     self.refresh_visible();
                     let path = self.tree.full_path(id);
                     self.status = format!("Expanded '{}'.", path);
@@ -433,20 +450,27 @@ impl AppState {
 
     pub fn collapse_cursor_node(&mut self) {
         if let Some(&id) = self.visible_ids.get(self.cursor) {
-            if self.expanded_ids.remove(&id) {
+            if self.expanded_ids.contains(&id) {
+                // Cursor is on a ▶ (expanded+folded) node. Fully collapse it.
+                self.expanded_ids.remove(&id);
                 self.folded_ids.remove(&id);
+                self.expanded_symref_targets.remove(&id);
                 self.refresh_visible();
                 let path = self.tree.full_path(id);
                 self.status = format!("Collapsed '{}'.", path);
                 return;
             }
+            // Cursor is on a normal visible (non-expanded) node.
+            // Collapse its structural parent if the parent was granularity-expanded.
             let parent_id = self.tree.get(id).and_then(|n| n.parent);
             if let Some(pid) = parent_id {
-                self.expanded_ids.remove(&pid);
-                self.folded_ids.remove(&pid);
-                self.refresh_visible();
-                let path = self.tree.full_path(pid);
-                self.status = format!("Collapsed '{}'.", path);
+                if self.expanded_ids.remove(&pid) {
+                    self.folded_ids.remove(&pid);
+                    self.expanded_symref_targets.remove(&pid);
+                    self.refresh_visible();
+                    let path = self.tree.full_path(pid);
+                    self.status = format!("Collapsed '{}'.", path);
+                }
             }
         }
     }
@@ -579,12 +603,13 @@ mod tests {
     #[test]
     fn test_toggle_collapse_updates_visible() {
         let mut state = state_with_sample_tree();
-        // Expand root to see fn_a and fn_b (root is now a fold handle + children)
+        // Expand root so fn_a and fn_b become visible (root itself disappears).
         state.expanded_ids.insert(0);
         state.refresh_visible();
-        let initial = state.visible_ids.len(); // 3: root + fn_a + fn_b
-        state.cursor = 0; // on root (fold handle)
-        // toggle_fold on root (which IS in expanded_ids) → folds it, hiding fn_a and fn_b
+        let initial = state.visible_ids.len(); // 2: fn_a + fn_b (root is invisible)
+        state.cursor = 0; // on fn_a
+        // toggle_fold on fn_a (NOT in expanded_ids): folds its structural parent (root),
+        // which makes root reappear as ▶ and fn_a/fn_b disappear.
         state.toggle_cursor_collapse();
         assert!(state.visible_ids.len() < initial);
     }
@@ -614,8 +639,12 @@ mod tests {
         state.collapse_all();
         assert_eq!(state.visible_ids.len(), 1); // just root
         state.expand_all();
-        // root (fold handle) + fn_a + fn_b = 3
-        assert_eq!(state.visible_ids.len(), 3);
+        // expand_all expands root and fn_a (both have children).
+        // root is invisible (expanded, unfolded) → shows fn_a's children.
+        // fn_a is invisible (expanded, unfolded) → shows l1.
+        // fn_b is a leaf → visible.
+        // visible = [l1, fn_b] = 2 nodes.
+        assert_eq!(state.visible_ids.len(), 2);
     }
 
     #[test]
@@ -633,18 +662,18 @@ mod tests {
         let mut state = state_with_sample_tree();
         assert_eq!(state.visible_ids.len(), 1); // just root
         state.cursor = 0;
-        state.expand_cursor_granularity(); // expand root → shows root + fn_a + fn_b
-        assert_eq!(state.visible_ids.len(), 3);
+        state.expand_cursor_granularity(); // expand root → root disappears, fn_a + fn_b visible
+        assert_eq!(state.visible_ids.len(), 2);
     }
 
     #[test]
     fn test_shrink_granularity_changes_visible() {
         let mut state = state_with_sample_tree();
         state.cursor = 0;
-        state.expand_cursor_granularity(); // expand root
-        assert_eq!(state.visible_ids.len(), 3); // root + fn_a + fn_b
-        state.cursor = 0; // still on root (fold handle at index 0)
-        state.shrink_cursor_granularity(); // collapse root
+        state.expand_cursor_granularity(); // expand root → root invisible, fn_a + fn_b visible
+        assert_eq!(state.visible_ids.len(), 2); // fn_a + fn_b
+        state.cursor = 0; // on fn_a
+        state.shrink_cursor_granularity(); // collapse: fn_a's parent (root) removed from expanded_ids
         assert_eq!(state.visible_ids.len(), 1);
     }
 
