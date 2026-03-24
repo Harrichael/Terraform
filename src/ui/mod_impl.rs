@@ -71,19 +71,8 @@ fn render_tree(frame: &mut Frame, area: Rect, state: &AppState) {
         .visible_ids
         .iter()
         .enumerate()
-        .map(|(i, &id)| build_tree_item(state, id, i == state.cursor))
+        .map(|(i, &id)| build_tree_item(state, id, i == state.cursor, state.view_depths.get(i).copied().unwrap_or(0)))
         .collect();
-
-    // Append a "References" section when the graph has visible edges.
-    if !state.visible_refs.is_empty() {
-        items.push(ListItem::new(Line::from(vec![Span::styled(
-            "─── References ──────────────────────────────────────────",
-            Style::default().fg(Color::DarkGray),
-        )])));
-        for &(from_id, to_id) in &state.visible_refs {
-            items.push(build_ref_item(state, from_id, to_id));
-        }
-    }
 
     let mut list_state = ListState::default();
     list_state.select(Some(state.cursor.saturating_sub(state.scroll_offset)));
@@ -105,10 +94,10 @@ fn render_tree(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_stateful_widget(list, inner, &mut list_state);
 }
 
-fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool) -> ListItem<'a> {
+fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool, display_depth: usize) -> ListItem<'a> {
     let node = state.tree.get(id).expect("visible id must exist");
 
-    let indent = "  ".repeat(node.depth);
+    let indent = "  ".repeat(display_depth);
 
     let expand_icon = if node.kind == NodeKind::SymRef {
         "→ "
@@ -149,7 +138,7 @@ fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool) -> Lis
 
     let line = Line::from(vec![
         Span::raw(format!("{indent}{expand_icon}")),
-        Span::styled(format!("[{kind_icon}] {}", node.name), name_style),
+        Span::styled(format!("[{kind_icon}] {}", if node.kind == NodeKind::SymRef { node.name.clone() } else { state.tree.full_path(id) }), name_style),
         Span::styled(
             limit_annotation,
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
@@ -161,6 +150,7 @@ fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool) -> Lis
 }
 
 /// Build a list item showing a single reference edge `from → to`.
+#[allow(dead_code)]
 fn build_ref_item(state: &AppState, from_id: usize, to_id: usize) -> ListItem<'static> {
     let from_name = state
         .tree
@@ -266,12 +256,12 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("  G / End        Jump to bottom"),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Granularity (per node, does not affect siblings)",
+            "  Expand / Collapse",
             Style::default().add_modifier(Modifier::UNDERLINED),
         )]),
-        Line::from("  l / Right      Expand to finer granularity"),
-        Line::from("  h / Left       Shrink to coarser granularity"),
-        Line::from("  Space          Toggle collapse/expand (full)"),
+        Line::from("  l / Right      Expand node (show semantic children)"),
+        Line::from("  h / Left       Collapse node"),
+        Line::from("  Space          Toggle expand/collapse"),
         Line::from("  [              Collapse all"),
         Line::from("  ]              Expand all"),
         Line::from(""),
@@ -279,10 +269,8 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
             "  References",
             Style::default().add_modifier(Modifier::UNDERLINED),
         )]),
-        Line::from("  l / Right      Drill into node (finer granularity)"),
-        Line::from("  h / Left       Zoom out of node (coarser granularity)"),
-        Line::from("  References section below the tree updates automatically"),
-        Line::from("  as you expand/collapse nodes."),
+        Line::from("  Symbolic references (→) appear inline when a node"),
+        Line::from("  is expanded and has dependency relationships."),
         Line::from(""),
         Line::from(vec![Span::styled(
             "  Filter",

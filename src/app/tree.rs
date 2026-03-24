@@ -224,6 +224,10 @@ impl CodeNode {
     pub fn is_leaf(&self) -> bool {
         self.children.is_empty()
     }
+
+    pub fn full_display_name(&self) -> String {
+        self.name.clone()
+    }
 }
 
 /// Arena-allocated tree of code nodes for a single file or directory workspace.
@@ -245,11 +249,22 @@ impl CodeNode {
 #[derive(Debug, Default)]
 pub struct CodeTree {
     /// Flat storage; index == node.id.
-    nodes: Vec<CodeNode>,
+    pub(crate) nodes: Vec<CodeNode>,
+    /// Number of structural nodes after initial parse (virtual nodes have id >= this).
+    pub structural_count: usize,
     /// Root node index (always 0 when the tree is non-empty).
     pub root: Option<usize>,
     /// Directed symbolic references between nodes (the reference graph).
     pub references: ReferenceGraph,
+}
+
+/// Describes one entry in the semantic dependency layout of a node's children.
+#[derive(Debug, Clone)]
+pub enum SemanticEntry {
+    /// A real structural node at the given depth relative to the expansion level.
+    Node { id: usize, depth: usize },
+    /// A "→ target" SymRef arrow at the given relative depth.
+    SymRef { target_id: usize, depth: usize },
 }
 
 impl CodeTree {
@@ -590,6 +605,187 @@ impl CodeTree {
             }
         }
         result
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn nodes_iter(&self) -> impl Iterator<Item = &CodeNode> {
+        self.nodes.iter()
+    }
+
+    /// Remove virtual SymRef nodes added during view construction
+    /// (all nodes with id >= structural_count).
+    pub fn clear_virtual_nodes(&mut self) {
+        for id in self.structural_count..self.nodes.len() {
+            if let Some(pid) = self.nodes[id].parent {
+                if pid < self.structural_count {
+                    self.nodes[pid].children.retain(|&c| c < self.structural_count);
+                }
+            }
+        }
+        self.nodes.truncate(self.structural_count);
+    }
+
+    /// Collect all node IDs in the subtree rooted at root_id.
+    pub fn subtree_ids(&self, root_id: usize) -> std::collections::HashSet<usize> {
+        let mut result = std::collections::HashSet::new();
+        let mut stack = vec![root_id];
+        while let Some(id) = stack.pop() {
+            result.insert(id);
+            if let Some(node) = self.nodes.get(id) {
+                for &child in &node.children {
+                    stack.push(child);
+                }
+            }
+        }
+        result
+    }
+
+    /// Count reference edges from the subtree of `from_root` to the subtree of `to_root`.
+    pub fn cross_ref_count(&self, from_root: usize, to_root: usize) -> usize {
+        let from_set = self.subtree_ids(from_root);
+        let to_set = self.subtree_ids(to_root);
+        self.references
+            .references()
+            .iter()
+            .filter(|r| from_set.contains(&r.from) && to_set.contains(&r.to))
+            .count()
+    }
+
+    /// Compute the full path of a node from the tree root (e.g. "src/app/state.rs").
+    pub fn full_path(&self, node_id: usize) -> String {
+        let mut parts = Vec::new();
+        let mut current = node_id;
+        loop {
+            if let Some(node) = self.nodes.get(current) {
+                parts.push(node.name.clone());
+                match node.parent {
+                    Some(pid) => current = pid,
+                    None => break,
+                }
+            } else {
+                break;
+            }
+        }
+        parts.reverse();
+        parts.join("/")
+    }
+
+    /// Compute the semantic layout of direct meaningful children of parent_id.
+    /// Returns flat list of SemanticEntry (depth is relative to the expansion level).
+    /// Only includes Folder/File/Class/Function/Module children (no Block/Line).
+    pub fn semantic_children_of(&self, parent_id: usize) -> Vec<SemanticEntry> {
+        let node = match self.nodes.get(parent_id) {
+            Some(n) => n,
+            None => return Vec::new(),
+        };
+
+        // Filter to only meaningful kinds
+        let node_ids: Vec<usize> = node
+            .children
+            .iter()
+            .filter(|&&c| {
+                if let Some(child) = self.nodes.get(c) {
+                    matches!(
+                        child.kind,
+                        NodeKind::Folder
+                            | NodeKind::File
+                            | NodeKind::Class
+                            | NodeKind::Function
+                            | NodeKind::Module
+                    )
+                } else {
+                    false
+                }
+            })
+            .copied()
+            .collect();
+
+        let n = node_ids.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Build dependency matrix: deps[i][j] = node_ids[i] uses node_ids[j]
+        let mut deps = vec![vec![false; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                if i != j && self.cross_ref_count(node_ids[i], node_ids[j]) > 0 {
+                    deps[i][j] = true;
+                }
+            }
+        }
+
+        // Compute incoming count for each node (how many others use it)
+        let mut incoming = vec![0usize; n];
+        for j in 0..n {
+            for i in 0..n {
+                if deps[i][j] {
+                    incoming[j] += 1;
+                }
+            }
+        }
+
+        // Sort processing order: ascending by incoming count, tiebreak by node_id ascending
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| (incoming[i], node_ids[i]));
+
+        // LayoutBuilder places nodes depth-first in semantic order
+        struct LayoutBuilder {
+            n: usize,
+            placed: Vec<bool>,
+            result: Vec<SemanticEntry>,
+        }
+
+        impl LayoutBuilder {
+            fn place(&mut self, idx: usize, depth: usize, node_ids: &[usize], deps: &[Vec<bool>]) {
+                self.placed[idx] = true;
+                self.result.push(SemanticEntry::Node {
+                    id: node_ids[idx],
+                    depth,
+                });
+                for j in 0..self.n {
+                    if deps[idx][j] {
+                        if self.placed[j] {
+                            // Already placed: emit a SymRef
+                            self.result.push(SemanticEntry::SymRef {
+                                target_id: node_ids[j],
+                                depth: depth + 1,
+                            });
+                        } else if deps[j][idx] {
+                            // Mutual cycle: lower id is the "parent"
+                            if node_ids[idx] < node_ids[j] {
+                                self.place(j, depth + 1, node_ids, deps);
+                            } else {
+                                self.result.push(SemanticEntry::SymRef {
+                                    target_id: node_ids[j],
+                                    depth: depth + 1,
+                                });
+                            }
+                        } else {
+                            // Pure library: place as child
+                            self.place(j, depth + 1, node_ids, deps);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut builder = LayoutBuilder {
+            n,
+            placed: vec![false; n],
+            result: Vec::new(),
+        };
+
+        for &idx in &order {
+            if !builder.placed[idx] {
+                builder.place(idx, 0, &node_ids, &deps);
+            }
+        }
+
+        builder.result
     }
 }
 

@@ -193,7 +193,7 @@ fn parse_into_tree(
 ) -> Result<()> {
     match lang {
         SourceLanguage::PlainText => {
-            add_plain_text_lines(tree, source, parent_id, depth);
+            // Plain text files get no children (just the file node itself)
         }
         _ => {
             let ts_lang = ts_language(lang);
@@ -544,6 +544,7 @@ fn is_trivial_name(name: &str) -> bool {
         )
 }
 
+#[allow(dead_code)]
 fn add_plain_text_lines(tree: &mut CodeTree, source: &str, parent_id: usize, depth: usize) {
     let mut byte_offset = 0usize;
     for (i, line) in source.lines().enumerate() {
@@ -626,8 +627,8 @@ fn walk_ts_node(
                 Some(parent_id),
             );
 
-            // Recurse into containers (not Lines or Blocks at the leaf level).
-            if our_kind != NodeKind::Line {
+            // Recurse into containers (only Module/Class/Function, not Block/Line)
+            if matches!(our_kind, NodeKind::Module | NodeKind::Class | NodeKind::Function) {
                 walk_ts_node(child, source, lines, tree, node_id, depth + 1);
             }
         } else {
@@ -650,15 +651,14 @@ fn classify_ts_node<'a>(node: &Node<'a>) -> Option<(NodeKind, Option<Node<'a>>)>
         "trait_item" => Some((NodeKind::Class, node.child_by_field_name("name"))),
         "mod_item" => Some((NodeKind::Module, node.child_by_field_name("name"))),
         // Basic constructs: if/for/while/loop/match
-        "if_expression" | "for_expression" | "while_expression" | "loop_expression"
-        | "match_expression" => Some((NodeKind::Block, None)),
+        // (removed - Block nodes are no longer produced)
 
         // ── Python ───────────────────────────────────────────────────────
         "function_definition" => Some((NodeKind::Function, node.child_by_field_name("name"))),
         "class_definition" => Some((NodeKind::Class, node.child_by_field_name("name"))),
         "decorated_definition" => Some((NodeKind::Function, None)),
         // Python-only basic constructs
-        "with_statement" => Some((NodeKind::Block, None)),
+        // (removed - Block nodes are no longer produced)
 
         // ── JavaScript ──────────────────────────────────────────────────
         "function_declaration" | "function" => {
@@ -670,7 +670,7 @@ fn classify_ts_node<'a>(node: &Node<'a>) -> Option<(NodeKind, Option<Node<'a>>)>
         }
         "arrow_function" => Some((NodeKind::Function, None)),
         // JS-only basic constructs
-        "for_in_statement" | "switch_statement" => Some((NodeKind::Block, None)),
+        // (removed - Block nodes are no longer produced)
 
         // ── TypeScript-only constructs ────────────────────────────────────
         // TypeScript files are also matched by the JS patterns above; the
@@ -697,13 +697,12 @@ fn classify_ts_node<'a>(node: &Node<'a>) -> Option<(NodeKind, Option<Node<'a>>)>
             let name_node = find_named_child_by_kind(node, "object_reference");
             Some((NodeKind::Class, name_node))
         }
-        // Individual SQL statements (SELECT, INSERT, …) are shown as Blocks.
-        "statement" => Some((NodeKind::Block, None)),
+        // Individual SQL statements (SELECT, INSERT, …) are no longer shown as Blocks.
 
         // ── Shared Python + JS + TS basic constructs ─────────────────────
         // Note: Python uses `if_statement` / `for_statement` / `while_statement`,
         // JS/TS use the same names, so these are truly shared across three languages.
-        "if_statement" | "for_statement" | "while_statement" => Some((NodeKind::Block, None)),
+        // (removed - Block nodes are no longer produced)
 
         _ => None,
     }
@@ -811,16 +810,16 @@ fn example() {
             .all_nodes_dfs()
             .iter()
             .any(|n| n.kind == NodeKind::Block);
-        assert!(has_block, "Expected Block nodes for if/for");
+        assert!(!has_block, "Block nodes should not be produced");
     }
 
     #[test]
     fn test_plain_text_gives_lines() {
         let src = "line one\nline two\nline three";
         let tree = parse_source(src, &SourceLanguage::PlainText, "notes.txt").unwrap();
-        assert_eq!(tree.len(), 4); // 1 file root + 3 lines
+        assert_eq!(tree.len(), 1); // just the file root, no children
         let vis = tree.visible_nodes();
-        assert_eq!(vis.len(), 4);
+        assert_eq!(vis.len(), 1);
     }
 
     #[test]
@@ -1000,7 +999,7 @@ SELECT id, name FROM users;
             .all_nodes_dfs()
             .iter()
             .any(|n| n.kind == NodeKind::Block);
-        assert!(has_block, "Expected Block nodes for SQL statements");
+        assert!(!has_block, "Block nodes should not be produced");
     }
 
     #[test]

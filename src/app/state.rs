@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::app::tree::CodeTree;
+use crate::app::tree::{CodeTree, NodeKind, SemanticEntry};
 use crate::parser::{parse_directory, parse_source, SourceLanguage};
 
 /// The overall application mode.
@@ -43,6 +44,12 @@ pub struct AppState {
     pub status: String,
     /// Whether the application should quit.
     pub should_quit: bool,
+    /// Number of structural (non-virtual) nodes at load time.
+    pub base_node_count: usize,
+    /// IDs of nodes that have been "expanded away" (replaced by their semantic children).
+    pub expanded_ids: HashSet<usize>,
+    /// Display depth for each entry in visible_ids (parallel vector).
+    pub view_depths: Vec<usize>,
 }
 
 impl AppState {
@@ -59,6 +66,9 @@ impl AppState {
             filter: String::new(),
             status: String::from("No path loaded. Pass a source file or directory as a command-line argument."),
             should_quit: false,
+            base_node_count: 0,
+            expanded_ids: HashSet::new(),
+            view_depths: Vec::new(),
         }
     }
 
@@ -72,6 +82,9 @@ impl AppState {
             .unwrap_or("unknown")
             .to_string();
         self.tree = parse_source(&source, &lang, &fname)?;
+        self.tree.structural_count = self.tree.node_count();
+        self.base_node_count = self.tree.node_count();
+        self.expanded_ids.clear();
         self.current_path = Some(path.clone());
         self.filter.clear();
         self.cursor = 0;
@@ -84,37 +97,100 @@ impl AppState {
     /// Load a directory, parse all source files in it, and refresh the view.
     pub fn load_directory(&mut self, path: PathBuf) -> anyhow::Result<()> {
         self.tree = parse_directory(&path)?;
+        self.tree.structural_count = self.tree.node_count();
+        self.base_node_count = self.tree.node_count();
+        self.expanded_ids.clear();
         self.current_path = Some(path.clone());
         self.filter.clear();
         self.cursor = 0;
         self.scroll_offset = 0;
-        self.status = format!(
-            "Loaded directory: {} — use l/Right to drill down into a node",
-            path.display()
-        );
+        self.status = format!("Loaded directory: {} — use l/Right to expand", path.display());
         self.refresh_visible();
         Ok(())
     }
 
     /// Recompute `visible_ids` and `visible_refs` from the current tree + filter.
     pub fn refresh_visible(&mut self) {
-        let nodes = if self.filter.is_empty() {
-            self.tree.visible_nodes()
-        } else {
-            self.tree.filter_visible(&self.filter)
-        };
-        self.visible_ids = nodes.iter().map(|n| n.id).collect();
+        self.tree.clear_virtual_nodes();
+        self.visible_ids.clear();
+        self.view_depths.clear();
 
-        // Project the reference graph onto the currently visible nodes.
+        if let Some(root_id) = self.tree.root {
+            self.build_view_entries(root_id, 0);
+        }
+
+        // Apply filter if active
+        if !self.filter.is_empty() {
+            let pat = self.filter.to_ascii_lowercase();
+            let pairs: Vec<(usize, usize)> = self
+                .visible_ids
+                .iter()
+                .zip(self.view_depths.iter())
+                .filter(|&(&id, _)| {
+                    if let Some(node) = self.tree.get(id) {
+                        node.name.to_ascii_lowercase().contains(&pat)
+                            || node
+                                .detail
+                                .as_deref()
+                                .map(|d| d.to_ascii_lowercase().contains(&pat))
+                                .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                })
+                .map(|(&id, &d)| (id, d))
+                .collect();
+            self.visible_ids = pairs.iter().map(|&(id, _)| id).collect();
+            self.view_depths = pairs.iter().map(|&(_, d)| d).collect();
+        }
+
         self.visible_refs = self.tree.project_refs_onto_visible(&self.visible_ids);
 
-        // Keep cursor in bounds.
         if self.visible_ids.is_empty() {
             self.cursor = 0;
         } else if self.cursor >= self.visible_ids.len() {
             self.cursor = self.visible_ids.len() - 1;
         }
         self.ensure_cursor_visible();
+    }
+
+    fn build_view_entries(&mut self, node_id: usize, display_depth: usize) {
+        if self.expanded_ids.contains(&node_id) {
+            let entries = self.tree.semantic_children_of(node_id);
+            let has_node_entries = entries.iter().any(|e| matches!(e, SemanticEntry::Node { .. }));
+            if !has_node_entries {
+                // Expanded but no semantic children — show the node itself
+                self.visible_ids.push(node_id);
+                self.view_depths.push(display_depth);
+                return;
+            }
+            for entry in entries {
+                match entry {
+                    SemanticEntry::Node { id, depth } => {
+                        self.build_view_entries(id, display_depth + depth);
+                    }
+                    SemanticEntry::SymRef { target_id, depth } => {
+                        let full_path = self.tree.full_path(target_id);
+                        let virtual_id = self.tree.add_node(
+                            NodeKind::SymRef,
+                            full_path,
+                            (0, 0),
+                            (0, 0),
+                            0,
+                            None,
+                        );
+                        if let Some(n) = self.tree.get_mut(virtual_id) {
+                            n.sym_ref_target = Some(target_id);
+                        }
+                        self.visible_ids.push(virtual_id);
+                        self.view_depths.push(display_depth + depth);
+                    }
+                }
+            }
+        } else {
+            self.visible_ids.push(node_id);
+            self.view_depths.push(display_depth);
+        }
     }
 
     /// Move cursor up by `n` rows.
@@ -134,126 +210,159 @@ impl AppState {
     /// Toggle collapse on the node under the cursor.
     pub fn toggle_cursor_collapse(&mut self) {
         if let Some(&id) = self.visible_ids.get(self.cursor) {
-            if let Some(node) = self.tree.get(id) {
-                if node.is_leaf() {
-                    self.status = format!("'{}' has no children to collapse.", node.name);
-                    return;
+            if self.expanded_ids.contains(&id) {
+                self.collapse_cursor_node();
+            } else {
+                let has_children = self
+                    .tree
+                    .semantic_children_of(id)
+                    .iter()
+                    .any(|e| matches!(e, SemanticEntry::Node { .. }));
+                if has_children {
+                    self.expand_cursor_node();
+                } else {
+                    self.collapse_cursor_node();
                 }
             }
-            self.tree.toggle_collapse(id);
-            self.refresh_visible();
         }
     }
 
     /// Expand the granularity of the node under the cursor (show finer children).
-    /// This only affects the cursor node — siblings are unchanged.
     pub fn expand_cursor_granularity(&mut self) {
-        if let Some(&id) = self.visible_ids.get(self.cursor) {
-            if let Some(node) = self.tree.get(id) {
-                if node.is_leaf() {
-                    self.status = format!("'{}' is already at the finest level.", node.name);
-                    return;
-                }
-                if node.granularity_limit.is_none() {
-                    self.status = format!("'{}' already shows all detail.", node.name);
-                    return;
-                }
-            }
-            self.tree.expand_granularity(id);
-            self.refresh_visible();
-            if let Some(node) = self.tree.get(id) {
-                let level_desc = node
-                    .granularity_limit
-                    .as_ref()
-                    .map(|k| format!("{k}"))
-                    .unwrap_or_else(|| "all".to_string());
-                self.status = format!("'{}' now shows up to {} level.", node.name, level_desc);
-            }
-        }
+        self.expand_cursor_node();
     }
 
     /// Shrink the granularity of the node under the cursor (show coarser children).
-    /// This only affects the cursor node — siblings are unchanged.
     pub fn shrink_cursor_granularity(&mut self) {
-        if let Some(&id) = self.visible_ids.get(self.cursor) {
-            if let Some(node) = self.tree.get(id) {
-                if node.is_leaf() {
-                    self.status = format!("'{}' has no children.", node.name);
-                    return;
-                }
-            }
-            self.tree.shrink_granularity(id);
-            self.refresh_visible();
-            if let Some(node) = self.tree.get(id) {
-                let level_desc = if node.collapsed {
-                    "collapsed".to_string()
-                } else {
-                    node.granularity_limit
-                        .as_ref()
-                        .map(|k| format!("up to {k}"))
-                        .unwrap_or_else(|| "all".to_string())
-                };
-                self.status = format!("'{}': {}", node.name, level_desc);
-            }
-        }
+        self.collapse_cursor_node();
     }
 
     /// Collapse all non-leaf nodes.
     pub fn collapse_all(&mut self) {
-        let ids: Vec<usize> = self
-            .tree
-            .all_nodes_dfs()
-            .iter()
-            .filter(|n| !n.is_leaf())
-            .map(|n| n.id)
-            .collect();
-        for id in ids {
-            if let Some(n) = self.tree.get_mut(id) {
-                n.collapsed = true;
-            }
-        }
+        self.expanded_ids.clear();
         self.refresh_visible();
     }
 
     /// Expand all nodes.
     pub fn expand_all(&mut self) {
-        let ids: Vec<usize> = self
-            .tree
-            .all_nodes_dfs()
-            .iter()
-            .map(|n| n.id)
+        let structural_count = self.tree.structural_count;
+        let ids: Vec<usize> = (0..structural_count)
+            .filter(|&id| {
+                if let Some(node) = self.tree.get(id) {
+                    !node.is_leaf() && node.kind != NodeKind::SymRef
+                } else {
+                    false
+                }
+            })
             .collect();
         for id in ids {
-            if let Some(n) = self.tree.get_mut(id) {
-                n.collapsed = false;
-                n.granularity_limit = None;
+            let has_children = self
+                .tree
+                .semantic_children_of(id)
+                .iter()
+                .any(|e| matches!(e, SemanticEntry::Node { .. }));
+            if has_children {
+                self.expanded_ids.insert(id);
             }
         }
         self.refresh_visible();
     }
 
-    /// If the cursor is on a `SymRef` node, jump to its canonical definition
-    /// in the lib section. Returns `true` if a jump was performed.
+    /// If the cursor is on a `SymRef` node, jump to its canonical definition.
+    /// Returns `true` if a jump was performed.
     pub fn jump_to_sym_ref_target(&mut self) -> bool {
         if let Some(&id) = self.visible_ids.get(self.cursor) {
-            if let Some(node) = self.tree.get(id) {
-                if let Some(target_id) = node.sym_ref_target {
-                    // Find the target in the lib section nodes rendered below main tree.
-                    // We place lib section IDs after the main visible_ids in state;
-                    // refresh_visible_with_lib builds the combined list.
-                    if let Some(pos) = self.visible_ids.iter().position(|&vid| vid == target_id) {
-                        self.cursor = pos;
-                        self.ensure_cursor_visible();
-                        if let Some(target_node) = self.tree.get(target_id) {
-                            self.status =
-                                format!("Jumped to definition: '{}'", target_node.name);
+            if let Some(target_id) = self.tree.get(id).and_then(|n| n.sym_ref_target) {
+                // Check if target is already visible
+                if let Some(pos) = self.visible_ids.iter().position(|&vid| vid == target_id) {
+                    self.cursor = pos;
+                    self.ensure_cursor_visible();
+                    let name = self
+                        .tree
+                        .get(target_id)
+                        .map(|n| n.name.clone())
+                        .unwrap_or_default();
+                    self.status = format!("Jumped to definition: '{}'", name);
+                    return true;
+                }
+                // Target not visible — expand path to it
+                let mut path = Vec::new();
+                let mut current = target_id;
+                loop {
+                    if let Some(n) = self.tree.get(current) {
+                        path.push(current);
+                        match n.parent {
+                            Some(pid) => current = pid,
+                            None => break,
                         }
-                        return true;
+                    } else {
+                        break;
                     }
+                }
+                path.reverse();
+                for &anc in &path[..path.len().saturating_sub(1)] {
+                    self.expanded_ids.insert(anc);
+                }
+                self.refresh_visible();
+                if let Some(pos) = self.visible_ids.iter().position(|&vid| vid == target_id) {
+                    self.cursor = pos;
+                    self.ensure_cursor_visible();
+                    let name = self
+                        .tree
+                        .get(target_id)
+                        .map(|n| n.name.clone())
+                        .unwrap_or_default();
+                    self.status = format!("Jumped to definition: '{}'", name);
+                    return true;
                 }
             }
         }
         false
+    }
+
+    pub fn expand_cursor_node(&mut self) {
+        if let Some(&id) = self.visible_ids.get(self.cursor) {
+            let is_symref = self
+                .tree
+                .get(id)
+                .map(|n| n.kind == NodeKind::SymRef)
+                .unwrap_or(false);
+            if is_symref {
+                return;
+            }
+            let has_children = self
+                .tree
+                .semantic_children_of(id)
+                .iter()
+                .any(|e| matches!(e, SemanticEntry::Node { .. }));
+            if !has_children {
+                let path = self.tree.full_path(id);
+                self.status = format!("'{}' has no expandable children.", path);
+                return;
+            }
+            self.expanded_ids.insert(id);
+            self.refresh_visible();
+            let path = self.tree.full_path(id);
+            self.status = format!("Expanded '{}'.", path);
+        }
+    }
+
+    pub fn collapse_cursor_node(&mut self) {
+        if let Some(&id) = self.visible_ids.get(self.cursor) {
+            if self.expanded_ids.remove(&id) {
+                self.refresh_visible();
+                let path = self.tree.full_path(id);
+                self.status = format!("Collapsed '{}'.", path);
+                return;
+            }
+            let parent_id = self.tree.get(id).and_then(|n| n.parent);
+            if let Some(pid) = parent_id {
+                self.expanded_ids.remove(&pid);
+                self.refresh_visible();
+                let path = self.tree.full_path(pid);
+                self.status = format!("Collapsed '{}'.", path);
+            }
+        }
     }
 
     /// Enter filter mode.
@@ -339,6 +448,8 @@ mod tests {
         let _l1 = tree.add_node(NodeKind::Line, "let x = 1;", (0, 20), (1, 1), 2, Some(f1));
         let _f2 = tree.add_node(NodeKind::Function, "fn_b", (101, 200), (16, 30), 1, Some(root));
         state.tree = tree;
+        state.tree.structural_count = state.tree.node_count();
+        state.base_node_count = state.tree.node_count();
         state.refresh_visible();
         state
     }
@@ -355,6 +466,9 @@ mod tests {
     #[test]
     fn test_cursor_movement() {
         let mut state = state_with_sample_tree();
+        // Expand root so fn_a and fn_b become visible
+        state.expanded_ids.insert(0);
+        state.refresh_visible();
         assert_eq!(state.cursor, 0);
         state.move_cursor_down(1);
         assert_eq!(state.cursor, 1);
@@ -379,8 +493,12 @@ mod tests {
     #[test]
     fn test_toggle_collapse_updates_visible() {
         let mut state = state_with_sample_tree();
-        let initial = state.visible_ids.len();
-        state.cursor = 0;
+        // Expand root to see fn_a and fn_b
+        state.expanded_ids.insert(0);
+        state.refresh_visible();
+        let initial = state.visible_ids.len(); // 2
+        state.cursor = 0; // on fn_a
+        // Toggle on fn_a: fn_a not expanded, no semantic children → collapse parent (root)
         state.toggle_cursor_collapse();
         assert!(state.visible_ids.len() < initial);
     }
@@ -408,9 +526,10 @@ mod tests {
     fn test_collapse_all_expand_all() {
         let mut state = state_with_sample_tree();
         state.collapse_all();
-        assert_eq!(state.visible_ids.len(), 1);
+        assert_eq!(state.visible_ids.len(), 1); // just root
         state.expand_all();
-        assert_eq!(state.visible_ids.len(), 4);
+        // root has semantic children fn_a and fn_b; fn_a has no semantic children (only Line child)
+        assert_eq!(state.visible_ids.len(), 2);
     }
 
     #[test]
@@ -426,38 +545,21 @@ mod tests {
     #[test]
     fn test_expand_granularity_changes_visible() {
         let mut state = state_with_sample_tree();
-        // fn_a (id=1) has Line children. Set its granularity to Function level →
-        // Lines (level 6) are finer than Function (level 4) → hidden.
-        state.tree.get_mut(1).unwrap().granularity_limit = Some(NodeKind::Function);
-        state.refresh_visible();
-        assert_eq!(state.visible_ids.len(), 3); // root + fn_a (no Line) + fn_b
-
-        // Expand fn_a's granularity (cursor=1).
-        state.cursor = 1;
-        state.expand_cursor_granularity();
-        // Function → Block: Line (6) still finer than Block (5) → still hidden.
-        assert_eq!(state.visible_ids.len(), 3);
-        // Expand again: Block → Line. Line.is_finer_than(Line) = false → shown.
-        state.expand_cursor_granularity();
-        assert_eq!(state.visible_ids.len(), 4);
+        assert_eq!(state.visible_ids.len(), 1); // just root
+        state.cursor = 0;
+        state.expand_cursor_granularity(); // expand root → shows fn_a and fn_b
+        assert_eq!(state.visible_ids.len(), 2);
     }
 
     #[test]
     fn test_shrink_granularity_changes_visible() {
         let mut state = state_with_sample_tree();
-        // Root has no limit (shows all 4 nodes)
-        assert_eq!(state.visible_ids.len(), 4);
         state.cursor = 0;
-        state.shrink_cursor_granularity();
-        // Should set limit to Block (Line still shown because fn_a has depth 2
-        // and its Line child has depth 3 — wait, the limit is on the FILE root
-        // which only has Function children, not Line directly)
-        // The Line is a child of fn_a, not of root, so root's limit doesn't hide it directly
-        // Root's granularity_limit only affects root's DIRECT children.
-        // fn_a is a Function (≤ Block), so fn_a is still shown.
-        // fn_a's Line child is not affected by root's granularity_limit.
-        // So visible count stays at 4.
-        assert_eq!(state.visible_ids.len(), 4);
+        state.expand_cursor_granularity(); // expand root
+        assert_eq!(state.visible_ids.len(), 2);
+        state.cursor = 0; // on fn_a
+        state.shrink_cursor_granularity(); // collapse parent (root)
+        assert_eq!(state.visible_ids.len(), 1);
     }
 
     #[test]
