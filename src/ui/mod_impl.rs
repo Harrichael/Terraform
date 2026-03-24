@@ -136,9 +136,15 @@ fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool, displa
         .map(|d| format!("  {d}"))
         .unwrap_or_default();
 
+    let display_name = if node.kind == NodeKind::SymRef {
+        node.name.clone()
+    } else {
+        state.tree.full_path(id)
+    };
+
     let line = Line::from(vec![
         Span::raw(format!("{indent}{expand_icon}")),
-        Span::styled(format!("[{kind_icon}] {}", if node.kind == NodeKind::SymRef { node.name.clone() } else { state.tree.full_path(id) }), name_style),
+        Span::styled(format!("[{kind_icon}] {}", display_name), name_style),
         Span::styled(
             limit_annotation,
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
