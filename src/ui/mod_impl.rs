@@ -67,11 +67,28 @@ fn render_tree(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     // Build list items: main tree rows.
+    // Compute reference-connected nodes for the current cursor.
+    let cursor_id = state.visible_ids.get(state.cursor).copied();
+    let ref_connected: std::collections::HashSet<usize> = if let Some(cid) = cursor_id {
+        state
+            .visible_refs
+            .iter()
+            .filter(|&&(from, to)| from == cid || to == cid)
+            .flat_map(|&(from, to)| [from, to])
+            .filter(|&x| x != cid)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let items: Vec<ListItem> = state
         .visible_ids
         .iter()
         .enumerate()
-        .map(|(i, &id)| build_tree_item(state, id, i == state.cursor, state.view_depths.get(i).copied().unwrap_or(0)))
+        .map(|(i, &id)| {
+            let is_ref = ref_connected.contains(&id);
+            build_tree_item(state, id, i == state.cursor, state.view_depths.get(i).copied().unwrap_or(0), is_ref)
+        })
         .collect();
 
     let mut list_state = ListState::default();
@@ -94,7 +111,7 @@ fn render_tree(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_stateful_widget(list, inner, &mut list_state);
 }
 
-fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool, display_depth: usize) -> ListItem<'a> {
+fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool, display_depth: usize, is_ref_connected: bool) -> ListItem<'a> {
     let node = state.tree.get(id).expect("visible id must exist");
 
     let indent = "  ".repeat(display_depth);
@@ -103,10 +120,14 @@ fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool, displa
         "→ "
     } else if node.is_leaf() {
         "  "
-    } else if node.collapsed {
-        "▶ "
+    } else if state.expanded_ids.contains(&id) {
+        if state.folded_ids.contains(&id) {
+            "▶ " // expanded but folded: Space to unfold
+        } else {
+            "▼ " // expanded and showing children: Space to fold
+        }
     } else {
-        "▼ "
+        "▷ " // not yet expanded: Right/l to expand granularity
     };
 
     let kind_icon = kind_icon(&node.kind);
@@ -126,6 +147,10 @@ fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool, displa
             .bg(Color::Blue)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD)
+    } else if is_ref_connected {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::UNDERLINED)
     } else {
         kind_color_style(&node.kind)
     };
@@ -265,9 +290,10 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
             "  Expand / Collapse",
             Style::default().add_modifier(Modifier::UNDERLINED),
         )]),
-        Line::from("  l / Right      Expand node (show semantic children)"),
-        Line::from("  h / Left       Collapse node"),
-        Line::from("  Space          Toggle expand/collapse"),
+        Line::from("  l / Right      Expand granularity (show semantic children)"),
+        Line::from("  h / Left       Collapse granularity"),
+        Line::from("  Space          Fold/unfold children (toggle visibility)"),
+        Line::from("  Enter          Fold/unfold or jump to SymRef"),
         Line::from("  [              Collapse all"),
         Line::from("  ]              Expand all"),
         Line::from(""),

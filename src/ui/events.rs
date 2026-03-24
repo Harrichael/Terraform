@@ -40,22 +40,22 @@ fn handle_normal_key(state: &mut AppState, key: KeyEvent) {
             }
         }
 
-        // Collapse / Expand (full toggle for the current node)
-        KeyCode::Char(' ') => state.toggle_cursor_collapse(),
+        // Collapse / Expand (fold toggle for the current node)
+        KeyCode::Char(' ') => state.toggle_fold(),
 
-        // Enter: toggle collapse, or jump to SymRef target
+        // Enter: fold/unfold, or jump to SymRef target
         KeyCode::Enter => {
             if let Some(&id) = state.visible_ids.get(state.cursor) {
                 if let Some(node) = state.tree.get(id) {
                     if node.kind == NodeKind::SymRef {
                         if !state.jump_to_sym_ref_target() {
-                            state.status = "Definition is not currently visible. Try expanding all ([]).".to_string();
+                            state.status = "Definition is not currently visible.".to_string();
                         }
                         return;
                     }
                 }
             }
-            state.toggle_cursor_collapse();
+            state.toggle_fold();
         }
 
         // Granularity: l / Right = expand (show finer detail on this node only)
