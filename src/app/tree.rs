@@ -1,6 +1,7 @@
 /// Hierarchical code node kinds, ordered from coarsest to finest granularity.
 /// `SymRef` is a special non-granularity kind for symbolic references.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub enum NodeKind {
     Folder,
     Module,

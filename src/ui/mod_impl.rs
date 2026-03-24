@@ -67,7 +67,7 @@ fn render_tree(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     // Build list items: main tree rows.
-    let mut items: Vec<ListItem> = state
+    let items: Vec<ListItem> = state
         .visible_ids
         .iter()
         .enumerate()
