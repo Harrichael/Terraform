@@ -66,30 +66,30 @@ fn render_tree(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    // Build list items: main tree rows + lib section.
-    let mut items: Vec<ListItem> = state
+    // Build list items: main tree rows.
+    // Compute reference-connected nodes for the current cursor.
+    let cursor_id = state.visible_ids.get(state.cursor).copied();
+    let ref_connected: std::collections::HashSet<usize> = if let Some(cid) = cursor_id {
+        state
+            .visible_refs
+            .iter()
+            .filter(|&&(from, to)| from == cid || to == cid)
+            .flat_map(|&(from, to)| [from, to])
+            .filter(|&x| x != cid)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let items: Vec<ListItem> = state
         .visible_ids
         .iter()
         .enumerate()
-        .map(|(i, &id)| build_tree_item(state, id, i == state.cursor))
+        .map(|(i, &id)| {
+            let is_ref = ref_connected.contains(&id);
+            build_tree_item(state, id, i == state.cursor, state.view_depths.get(i).copied().unwrap_or(0), is_ref)
+        })
         .collect();
-
-    // Append lib section if there are lib nodes.
-    let lib_nodes = state.tree.visible_lib_nodes();
-    if !lib_nodes.is_empty() {
-        // Separator row.
-        let sep = ListItem::new(Line::from(vec![Span::styled(
-            "─── Lib (shared definitions) ────────────────────────────",
-            Style::default().fg(Color::DarkGray),
-        )]));
-        items.push(sep);
-
-        let lib_start_idx = state.visible_ids.len() + 1; // +1 for separator
-        for (li, node) in lib_nodes.iter().enumerate() {
-            let is_selected = state.cursor == lib_start_idx + li;
-            items.push(build_tree_item(state, node.id, is_selected));
-        }
-    }
 
     let mut list_state = ListState::default();
     list_state.select(Some(state.cursor.saturating_sub(state.scroll_offset)));
@@ -111,31 +111,24 @@ fn render_tree(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_stateful_widget(list, inner, &mut list_state);
 }
 
-fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool) -> ListItem<'a> {
+fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool, display_depth: usize, is_ref_connected: bool) -> ListItem<'a> {
     let node = state.tree.get(id).expect("visible id must exist");
 
-    let indent = "  ".repeat(node.depth);
+    let indent = "  ".repeat(display_depth);
 
     let expand_icon = if node.kind == NodeKind::SymRef {
         "→ "
     } else if node.is_leaf() {
         "  "
-    } else if node.collapsed {
+    } else if state.expanded_ids.contains(&id) {
+        // Node is expanded+folded: visible as ▶. Space to unfold.
+        // (Expanded+unfolded nodes are invisible — their children replaced them.)
         "▶ "
     } else {
-        "▼ "
+        "▷ " // not yet expanded: Right/l to expand granularity
     };
 
-    let kind_icon = match node.kind {
-        NodeKind::Folder => "dir",
-        NodeKind::Module => "mod",
-        NodeKind::File => "fil",
-        NodeKind::Class => "cls",
-        NodeKind::Function => "fn ",
-        NodeKind::Block => "{ }",
-        NodeKind::Line => "   ",
-        NodeKind::SymRef => "ref",
-    };
+    let kind_icon = kind_icon(&node.kind);
 
     // For a node with a granularity limit, show it as a small annotation.
     let limit_annotation = if node.kind != NodeKind::SymRef && !node.is_leaf() {
@@ -152,6 +145,10 @@ fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool) -> Lis
             .bg(Color::Blue)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD)
+    } else if is_ref_connected {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::UNDERLINED)
     } else {
         kind_color_style(&node.kind)
     };
@@ -162,9 +159,15 @@ fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool) -> Lis
         .map(|d| format!("  {d}"))
         .unwrap_or_default();
 
+    let display_name = if node.kind == NodeKind::SymRef {
+        node.name.clone()
+    } else {
+        state.tree.full_path(id)
+    };
+
     let line = Line::from(vec![
         Span::raw(format!("{indent}{expand_icon}")),
-        Span::styled(format!("[{kind_icon}] {}", node.name), name_style),
+        Span::styled(format!("[{kind_icon}] {}", display_name), name_style),
         Span::styled(
             limit_annotation,
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
@@ -173,6 +176,49 @@ fn build_tree_item<'a>(state: &'a AppState, id: usize, is_selected: bool) -> Lis
     ]);
 
     ListItem::new(line)
+}
+
+/// Build a list item showing a single reference edge `from → to`.
+#[allow(dead_code)]
+fn build_ref_item(state: &AppState, from_id: usize, to_id: usize) -> ListItem<'static> {
+    let from_name = state
+        .tree
+        .get(from_id)
+        .map(|n| format!("[{}] {}", kind_icon(&n.kind), n.name))
+        .unwrap_or_else(|| format!("#{from_id}"));
+    let to_name = state
+        .tree
+        .get(to_id)
+        .map(|n| format!("[{}] {}", kind_icon(&n.kind), n.name))
+        .unwrap_or_else(|| format!("#{to_id}"));
+
+    let line = Line::from(vec![
+        Span::raw("  "),
+        Span::styled(from_name, Style::default().fg(Color::LightBlue)),
+        Span::styled(
+            "  ──→  ",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(to_name, Style::default().fg(Color::LightGreen)),
+    ]);
+    ListItem::new(line)
+}
+
+/// Map a [`NodeKind`] to the three-character icon string shown in both the
+/// tree rows and the reference-edge rows.
+fn kind_icon(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Folder => "dir",
+        NodeKind::Module => "mod",
+        NodeKind::File => "fil",
+        NodeKind::Class => "cls",
+        NodeKind::Function => "fn ",
+        NodeKind::Block => "{ }",
+        NodeKind::Line => "   ",
+        NodeKind::SymRef => "ref",
+    }
 }
 
 /// Render the one-line status bar at the bottom.
@@ -239,20 +285,22 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("  G / End        Jump to bottom"),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Granularity (per node, does not affect siblings)",
+            "  Expand / Collapse",
             Style::default().add_modifier(Modifier::UNDERLINED),
         )]),
-        Line::from("  l / Right      Expand to finer granularity"),
-        Line::from("  h / Left       Shrink to coarser granularity"),
-        Line::from("  Space          Toggle collapse/expand (full)"),
+        Line::from("  l / Right      Expand granularity (show semantic children)"),
+        Line::from("  h / Left       Collapse granularity"),
+        Line::from("  Space          Fold parent (hide siblings); unfold ▶ node"),
+        Line::from("  Enter          Same as Space, or jump to SymRef target"),
         Line::from("  [              Collapse all"),
         Line::from("  ]              Expand all"),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Symbolic References",
+            "  References",
             Style::default().add_modifier(Modifier::UNDERLINED),
         )]),
-        Line::from("  Enter (on [ref]) Jump to canonical definition in Lib"),
+        Line::from("  Symbolic references (→) appear inline when a node"),
+        Line::from("  is expanded and has dependency relationships."),
         Line::from(""),
         Line::from(vec![Span::styled(
             "  Filter",

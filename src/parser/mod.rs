@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::{Language, Node, Parser};
 
-use crate::app::tree::{CodeTree, NodeKind};
+use crate::app::tree::{CodeTree, NodeKind, ReferenceKind};
 
 /// Supported source languages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,8 +59,12 @@ pub fn parse_source(source: &str, lang: &SourceLanguage, file_name: &str) -> Res
 }
 
 /// Walk a directory and build a hierarchical `CodeTree` (Folder → File → constructs).
-/// Identical top-level class/struct names found in multiple files are deduplicated
-/// into the lib section with SymRef nodes in their respective files.
+///
+/// After building the contains topology the parser performs a second pass to
+/// populate the [`ReferenceGraph`] with call and import edges extracted from
+/// each source file.  These edges represent the *symbolic* relationships
+/// between constructs (function calls, type usages, imports) and are
+/// independent of the directory containment structure.
 pub fn parse_directory(dir: &Path) -> Result<CodeTree> {
     let mut tree = CodeTree::new();
 
@@ -85,10 +89,24 @@ pub fn parse_directory(dir: &Path) -> Result<CodeTree> {
         n.granularity_limit = Some(NodeKind::File);
     }
 
-    // symbol_map: (name, kind_label) → first-occurrence node id (canonical definition)
-    let mut symbol_map: HashMap<(String, String), usize> = HashMap::new();
+    // Phase 1: build the contains topology (folder → file → constructs).
+    // Collect (file_id, source, lang) so we can do reference extraction after.
+    let mut file_sources: Vec<(usize, String, SourceLanguage)> = Vec::new();
+    walk_dir(dir, &mut tree, root_id, 1, &mut file_sources)?;
 
-    walk_dir(dir, &mut tree, root_id, 1, &mut symbol_map)?;
+    // Phase 2: build a name → node_id map from the completed tree.
+    let name_to_id = build_name_to_id_map(&tree);
+
+    // Phase 3: for each file extract raw references and resolve them to node IDs.
+    for (file_id, source, lang) in &file_sources {
+        for (from_id, ref_name, kind) in extract_raw_refs(source, lang, &tree, *file_id) {
+            if let Some(&to_id) = name_to_id.get(&ref_name) {
+                if from_id != to_id {
+                    tree.add_reference(from_id, to_id, kind);
+                }
+            }
+        }
+    }
 
     Ok(tree)
 }
@@ -96,12 +114,15 @@ pub fn parse_directory(dir: &Path) -> Result<CodeTree> {
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
 /// Recursively build folder/file nodes for `dir` under `parent_id`.
+///
+/// Each processed file's source text is appended to `file_sources` for the
+/// subsequent reference-extraction pass.
 fn walk_dir(
     dir: &Path,
     tree: &mut CodeTree,
     parent_id: usize,
     depth: usize,
-    symbol_map: &mut HashMap<(String, String), usize>,
+    file_sources: &mut Vec<(usize, String, SourceLanguage)>,
 ) -> Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("Cannot read directory: {}", dir.display()))?
@@ -140,7 +161,7 @@ fn walk_dir(
             if let Some(n) = tree.get_mut(folder_id) {
                 n.granularity_limit = Some(NodeKind::File);
             }
-            walk_dir(&path, tree, folder_id, depth + 1, symbol_map)?;
+            walk_dir(&path, tree, folder_id, depth + 1, file_sources)?;
         } else if path.is_file() {
             let lang = SourceLanguage::from_path(&path);
             let source = std::fs::read_to_string(&path).unwrap_or_default();
@@ -154,7 +175,8 @@ fn walk_dir(
                 Some(parent_id),
             );
 
-            parse_into_tree_with_symrefs(tree, &source, &lang, file_id, depth + 1, symbol_map)?;
+            parse_into_tree(tree, &source, &lang, file_id, depth + 1)?;
+            file_sources.push((file_id, source, lang));
         }
     }
 
@@ -171,7 +193,7 @@ fn parse_into_tree(
 ) -> Result<()> {
     match lang {
         SourceLanguage::PlainText => {
-            add_plain_text_lines(tree, source, parent_id, depth);
+            // Plain text files get no children (just the file node itself)
         }
         _ => {
             let ts_lang = ts_language(lang);
@@ -181,64 +203,348 @@ fn parse_into_tree(
     Ok(())
 }
 
-/// Like `parse_into_tree`, but also checks/registers top-level Class nodes for
-/// symbolic reference deduplication across files.
-fn parse_into_tree_with_symrefs(
-    tree: &mut CodeTree,
+// ─── Reference extraction ─────────────────────────────────────────────────────
+
+/// Build a name → node_id lookup from all Function, Class, Module, and File
+/// nodes in the tree.  The first occurrence wins for duplicate names.
+///
+/// **Limitation**: symbols that share a name across files (e.g. two files each
+/// defining `fn main`) can only be mapped to the first occurrence.  Fully
+/// disambiguating same-named symbols would require tracking parent context or
+/// module path, which is left for future work.
+fn build_name_to_id_map(tree: &CodeTree) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for node in tree.all_nodes_dfs() {
+        if matches!(node.kind, NodeKind::Function | NodeKind::Class | NodeKind::Module | NodeKind::File) {
+            map.entry(node.name.clone()).or_insert(node.id);
+        }
+    }
+    map
+}
+
+/// Extract raw symbolic references from one file's source.
+///
+/// Returns `(from_node_id, ref_name, ref_kind)` triples where `from_node_id`
+/// is the innermost Function/Class/File node that textually contains the
+/// reference site (determined by byte-range containment).
+fn extract_raw_refs(
     source: &str,
     lang: &SourceLanguage,
+    tree: &CodeTree,
     file_id: usize,
-    depth: usize,
-    symbol_map: &mut HashMap<(String, String), usize>,
-) -> Result<()> {
-    parse_into_tree(tree, source, lang, file_id, depth)?;
+) -> Vec<(usize, String, ReferenceKind)> {
+    if matches!(lang, SourceLanguage::PlainText | SourceLanguage::Sql) {
+        return Vec::new();
+    }
+    let ts_lang = ts_language(lang);
+    let mut parser = Parser::new();
+    if parser.set_language(&ts_lang).is_err() {
+        return Vec::new();
+    }
+    let ts_tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
 
-    // Collect the just-added top-level Class nodes (children of file_id at depth `depth`).
-    let file_children: Vec<usize> = tree
-        .get(file_id)
-        .map(|n| n.children.clone())
-        .unwrap_or_default();
+    // Build (node_id, byte_range) pairs for each Function/Class under this file.
+    let scope_nodes = collect_scope_nodes(tree, file_id);
 
-    let mut to_replace: Vec<(usize, usize)> = Vec::new(); // (child_id, canonical_id)
+    let source_bytes = source.as_bytes();
+    let mut result = Vec::new();
+    collect_ref_edges(
+        ts_tree.root_node(),
+        source_bytes,
+        &scope_nodes,
+        file_id,
+        &mut result,
+    );
+    result
+}
 
-    for child_id in file_children {
-        if let Some(child) = tree.get(child_id) {
-            if matches!(child.kind, NodeKind::Class) {
-                let key = (child.name.clone(), "cls".to_string());
-                match symbol_map.get(&key) {
-                    None => {
-                        // First occurrence — register as canonical.
-                        symbol_map.insert(key, child_id);
-                    }
-                    Some(&canonical_id) => {
-                        // Duplicate — schedule replacement with a SymRef.
-                        // Also promote canonical to lib if not already.
-                        to_replace.push((child_id, canonical_id));
-                    }
+/// Collect all Function and Class node IDs with their byte ranges under `file_id`.
+fn collect_scope_nodes(tree: &CodeTree, file_id: usize) -> Vec<(usize, (usize, usize))> {
+    let mut out = Vec::new();
+    let mut stack = vec![file_id];
+    while let Some(id) = stack.pop() {
+        if let Some(node) = tree.get(id) {
+            if id != file_id && matches!(node.kind, NodeKind::Function | NodeKind::Class) {
+                out.push((id, node.byte_range));
+            }
+            for &child in &node.children {
+                stack.push(child);
+            }
+        }
+    }
+    out
+}
+
+/// Find the innermost scope node (smallest byte range) that contains `byte_offset`,
+/// falling back to `file_id` when no function/class scope contains it.
+///
+/// This is O(n) in the number of scope nodes per call-site.  For typical
+/// source files the number of functions is small enough that this is fast.
+/// A future optimisation could sort `scope_nodes` by start position and use
+/// binary search to find candidates before the linear containment filter.
+fn find_containing_scope(
+    byte_offset: usize,
+    scope_nodes: &[(usize, (usize, usize))],
+    file_id: usize,
+) -> usize {
+    scope_nodes
+        .iter()
+        .filter(|(_, (start, end))| *start <= byte_offset && byte_offset < *end)
+        .min_by_key(|(_, (start, end))| end - start)
+        .map(|(id, _)| *id)
+        .unwrap_or(file_id)
+}
+
+/// Recursively walk a tree-sitter AST to collect call and import references.
+fn collect_ref_edges(
+    node: Node<'_>,
+    source: &[u8],
+    scope_nodes: &[(usize, (usize, usize))],
+    file_id: usize,
+    result: &mut Vec<(usize, String, ReferenceKind)>,
+) {
+    let kind = node.kind();
+
+    // Call expressions (Rust, JS/TS) and plain calls (Python).
+    if kind == "call_expression" || kind == "call" {
+        let from_id = find_containing_scope(node.start_byte(), scope_nodes, file_id);
+        if let Some(fn_node) = node.child_by_field_name("function") {
+            if let Some(name) = extract_leaf_ident(fn_node, source) {
+                if !is_trivial_name(&name) {
+                    result.push((from_id, name, ReferenceKind::Call));
                 }
             }
         }
     }
 
-    for (child_id, canonical_id) in to_replace {
-        // Promote canonical to lib.
-        tree.mark_as_lib(canonical_id);
-
-        // Replace the duplicate node with a SymRef in the tree.
-        // We do this by converting the existing node to a SymRef in place
-        // (removing its children and pointing to the canonical).
-        if let Some(node) = tree.get_mut(child_id) {
-            let ref_name = format!("→ {}", node.name.clone());
-            node.kind = NodeKind::SymRef;
-            node.name = ref_name;
-            node.sym_ref_target = Some(canonical_id);
-            node.children.clear();
+    // Rust `use` declarations → Import from the file node.
+    if kind == "use_declaration" {
+        for name in extract_use_leaf_names(node, source) {
+            if !is_trivial_name(&name) {
+                result.push((file_id, name, ReferenceKind::Import));
+            }
         }
     }
 
-    Ok(())
+    // Python / JS / TS import statements → Import from the file node.
+    if kind == "import_statement" || kind == "import_from_statement" {
+        for name in extract_import_leaf_names(node, source) {
+            if !is_trivial_name(&name) {
+                result.push((file_id, name, ReferenceKind::Import));
+            }
+        }
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_ref_edges(child, source, scope_nodes, file_id, result);
+    }
 }
 
+/// Extract the leaf identifier from a call-expression's function node.
+///
+/// Handles simple identifiers, field/member access (`obj.method`), and
+/// qualified paths (`Module::function`).
+fn extract_leaf_ident(node: Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier"
+        | "field_identifier"
+        | "property_identifier"
+        | "type_identifier"
+        | "shorthand_property_identifier" => Some(extract_node_text(node, source)),
+        _ => {
+            // For qualified paths take the rightmost identifier-like child.
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            for child in children.iter().rev() {
+                if let Some(name) = extract_leaf_ident(*child, source) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Extract leaf names from a Rust `use_declaration` node.
+fn extract_use_leaf_names(node: Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_use_names(node, source, &mut names);
+    names
+}
+
+fn collect_use_names(node: Node<'_>, source: &[u8], names: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" | "type_identifier" => {
+            names.push(extract_node_text(node, source));
+        }
+        // `use foo as Bar` — extract the original name only.
+        "use_as_clause" => {
+            if let Some(first) = node.named_child(0) {
+                collect_use_names(first, source, names);
+            }
+        }
+        // `use_wildcard` (`use module::*`) — skip (no specific name to resolve).
+        "use_wildcard" | "self" => {}
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_use_names(child, source, names);
+            }
+        }
+    }
+}
+
+/// Extract leaf names from Python/JS/TS import statements.
+fn extract_import_leaf_names(node: Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_import_names(node, source, &mut names);
+    names
+}
+
+fn collect_import_names(node: Node<'_>, source: &[u8], names: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" => {
+            names.push(extract_node_text(node, source));
+        }
+        // Python dotted names (e.g. `os.path`) — take the last segment.
+        "dotted_name" | "relative_import" => {
+            let text = extract_node_text(node, source);
+            let leaf = text.split('.').last().unwrap_or(&text).trim().to_string();
+            if !leaf.is_empty() {
+                names.push(leaf);
+            }
+        }
+        // JS `import_specifier`: `{ A as B }` → extract A.
+        "import_specifier" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                names.push(extract_node_text(name_node, source));
+            } else if let Some(first) = node.named_child(0) {
+                names.push(extract_node_text(first, source));
+            }
+        }
+        // Skip raw string module paths in JS/TS `from 'module'`.
+        "string" | "string_fragment" => {}
+        // `import module as alias` / `aliased_import` — use the original name.
+        "as_pattern" | "aliased_import" => {
+            if let Some(first) = node.named_child(0) {
+                collect_import_names(first, source, names);
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_import_names(child, source, names);
+            }
+        }
+    }
+}
+
+/// Names that are too common/generic to be meaningful reference targets.
+///
+/// This list filters out standard-library/runtime functions, common helpers,
+/// and language built-ins so that the reference graph is not cluttered with
+/// noise.  Extend the list as new noisy patterns are encountered; all entries
+/// should have near-universal presence across many files (e.g. `new`, `len`,
+/// `println`) rather than project-specific names.
+fn is_trivial_name(name: &str) -> bool {
+    name.len() <= 1
+        || matches!(
+            name,
+            "new"
+                | "clone"
+                | "unwrap"
+                | "unwrap_or"
+                | "unwrap_or_else"
+                | "expect"
+                | "to_string"
+                | "to_owned"
+                | "into"
+                | "from"
+                | "as_ref"
+                | "as_mut"
+                | "push"
+                | "pop"
+                | "len"
+                | "is_empty"
+                | "iter"
+                | "iter_mut"
+                | "get"
+                | "set"
+                | "insert"
+                | "remove"
+                | "contains"
+                | "contains_key"
+                | "println"
+                | "print"
+                | "eprintln"
+                | "eprint"
+                | "format"
+                | "panic"
+                | "Some"
+                | "None"
+                | "Ok"
+                | "Err"
+                | "true"
+                | "false"
+                | "self"
+                | "Self"
+                | "super"
+                | "map"
+                | "filter"
+                | "collect"
+                | "fold"
+                | "for_each"
+                | "find"
+                | "any"
+                | "all"
+                | "flat_map"
+                | "and_then"
+                | "or_else"
+                | "ok_or"
+                | "next"
+                | "parse"
+                | "split"
+                | "join"
+                | "trim"
+                | "default"
+                | "ok"
+                | "err"
+                | "is_some"
+                | "is_none"
+                | "is_ok"
+                | "is_err"
+                | "log"
+                | "error"
+                | "warn"
+                | "info"
+                | "debug"
+                | "trace"
+                | "console"
+                | "Object"
+                | "Array"
+                | "Math"
+                | "JSON"
+                | "input"
+                | "range"
+                | "enumerate"
+                | "zip"
+                | "list"
+                | "dict"
+                | "str"
+                | "int"
+                | "float"
+                | "bool"
+                | "assert"
+                | "assert_eq"
+                | "assert_ne"
+                | "vec"
+        )
+}
+
+#[allow(dead_code)]
 fn add_plain_text_lines(tree: &mut CodeTree, source: &str, parent_id: usize, depth: usize) {
     let mut byte_offset = 0usize;
     for (i, line) in source.lines().enumerate() {
@@ -321,8 +627,8 @@ fn walk_ts_node(
                 Some(parent_id),
             );
 
-            // Recurse into containers (not Lines or Blocks at the leaf level).
-            if our_kind != NodeKind::Line {
+            // Recurse into containers (only Module/Class/Function, not Block/Line)
+            if matches!(our_kind, NodeKind::Module | NodeKind::Class | NodeKind::Function) {
                 walk_ts_node(child, source, lines, tree, node_id, depth + 1);
             }
         } else {
@@ -345,15 +651,14 @@ fn classify_ts_node<'a>(node: &Node<'a>) -> Option<(NodeKind, Option<Node<'a>>)>
         "trait_item" => Some((NodeKind::Class, node.child_by_field_name("name"))),
         "mod_item" => Some((NodeKind::Module, node.child_by_field_name("name"))),
         // Basic constructs: if/for/while/loop/match
-        "if_expression" | "for_expression" | "while_expression" | "loop_expression"
-        | "match_expression" => Some((NodeKind::Block, None)),
+        // (removed - Block nodes are no longer produced)
 
         // ── Python ───────────────────────────────────────────────────────
         "function_definition" => Some((NodeKind::Function, node.child_by_field_name("name"))),
         "class_definition" => Some((NodeKind::Class, node.child_by_field_name("name"))),
         "decorated_definition" => Some((NodeKind::Function, None)),
         // Python-only basic constructs
-        "with_statement" => Some((NodeKind::Block, None)),
+        // (removed - Block nodes are no longer produced)
 
         // ── JavaScript ──────────────────────────────────────────────────
         "function_declaration" | "function" => {
@@ -365,7 +670,7 @@ fn classify_ts_node<'a>(node: &Node<'a>) -> Option<(NodeKind, Option<Node<'a>>)>
         }
         "arrow_function" => Some((NodeKind::Function, None)),
         // JS-only basic constructs
-        "for_in_statement" | "switch_statement" => Some((NodeKind::Block, None)),
+        // (removed - Block nodes are no longer produced)
 
         // ── TypeScript-only constructs ────────────────────────────────────
         // TypeScript files are also matched by the JS patterns above; the
@@ -392,13 +697,12 @@ fn classify_ts_node<'a>(node: &Node<'a>) -> Option<(NodeKind, Option<Node<'a>>)>
             let name_node = find_named_child_by_kind(node, "object_reference");
             Some((NodeKind::Class, name_node))
         }
-        // Individual SQL statements (SELECT, INSERT, …) are shown as Blocks.
-        "statement" => Some((NodeKind::Block, None)),
+        // Individual SQL statements (SELECT, INSERT, …) are no longer shown as Blocks.
 
         // ── Shared Python + JS + TS basic constructs ─────────────────────
         // Note: Python uses `if_statement` / `for_statement` / `while_statement`,
         // JS/TS use the same names, so these are truly shared across three languages.
-        "if_statement" | "for_statement" | "while_statement" => Some((NodeKind::Block, None)),
+        // (removed - Block nodes are no longer produced)
 
         _ => None,
     }
@@ -506,16 +810,16 @@ fn example() {
             .all_nodes_dfs()
             .iter()
             .any(|n| n.kind == NodeKind::Block);
-        assert!(has_block, "Expected Block nodes for if/for");
+        assert!(!has_block, "Block nodes should not be produced");
     }
 
     #[test]
     fn test_plain_text_gives_lines() {
         let src = "line one\nline two\nline three";
         let tree = parse_source(src, &SourceLanguage::PlainText, "notes.txt").unwrap();
-        assert_eq!(tree.len(), 4); // 1 file root + 3 lines
+        assert_eq!(tree.len(), 1); // just the file root, no children
         let vis = tree.visible_nodes();
-        assert_eq!(vis.len(), 4);
+        assert_eq!(vis.len(), 1);
     }
 
     #[test]
@@ -695,7 +999,7 @@ SELECT id, name FROM users;
             .all_nodes_dfs()
             .iter()
             .any(|n| n.kind == NodeKind::Block);
-        assert!(has_block, "Expected Block nodes for SQL statements");
+        assert!(!has_block, "Block nodes should not be produced");
     }
 
     #[test]
@@ -719,15 +1023,32 @@ SELECT id, name FROM users;
     }
 
     #[test]
-    fn test_directory_symref_deduplication() {
+    fn test_directory_cross_file_references() {
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
-        // Two files both define "struct Config" → second becomes a SymRef
-        std::fs::write(dir.path().join("a.rs"), "pub struct Config {}").unwrap();
-        std::fs::write(dir.path().join("b.rs"), "pub struct Config {}").unwrap();
+        // lib.rs defines `compute`; main.rs calls `compute` → should produce a
+        // cross-file reference edge from the main.rs file node to the lib.rs
+        // function node (or its file).
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn compute(x: i32) -> i32 { x * 2 }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn main() { let v = compute(1); }",
+        )
+        .unwrap();
         let tree = parse_directory(dir.path()).unwrap();
-        let has_sym_ref = tree.all_nodes_dfs().iter().any(|n| n.kind == NodeKind::SymRef);
-        assert!(has_sym_ref, "Expected a SymRef for duplicated Config");
-        assert!(!tree.lib_nodes.is_empty(), "Expected lib entry for canonical Config");
+        // The reference graph should contain at least one edge involving `compute`.
+        let refs = tree.references.references();
+        assert!(
+            !refs.is_empty(),
+            "Expected at least one reference edge in the graph"
+        );
+        // Each file still keeps its own constructs (no SymRef mutation).
+        let all = tree.all_nodes_dfs();
+        let fn_count = all.iter().filter(|n| n.kind == NodeKind::Function).count();
+        assert!(fn_count >= 2, "Both files should have their own function nodes");
     }
 }

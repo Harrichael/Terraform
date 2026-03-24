@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::app::tree::CodeTree;
+use crate::app::tree::{CodeTree, NodeKind, SemanticEntry};
 use crate::parser::{parse_directory, parse_source, SourceLanguage};
 
 /// The overall application mode.
@@ -22,6 +23,13 @@ pub struct AppState {
     pub current_path: Option<PathBuf>,
     /// Flat list of currently-visible node IDs (main tree, respecting filter/collapse).
     pub visible_ids: Vec<usize>,
+    /// Reference edges projected onto the currently visible nodes.
+    ///
+    /// Each entry `(from, to)` is a pair of visible node IDs connected by one
+    /// or more symbolic references in the [`ReferenceGraph`].  The set is
+    /// recomputed whenever `visible_ids` changes so that edges automatically
+    /// aggregate or expand as the user drills down into the hierarchy.
+    pub visible_refs: Vec<(usize, usize)>,
     /// Index into `visible_ids` of the currently highlighted row.
     pub cursor: usize,
     /// Vertical scroll offset for the tree pane (in rows).
@@ -36,6 +44,16 @@ pub struct AppState {
     pub status: String,
     /// Whether the application should quit.
     pub should_quit: bool,
+    /// Number of structural (non-virtual) nodes at load time.
+    pub base_node_count: usize,
+    /// IDs of nodes that have been "expanded away" (replaced by their semantic children).
+    pub expanded_ids: HashSet<usize>,
+    /// Display depth for each entry in visible_ids (parallel vector).
+    pub view_depths: Vec<usize>,
+    /// IDs of expanded nodes whose children are visually hidden (folded).
+    pub folded_ids: HashSet<usize>,
+    /// Target node IDs whose SymRef entry is expanded to show specific symbols.
+    pub expanded_symref_targets: HashSet<usize>,
 }
 
 impl AppState {
@@ -44,6 +62,7 @@ impl AppState {
             tree: CodeTree::new(),
             current_path: None,
             visible_ids: Vec::new(),
+            visible_refs: Vec::new(),
             cursor: 0,
             scroll_offset: 0,
             pane_height: 24,
@@ -51,6 +70,11 @@ impl AppState {
             filter: String::new(),
             status: String::from("No path loaded. Pass a source file or directory as a command-line argument."),
             should_quit: false,
+            base_node_count: 0,
+            expanded_ids: HashSet::new(),
+            view_depths: Vec::new(),
+            folded_ids: HashSet::new(),
+            expanded_symref_targets: HashSet::new(),
         }
     }
 
@@ -64,6 +88,11 @@ impl AppState {
             .unwrap_or("unknown")
             .to_string();
         self.tree = parse_source(&source, &lang, &fname)?;
+        self.tree.structural_count = self.tree.node_count();
+        self.base_node_count = self.tree.node_count();
+        self.expanded_ids.clear();
+        self.folded_ids.clear();
+        self.expanded_symref_targets.clear();
         self.current_path = Some(path.clone());
         self.filter.clear();
         self.cursor = 0;
@@ -76,34 +105,155 @@ impl AppState {
     /// Load a directory, parse all source files in it, and refresh the view.
     pub fn load_directory(&mut self, path: PathBuf) -> anyhow::Result<()> {
         self.tree = parse_directory(&path)?;
+        self.tree.structural_count = self.tree.node_count();
+        self.base_node_count = self.tree.node_count();
+        self.expanded_ids.clear();
+        self.folded_ids.clear();
+        self.expanded_symref_targets.clear();
         self.current_path = Some(path.clone());
         self.filter.clear();
         self.cursor = 0;
         self.scroll_offset = 0;
-        self.status = format!(
-            "Loaded directory: {} — use l/Right to drill down into a node",
-            path.display()
-        );
+        self.status = format!("Loaded directory: {} — use l/Right to expand", path.display());
         self.refresh_visible();
         Ok(())
     }
 
-    /// Recompute `visible_ids` from the current tree + filter.
+    /// Recompute `visible_ids` and `visible_refs` from the current tree + filter.
     pub fn refresh_visible(&mut self) {
-        let nodes = if self.filter.is_empty() {
-            self.tree.visible_nodes()
-        } else {
-            self.tree.filter_visible(&self.filter)
-        };
-        self.visible_ids = nodes.iter().map(|n| n.id).collect();
+        self.tree.clear_virtual_nodes();
+        self.visible_ids.clear();
+        self.view_depths.clear();
 
-        // Keep cursor in bounds.
+        if let Some(root_id) = self.tree.root {
+            self.build_view_entries(root_id, 0);
+        }
+
+        // Apply filter if active
+        if !self.filter.is_empty() {
+            let pat = self.filter.to_ascii_lowercase();
+            let pairs: Vec<(usize, usize)> = self
+                .visible_ids
+                .iter()
+                .zip(self.view_depths.iter())
+                .filter(|&(&id, _)| {
+                    if let Some(node) = self.tree.get(id) {
+                        node.name.to_ascii_lowercase().contains(&pat)
+                            || node
+                                .detail
+                                .as_deref()
+                                .map(|d| d.to_ascii_lowercase().contains(&pat))
+                                .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                })
+                .map(|(&id, &d)| (id, d))
+                .collect();
+            self.visible_ids = pairs.iter().map(|&(id, _)| id).collect();
+            self.view_depths = pairs.iter().map(|&(_, d)| d).collect();
+        }
+
+        self.visible_refs = self.tree.project_refs_onto_visible(&self.visible_ids);
+
         if self.visible_ids.is_empty() {
             self.cursor = 0;
         } else if self.cursor >= self.visible_ids.len() {
             self.cursor = self.visible_ids.len() - 1;
         }
         self.ensure_cursor_visible();
+    }
+
+    fn build_view_entries(&mut self, node_id: usize, display_depth: usize) {
+        if self.expanded_ids.contains(&node_id) {
+            if self.folded_ids.contains(&node_id) {
+                // Expanded but visually folded: show the node itself as ▶, hide children.
+                self.visible_ids.push(node_id);
+                self.view_depths.push(display_depth);
+                return;
+            }
+            // Expanded and unfolded: the node itself is invisible; its children replace it.
+            let entries = self.tree.semantic_children_of(node_id);
+            let has_node_entries = entries.iter().any(|e| matches!(e, SemanticEntry::Node { .. }));
+            if !has_node_entries {
+                // No semantic children — fall back to showing the node itself.
+                self.visible_ids.push(node_id);
+                self.view_depths.push(display_depth);
+                return;
+            }
+            for entry in entries {
+                match entry {
+                    SemanticEntry::Node { id, depth } => {
+                        self.build_view_entries(id, display_depth + depth);
+                    }
+                    SemanticEntry::SymRef { target_id, depth } => {
+                        let full_path = self.tree.full_path(target_id);
+                        let virtual_id = self.tree.add_node(
+                            NodeKind::SymRef,
+                            full_path,
+                            (0, 0),
+                            (0, 0),
+                            0,
+                            None,
+                        );
+                        if let Some(n) = self.tree.get_mut(virtual_id) {
+                            n.sym_ref_target = Some(target_id);
+                        }
+                        self.visible_ids.push(virtual_id);
+                        self.view_depths.push(display_depth + depth);
+
+                        // Auto-expand SymRef if the target node is itself expanded or
+                        // the user has explicitly requested its symbol listing.
+                        let show_symbols = self.expanded_symref_targets.contains(&target_id)
+                            || self.expanded_ids.contains(&target_id);
+                        if show_symbols {
+                            let target_subtree = self.tree.subtree_ids(target_id);
+                            let refs: Vec<_> = self.tree.references.references().to_vec();
+                            let mut shown_targets: HashSet<usize> = HashSet::new();
+                            for edge in &refs {
+                                if target_subtree.contains(&edge.to)
+                                    && edge.to < self.tree.structural_count
+                                {
+                                    if let Some(to_node) = self.tree.get(edge.to) {
+                                        if matches!(
+                                            to_node.kind,
+                                            NodeKind::Function
+                                                | NodeKind::Class
+                                                | NodeKind::Module
+                                                | NodeKind::File
+                                        ) {
+                                            shown_targets.insert(edge.to);
+                                        }
+                                    }
+                                }
+                            }
+                            let mut sorted_targets: Vec<usize> =
+                                shown_targets.into_iter().collect();
+                            sorted_targets.sort_unstable();
+                            for &sym_target in &sorted_targets {
+                                let sym_path = self.tree.full_path(sym_target);
+                                let sym_virtual_id = self.tree.add_node(
+                                    NodeKind::SymRef,
+                                    format!("  {sym_path}"),
+                                    (0, 0),
+                                    (0, 0),
+                                    0,
+                                    None,
+                                );
+                                if let Some(n) = self.tree.get_mut(sym_virtual_id) {
+                                    n.sym_ref_target = Some(sym_target);
+                                }
+                                self.visible_ids.push(sym_virtual_id);
+                                self.view_depths.push(display_depth + depth + 1);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            self.visible_ids.push(node_id);
+            self.view_depths.push(display_depth);
+        }
     }
 
     /// Move cursor up by `n` rows.
@@ -122,127 +272,207 @@ impl AppState {
 
     /// Toggle collapse on the node under the cursor.
     pub fn toggle_cursor_collapse(&mut self) {
+        self.toggle_fold();
+    }
+
+    /// Fold or unfold.
+    ///
+    /// * If the cursor is on a `▶` node (expanded + folded): unfold it — the node
+    ///   disappears and its semantic children become visible again.
+    /// * If the cursor is on any other visible node: find its structural parent; if that
+    ///   parent is expanded, fold it so the parent reappears as `▶` and all its children
+    ///   are hidden.
+    ///
+    /// SymRef virtual nodes are skipped.
+    pub fn toggle_fold(&mut self) {
         if let Some(&id) = self.visible_ids.get(self.cursor) {
+            // SymRef nodes cannot be folded.
             if let Some(node) = self.tree.get(id) {
-                if node.is_leaf() {
-                    self.status = format!("'{}' has no children to collapse.", node.name);
+                if node.kind == NodeKind::SymRef {
                     return;
                 }
             }
-            self.tree.toggle_collapse(id);
-            self.refresh_visible();
+
+            if self.expanded_ids.contains(&id) {
+                // Node is visible as ▶ (folded expanded). Unfold it: it goes invisible
+                // and its semantic children reappear.
+                self.folded_ids.remove(&id);
+                self.refresh_visible();
+            } else {
+                // Node is a normal visible node. Fold its structural parent if the parent
+                // has been granularity-expanded.
+                let parent_id = self.tree.get(id).and_then(|n| n.parent);
+                if let Some(pid) = parent_id {
+                    if self.expanded_ids.contains(&pid) {
+                        self.folded_ids.insert(pid);
+                        self.refresh_visible();
+                    }
+                }
+            }
         }
     }
 
     /// Expand the granularity of the node under the cursor (show finer children).
-    /// This only affects the cursor node — siblings are unchanged.
     pub fn expand_cursor_granularity(&mut self) {
-        if let Some(&id) = self.visible_ids.get(self.cursor) {
-            if let Some(node) = self.tree.get(id) {
-                if node.is_leaf() {
-                    self.status = format!("'{}' is already at the finest level.", node.name);
-                    return;
-                }
-                if node.granularity_limit.is_none() {
-                    self.status = format!("'{}' already shows all detail.", node.name);
-                    return;
-                }
-            }
-            self.tree.expand_granularity(id);
-            self.refresh_visible();
-            if let Some(node) = self.tree.get(id) {
-                let level_desc = node
-                    .granularity_limit
-                    .as_ref()
-                    .map(|k| format!("{k}"))
-                    .unwrap_or_else(|| "all".to_string());
-                self.status = format!("'{}' now shows up to {} level.", node.name, level_desc);
-            }
-        }
+        self.expand_cursor_node();
     }
 
     /// Shrink the granularity of the node under the cursor (show coarser children).
-    /// This only affects the cursor node — siblings are unchanged.
     pub fn shrink_cursor_granularity(&mut self) {
-        if let Some(&id) = self.visible_ids.get(self.cursor) {
-            if let Some(node) = self.tree.get(id) {
-                if node.is_leaf() {
-                    self.status = format!("'{}' has no children.", node.name);
-                    return;
-                }
-            }
-            self.tree.shrink_granularity(id);
-            self.refresh_visible();
-            if let Some(node) = self.tree.get(id) {
-                let level_desc = if node.collapsed {
-                    "collapsed".to_string()
-                } else {
-                    node.granularity_limit
-                        .as_ref()
-                        .map(|k| format!("up to {k}"))
-                        .unwrap_or_else(|| "all".to_string())
-                };
-                self.status = format!("'{}': {}", node.name, level_desc);
-            }
-        }
+        self.collapse_cursor_node();
     }
 
     /// Collapse all non-leaf nodes.
     pub fn collapse_all(&mut self) {
-        let ids: Vec<usize> = self
-            .tree
-            .all_nodes_dfs()
-            .iter()
-            .filter(|n| !n.is_leaf())
-            .map(|n| n.id)
-            .collect();
-        for id in ids {
-            if let Some(n) = self.tree.get_mut(id) {
-                n.collapsed = true;
-            }
-        }
+        self.expanded_ids.clear();
+        self.folded_ids.clear();
+        self.expanded_symref_targets.clear();
         self.refresh_visible();
     }
 
     /// Expand all nodes.
     pub fn expand_all(&mut self) {
-        let ids: Vec<usize> = self
-            .tree
-            .all_nodes_dfs()
-            .iter()
-            .map(|n| n.id)
+        self.folded_ids.clear();
+        let structural_count = self.tree.structural_count;
+        let ids: Vec<usize> = (0..structural_count)
+            .filter(|&id| {
+                if let Some(node) = self.tree.get(id) {
+                    !node.is_leaf() && node.kind != NodeKind::SymRef
+                } else {
+                    false
+                }
+            })
             .collect();
         for id in ids {
-            if let Some(n) = self.tree.get_mut(id) {
-                n.collapsed = false;
-                n.granularity_limit = None;
+            let has_children = self
+                .tree
+                .semantic_children_of(id)
+                .iter()
+                .any(|e| matches!(e, SemanticEntry::Node { .. }));
+            if has_children {
+                self.expanded_ids.insert(id);
+                self.expanded_symref_targets.insert(id);
             }
         }
         self.refresh_visible();
     }
 
-    /// If the cursor is on a `SymRef` node, jump to its canonical definition
-    /// in the lib section. Returns `true` if a jump was performed.
+    /// If the cursor is on a `SymRef` node, jump to its canonical definition.
+    /// Returns `true` if a jump was performed.
     pub fn jump_to_sym_ref_target(&mut self) -> bool {
         if let Some(&id) = self.visible_ids.get(self.cursor) {
-            if let Some(node) = self.tree.get(id) {
-                if let Some(target_id) = node.sym_ref_target {
-                    // Find the target in the lib section nodes rendered below main tree.
-                    // We place lib section IDs after the main visible_ids in state;
-                    // refresh_visible_with_lib builds the combined list.
-                    if let Some(pos) = self.visible_ids.iter().position(|&vid| vid == target_id) {
-                        self.cursor = pos;
-                        self.ensure_cursor_visible();
-                        if let Some(target_node) = self.tree.get(target_id) {
-                            self.status =
-                                format!("Jumped to definition: '{}'", target_node.name);
+            if let Some(target_id) = self.tree.get(id).and_then(|n| n.sym_ref_target) {
+                // Check if target is already visible
+                if let Some(pos) = self.visible_ids.iter().position(|&vid| vid == target_id) {
+                    self.cursor = pos;
+                    self.ensure_cursor_visible();
+                    let name = self
+                        .tree
+                        .get(target_id)
+                        .map(|n| n.name.clone())
+                        .unwrap_or_default();
+                    self.status = format!("Jumped to definition: '{}'", name);
+                    return true;
+                }
+                // Target not visible — expand path to it
+                let mut path = Vec::new();
+                let mut current = target_id;
+                loop {
+                    if let Some(n) = self.tree.get(current) {
+                        path.push(current);
+                        match n.parent {
+                            Some(pid) => current = pid,
+                            None => break,
                         }
-                        return true;
+                    } else {
+                        break;
                     }
+                }
+                path.reverse();
+                for &anc in &path[..path.len().saturating_sub(1)] {
+                    self.expanded_ids.insert(anc);
+                    self.expanded_symref_targets.insert(anc);
+                }
+                self.refresh_visible();
+                if let Some(pos) = self.visible_ids.iter().position(|&vid| vid == target_id) {
+                    self.cursor = pos;
+                    self.ensure_cursor_visible();
+                    let name = self
+                        .tree
+                        .get(target_id)
+                        .map(|n| n.name.clone())
+                        .unwrap_or_default();
+                    self.status = format!("Jumped to definition: '{}'", name);
+                    return true;
                 }
             }
         }
         false
+    }
+
+    pub fn expand_cursor_node(&mut self) {
+        if let Some(&id) = self.visible_ids.get(self.cursor) {
+            let node_info = self.tree.get(id).map(|n| (n.kind, n.sym_ref_target));
+            match node_info {
+                Some((NodeKind::SymRef, Some(target_id))) => {
+                    if self.expanded_symref_targets.contains(&target_id) {
+                        self.expanded_symref_targets.remove(&target_id);
+                    } else {
+                        self.expanded_symref_targets.insert(target_id);
+                    }
+                    self.refresh_visible();
+                    let path = self.tree.full_path(target_id);
+                    self.status = format!("Showing references into '{}'.", path);
+                }
+                Some((NodeKind::SymRef, None)) => {}
+                _ => {
+                    let has_children = self
+                        .tree
+                        .semantic_children_of(id)
+                        .iter()
+                        .any(|e| matches!(e, SemanticEntry::Node { .. }));
+                    if !has_children {
+                        let path = self.tree.full_path(id);
+                        self.status = format!("'{}' has no expandable children.", path);
+                        return;
+                    }
+                    self.expanded_ids.insert(id);
+                    // Keep SymRef expansion in sync: any → arrow pointing into this
+                    // node's subtree will automatically show specific symbols.
+                    self.expanded_symref_targets.insert(id);
+                    self.refresh_visible();
+                    let path = self.tree.full_path(id);
+                    self.status = format!("Expanded '{}'.", path);
+                }
+            }
+        }
+    }
+
+    pub fn collapse_cursor_node(&mut self) {
+        if let Some(&id) = self.visible_ids.get(self.cursor) {
+            if self.expanded_ids.contains(&id) {
+                // Cursor is on a ▶ (expanded+folded) node. Fully collapse it.
+                self.expanded_ids.remove(&id);
+                self.folded_ids.remove(&id);
+                self.expanded_symref_targets.remove(&id);
+                self.refresh_visible();
+                let path = self.tree.full_path(id);
+                self.status = format!("Collapsed '{}'.", path);
+                return;
+            }
+            // Cursor is on a normal visible (non-expanded) node.
+            // Collapse its structural parent if the parent was granularity-expanded.
+            let parent_id = self.tree.get(id).and_then(|n| n.parent);
+            if let Some(pid) = parent_id {
+                if self.expanded_ids.remove(&pid) {
+                    self.folded_ids.remove(&pid);
+                    self.expanded_symref_targets.remove(&pid);
+                    self.refresh_visible();
+                    let path = self.tree.full_path(pid);
+                    self.status = format!("Collapsed '{}'.", path);
+                }
+            }
+        }
     }
 
     /// Enter filter mode.
@@ -328,6 +558,8 @@ mod tests {
         let _l1 = tree.add_node(NodeKind::Line, "let x = 1;", (0, 20), (1, 1), 2, Some(f1));
         let _f2 = tree.add_node(NodeKind::Function, "fn_b", (101, 200), (16, 30), 1, Some(root));
         state.tree = tree;
+        state.tree.structural_count = state.tree.node_count();
+        state.base_node_count = state.tree.node_count();
         state.refresh_visible();
         state
     }
@@ -344,6 +576,9 @@ mod tests {
     #[test]
     fn test_cursor_movement() {
         let mut state = state_with_sample_tree();
+        // Expand root so fn_a and fn_b become visible
+        state.expanded_ids.insert(0);
+        state.refresh_visible();
         assert_eq!(state.cursor, 0);
         state.move_cursor_down(1);
         assert_eq!(state.cursor, 1);
@@ -368,8 +603,13 @@ mod tests {
     #[test]
     fn test_toggle_collapse_updates_visible() {
         let mut state = state_with_sample_tree();
-        let initial = state.visible_ids.len();
-        state.cursor = 0;
+        // Expand root so fn_a and fn_b become visible (root itself disappears).
+        state.expanded_ids.insert(0);
+        state.refresh_visible();
+        let initial = state.visible_ids.len(); // 2: fn_a + fn_b (root is invisible)
+        state.cursor = 0; // on fn_a
+        // toggle_fold on fn_a (NOT in expanded_ids): folds its structural parent (root),
+        // which makes root reappear as ▶ and fn_a/fn_b disappear.
         state.toggle_cursor_collapse();
         assert!(state.visible_ids.len() < initial);
     }
@@ -397,9 +637,14 @@ mod tests {
     fn test_collapse_all_expand_all() {
         let mut state = state_with_sample_tree();
         state.collapse_all();
-        assert_eq!(state.visible_ids.len(), 1);
+        assert_eq!(state.visible_ids.len(), 1); // just root
         state.expand_all();
-        assert_eq!(state.visible_ids.len(), 4);
+        // expand_all expands root and fn_a (both have children).
+        // root is invisible (expanded, unfolded) → shows fn_a's children.
+        // fn_a is invisible (expanded, unfolded) → shows l1.
+        // fn_b is a leaf → visible.
+        // visible = [l1, fn_b] = 2 nodes.
+        assert_eq!(state.visible_ids.len(), 2);
     }
 
     #[test]
@@ -415,38 +660,21 @@ mod tests {
     #[test]
     fn test_expand_granularity_changes_visible() {
         let mut state = state_with_sample_tree();
-        // fn_a (id=1) has Line children. Set its granularity to Function level →
-        // Lines (level 6) are finer than Function (level 4) → hidden.
-        state.tree.get_mut(1).unwrap().granularity_limit = Some(NodeKind::Function);
-        state.refresh_visible();
-        assert_eq!(state.visible_ids.len(), 3); // root + fn_a (no Line) + fn_b
-
-        // Expand fn_a's granularity (cursor=1).
-        state.cursor = 1;
-        state.expand_cursor_granularity();
-        // Function → Block: Line (6) still finer than Block (5) → still hidden.
-        assert_eq!(state.visible_ids.len(), 3);
-        // Expand again: Block → Line. Line.is_finer_than(Line) = false → shown.
-        state.expand_cursor_granularity();
-        assert_eq!(state.visible_ids.len(), 4);
+        assert_eq!(state.visible_ids.len(), 1); // just root
+        state.cursor = 0;
+        state.expand_cursor_granularity(); // expand root → root disappears, fn_a + fn_b visible
+        assert_eq!(state.visible_ids.len(), 2);
     }
 
     #[test]
     fn test_shrink_granularity_changes_visible() {
         let mut state = state_with_sample_tree();
-        // Root has no limit (shows all 4 nodes)
-        assert_eq!(state.visible_ids.len(), 4);
         state.cursor = 0;
-        state.shrink_cursor_granularity();
-        // Should set limit to Block (Line still shown because fn_a has depth 2
-        // and its Line child has depth 3 — wait, the limit is on the FILE root
-        // which only has Function children, not Line directly)
-        // The Line is a child of fn_a, not of root, so root's limit doesn't hide it directly
-        // Root's granularity_limit only affects root's DIRECT children.
-        // fn_a is a Function (≤ Block), so fn_a is still shown.
-        // fn_a's Line child is not affected by root's granularity_limit.
-        // So visible count stays at 4.
-        assert_eq!(state.visible_ids.len(), 4);
+        state.expand_cursor_granularity(); // expand root → root invisible, fn_a + fn_b visible
+        assert_eq!(state.visible_ids.len(), 2); // fn_a + fn_b
+        state.cursor = 0; // on fn_a
+        state.shrink_cursor_granularity(); // collapse: fn_a's parent (root) removed from expanded_ids
+        assert_eq!(state.visible_ids.len(), 1);
     }
 
     #[test]
@@ -461,27 +689,55 @@ mod tests {
     }
 
     #[test]
-    fn test_jump_to_sym_ref() {
+    fn test_visible_refs_updates_with_expansion() {
+        use crate::app::tree::ReferenceKind;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "pub struct Config {}").unwrap();
-        std::fs::write(dir.path().join("b.rs"), "pub struct Config {}").unwrap();
+        // lib.rs defines `helper`, main.rs calls it → cross-file reference expected.
+        std::fs::write(dir.path().join("lib.rs"), "pub fn helper() {}").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() { helper(); }").unwrap();
         let mut state = AppState::new();
         state.load_directory(dir.path().to_path_buf()).unwrap();
 
-        // Expand all so we can see sym refs
-        state.expand_all();
-        state.refresh_visible();
+        // At the initial file-level view (both files collapsed under folder root),
+        // any cross-file reference should project to a file→file edge.
+        // The reference graph may or may not have edges depending on name resolution;
+        // what we can assert is that visible_refs is consistent with visible_ids.
+        for &(from, to) in &state.visible_refs {
+            assert!(
+                state.visible_ids.contains(&from),
+                "from endpoint {from} must be in visible_ids"
+            );
+            assert!(
+                state.visible_ids.contains(&to),
+                "to endpoint {to} must be in visible_ids"
+            );
+        }
 
-        // Find the SymRef node cursor position
-        let sym_ref_pos = state.visible_ids.iter().position(|&id| {
-            state.tree.get(id).map(|n| n.kind == NodeKind::SymRef).unwrap_or(false)
-        });
-        if let Some(pos) = sym_ref_pos {
-            state.cursor = pos;
-            // Jump should succeed if target is also visible
-            let _ = state.jump_to_sym_ref_target();
-            // After jump, cursor should point to a non-SymRef node (the canonical definition)
+        // Expanding all should keep visible_refs endpoints within visible_ids.
+        state.expand_all();
+        for &(from, to) in &state.visible_refs {
+            assert!(
+                state.visible_ids.contains(&from),
+                "after expand: from endpoint {from} must be in visible_ids"
+            );
+            assert!(
+                state.visible_ids.contains(&to),
+                "after expand: to endpoint {to} must be in visible_ids"
+            );
+        }
+
+        // Verify we can also add manual reference edges and have them projected.
+        let all_ids: Vec<usize> = state.tree.all_nodes_dfs().iter().map(|n| n.id).collect();
+        if all_ids.len() >= 2 {
+            state.tree.add_reference(all_ids[0], all_ids[1], ReferenceKind::Call);
+            state.refresh_visible();
+            // After adding a ref between root (always visible) and first child,
+            // visible_refs must still be consistent.
+            for &(from, to) in &state.visible_refs {
+                assert!(state.visible_ids.contains(&from));
+                assert!(state.visible_ids.contains(&to));
+            }
         }
     }
 }

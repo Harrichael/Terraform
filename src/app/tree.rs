@@ -1,6 +1,7 @@
 /// Hierarchical code node kinds, ordered from coarsest to finest granularity.
 /// `SymRef` is a special non-granularity kind for symbolic references.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub enum NodeKind {
     Folder,
     Module,
@@ -79,6 +80,91 @@ impl std::fmt::Display for NodeKind {
     }
 }
 
+/// The kind of symbolic relationship between two nodes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub enum ReferenceKind {
+    /// A function or method call.
+    Call,
+    /// An import or `use` statement.
+    Import,
+    /// A type annotation or type usage.
+    TypeRef,
+    /// A variable read or write.
+    VarRef,
+    /// Any other symbolic reference.
+    Generic,
+}
+
+impl std::fmt::Display for ReferenceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ReferenceKind::Call => "call",
+            ReferenceKind::Import => "import",
+            ReferenceKind::TypeRef => "type_ref",
+            ReferenceKind::VarRef => "var_ref",
+            ReferenceKind::Generic => "generic",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// A directed symbolic reference edge from one code node to another.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Reference {
+    /// ID of the source node (where the reference originates).
+    pub from: usize,
+    /// ID of the target node (the symbol being referenced).
+    pub to: usize,
+    /// The kind of relationship this reference represents.
+    pub kind: ReferenceKind,
+}
+
+impl Reference {
+    pub fn new(from: usize, to: usize, kind: ReferenceKind) -> Self {
+        Reference { from, to, kind }
+    }
+}
+
+/// A graph of directed symbolic references between code nodes.
+///
+/// This forms the second structural layer of the entity model alongside the
+/// hierarchical contains topology stored in [`CodeTree`].  Each edge records
+/// which node *uses* which other node (calls, imports, type references, …).
+#[derive(Debug, Default)]
+pub struct ReferenceGraph {
+    edges: Vec<Reference>,
+}
+
+impl ReferenceGraph {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a directed reference edge from `from` to `to`.
+    pub fn add_reference(&mut self, from: usize, to: usize, kind: ReferenceKind) {
+        self.edges.push(Reference::new(from, to, kind));
+    }
+
+    /// Return all reference edges.
+    pub fn references(&self) -> &[Reference] {
+        &self.edges
+    }
+
+    /// Return all edges that originate from `node_id`.
+    #[allow(dead_code)]
+    pub fn refs_from(&self, node_id: usize) -> Vec<&Reference> {
+        self.edges.iter().filter(|r| r.from == node_id).collect()
+    }
+
+    /// Return all edges that point to `node_id`.
+    #[allow(dead_code)]
+    pub fn refs_to(&self, node_id: usize) -> Vec<&Reference> {
+        self.edges.iter().filter(|r| r.to == node_id).collect()
+    }
+}
+
 /// A single node in the code tree.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -139,18 +225,47 @@ impl CodeNode {
     pub fn is_leaf(&self) -> bool {
         self.children.is_empty()
     }
+
+    pub fn full_display_name(&self) -> String {
+        self.name.clone()
+    }
 }
 
 /// Arena-allocated tree of code nodes for a single file or directory workspace.
+///
+/// The model has two structural layers:
+///
+/// 1. **Contains topology** — the parent/child tree stored in `nodes`.  Each
+///    node's [`CodeNode::parent`] and [`CodeNode::children`] fields record the
+///    hierarchical containment relationships (folder → file → class →
+///    function → …).
+///
+/// 2. **Reference graph** — the [`ReferenceGraph`] stored in `references`.
+///    Each edge records a directed symbolic relationship between two nodes
+///    (calls, imports, type usage, …).  Use
+///    [`CodeTree::aggregate_refs_at_granularity`] to collapse fine-grained
+///    edges to any desired resolution level, or
+///    [`CodeTree::project_refs_onto_visible`] to dynamically project edges
+///    onto whichever nodes are currently expanded in the viewer.
 #[derive(Debug, Default)]
 pub struct CodeTree {
     /// Flat storage; index == node.id.
-    nodes: Vec<CodeNode>,
+    pub(crate) nodes: Vec<CodeNode>,
+    /// Number of structural nodes after initial parse (virtual nodes have id >= this).
+    pub structural_count: usize,
     /// Root node index (always 0 when the tree is non-empty).
     pub root: Option<usize>,
-    /// IDs of nodes that serve as canonical "library" definitions —
-    /// referenced by one or more `SymRef` nodes in the main tree.
-    pub lib_nodes: Vec<usize>,
+    /// Directed symbolic references between nodes (the reference graph).
+    pub references: ReferenceGraph,
+}
+
+/// Describes one entry in the semantic dependency layout of a node's children.
+#[derive(Debug, Clone)]
+pub enum SemanticEntry {
+    /// A real structural node at the given depth relative to the expansion level.
+    Node { id: usize, depth: usize },
+    /// A "→ target" SymRef arrow at the given relative depth.
+    SymRef { target_id: usize, depth: usize },
 }
 
 impl CodeTree {
@@ -242,13 +357,6 @@ impl CodeTree {
         }
     }
 
-    /// Register `id` as a canonical library definition.
-    pub fn mark_as_lib(&mut self, id: usize) {
-        if !self.lib_nodes.contains(&id) {
-            self.lib_nodes.push(id);
-        }
-    }
-
     /// Add a SymRef node pointing to `target_id` as a child of `parent_id`.
     #[allow(dead_code)]
     pub fn add_sym_ref(
@@ -307,14 +415,6 @@ impl CodeTree {
         result
     }
 
-    /// Return the visible lib (library/canonical) nodes.
-    pub fn visible_lib_nodes(&self) -> Vec<&CodeNode> {
-        self.lib_nodes
-            .iter()
-            .filter_map(|&id| self.nodes.get(id))
-            .collect()
-    }
-
     /// Return all nodes (visible or not) in DFS pre-order.
     pub fn all_nodes_dfs(&self) -> Vec<&CodeNode> {
         let Some(root) = self.root else {
@@ -356,6 +456,337 @@ impl CodeTree {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    // -----------------------------------------------------------------------
+    // Reference graph helpers
+    // -----------------------------------------------------------------------
+
+    /// Add a directed symbolic reference from `from` to `to`.
+    ///
+    /// This records an edge in the [`ReferenceGraph`] embedded in this tree.
+    pub fn add_reference(&mut self, from: usize, to: usize, kind: ReferenceKind) {
+        self.references.add_reference(from, to, kind);
+    }
+
+    /// Walk the parent chain of `node_id` and return the nearest ancestor
+    /// (inclusive) whose [`NodeKind`] is at or coarser than `granularity`.
+    ///
+    /// Returns `None` only when `granularity` is [`NodeKind::SymRef`] (which
+    /// has no level) or when `node_id` is invalid.
+    #[allow(dead_code)]
+    pub fn ancestor_at_granularity(
+        &self,
+        node_id: usize,
+        granularity: &NodeKind,
+    ) -> Option<usize> {
+        let gran_level = granularity.level()?;
+        let mut current_id = node_id;
+        loop {
+            let node = self.nodes.get(current_id)?;
+            if let Some(level) = node.kind.level() {
+                if level <= gran_level {
+                    return Some(current_id);
+                }
+            }
+            match node.parent {
+                Some(pid) => current_id = pid,
+                None => return Some(current_id), // root — use as best effort
+            }
+        }
+    }
+
+    /// Aggregate all reference edges at the requested `granularity` level.
+    ///
+    /// For every edge `(from, to)` in the [`ReferenceGraph`], this method
+    /// walks up the contains hierarchy for *both* endpoints to find the
+    /// nearest ancestor at or coarser than `granularity`.  The resulting
+    /// `(ancestor_from, ancestor_to)` pairs are deduplicated so that — for
+    /// example — many function-level calls between two files are collapsed
+    /// into a single file-level edge.
+    ///
+    /// Self-loops (where both endpoints resolve to the same ancestor) are
+    /// dropped.  Edges whose endpoints cannot be resolved (invalid IDs or
+    /// SymRef granularity) are also dropped.
+    ///
+    /// # Example
+    ///
+    /// At [`NodeKind::File`] granularity, every call from any function inside
+    /// `file_a` to any symbol inside `file_b` is reported as the single pair
+    /// `(file_a_id, file_b_id)`.
+    #[allow(dead_code)]
+    pub fn aggregate_refs_at_granularity(
+        &self,
+        granularity: &NodeKind,
+    ) -> Vec<(usize, usize)> {
+        use std::collections::HashSet;
+        let mut seen: HashSet<(usize, usize)> = HashSet::new();
+        let mut result = Vec::new();
+        for edge in self.references.references() {
+            let Some(from_anc) = self.ancestor_at_granularity(edge.from, granularity) else {
+                continue;
+            };
+            let Some(to_anc) = self.ancestor_at_granularity(edge.to, granularity) else {
+                continue;
+            };
+            if from_anc == to_anc {
+                continue; // drop self-loops
+            }
+            if seen.insert((from_anc, to_anc)) {
+                result.push((from_anc, to_anc));
+            }
+        }
+        result
+    }
+
+    /// Walk the parent chain of `node_id` upward and return the first ancestor
+    /// (inclusive) that appears in `visible_set`.
+    ///
+    /// Returns `None` if neither `node_id` nor any ancestor is visible (e.g.
+    /// the whole subtree is collapsed above the root).
+    fn first_visible_ancestor(
+        &self,
+        node_id: usize,
+        visible_set: &std::collections::HashSet<usize>,
+    ) -> Option<usize> {
+        let mut current = node_id;
+        loop {
+            if visible_set.contains(&current) {
+                return Some(current);
+            }
+            let node = self.nodes.get(current)?;
+            match node.parent {
+                Some(pid) => current = pid,
+                None => return None,
+            }
+        }
+    }
+
+    /// Project every reference edge onto the set of currently visible nodes.
+    ///
+    /// For each edge `(from, to)` in the [`ReferenceGraph`], both endpoints
+    /// are walked up the contains hierarchy until a visible node is reached.
+    /// This handles **mixed granularity**: if one file is expanded (its
+    /// functions are visible) while the other is collapsed (only the file node
+    /// is visible), the edge appears as `(fn_a, file_b)` rather than
+    /// `(file_a, file_b)`.
+    ///
+    /// Self-loops and edges where either endpoint has no visible ancestor are
+    /// dropped.  The result is deduplicated.
+    ///
+    /// Visible ancestors are cached per unique endpoint ID so that nodes
+    /// referenced by many edges (e.g. a widely-used function) only pay the
+    /// parent-chain traversal cost once.
+    pub fn project_refs_onto_visible(&self, visible_ids: &[usize]) -> Vec<(usize, usize)> {
+        use std::collections::{HashMap, HashSet};
+        let visible_set: HashSet<usize> = visible_ids.iter().copied().collect();
+
+        // Pre-compute the visible ancestor for each unique referenced node so that
+        // nodes appearing in many edges are traversed only once.
+        let mut ancestor_cache: HashMap<usize, Option<usize>> = HashMap::new();
+        for edge in self.references.references() {
+            for &node_id in &[edge.from, edge.to] {
+                ancestor_cache
+                    .entry(node_id)
+                    .or_insert_with(|| self.first_visible_ancestor(node_id, &visible_set));
+            }
+        }
+
+        let mut seen: HashSet<(usize, usize)> = HashSet::new();
+        let mut result = Vec::new();
+        for edge in self.references.references() {
+            let (Some(from_vis), Some(to_vis)) = (
+                ancestor_cache.get(&edge.from).copied().flatten(),
+                ancestor_cache.get(&edge.to).copied().flatten(),
+            ) else {
+                continue;
+            };
+            if from_vis != to_vis && seen.insert((from_vis, to_vis)) {
+                result.push((from_vis, to_vis));
+            }
+        }
+        result
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn nodes_iter(&self) -> impl Iterator<Item = &CodeNode> {
+        self.nodes.iter()
+    }
+
+    /// Remove virtual SymRef nodes added during view construction
+    /// (all nodes with id >= structural_count).
+    pub fn clear_virtual_nodes(&mut self) {
+        for id in self.structural_count..self.nodes.len() {
+            if let Some(pid) = self.nodes[id].parent {
+                if pid < self.structural_count {
+                    self.nodes[pid].children.retain(|&c| c < self.structural_count);
+                }
+            }
+        }
+        self.nodes.truncate(self.structural_count);
+    }
+
+    /// Collect all node IDs in the subtree rooted at root_id.
+    pub fn subtree_ids(&self, root_id: usize) -> std::collections::HashSet<usize> {
+        let mut result = std::collections::HashSet::new();
+        let mut stack = vec![root_id];
+        while let Some(id) = stack.pop() {
+            result.insert(id);
+            if let Some(node) = self.nodes.get(id) {
+                for &child in &node.children {
+                    stack.push(child);
+                }
+            }
+        }
+        result
+    }
+
+    /// Count reference edges from the subtree of `from_root` to the subtree of `to_root`.
+    pub fn cross_ref_count(&self, from_root: usize, to_root: usize) -> usize {
+        let from_set = self.subtree_ids(from_root);
+        let to_set = self.subtree_ids(to_root);
+        self.references
+            .references()
+            .iter()
+            .filter(|r| from_set.contains(&r.from) && to_set.contains(&r.to))
+            .count()
+    }
+
+    /// Compute the full path of a node from the tree root (e.g. "src/app/state.rs").
+    pub fn full_path(&self, node_id: usize) -> String {
+        let mut parts = Vec::new();
+        let mut current = node_id;
+        loop {
+            if let Some(node) = self.nodes.get(current) {
+                parts.push(node.name.clone());
+                match node.parent {
+                    Some(pid) => current = pid,
+                    None => break,
+                }
+            } else {
+                break;
+            }
+        }
+        parts.reverse();
+        parts.join("/")
+    }
+
+    /// Compute the semantic layout of direct meaningful children of parent_id.
+    /// Returns flat list of SemanticEntry (depth is relative to the expansion level).
+    /// Only includes Folder/File/Class/Function/Module children (no Block/Line).
+    pub fn semantic_children_of(&self, parent_id: usize) -> Vec<SemanticEntry> {
+        let node = match self.nodes.get(parent_id) {
+            Some(n) => n,
+            None => return Vec::new(),
+        };
+
+        // Filter to only meaningful kinds
+        let node_ids: Vec<usize> = node
+            .children
+            .iter()
+            .filter(|&&c| {
+                if let Some(child) = self.nodes.get(c) {
+                    matches!(
+                        child.kind,
+                        NodeKind::Folder
+                            | NodeKind::File
+                            | NodeKind::Class
+                            | NodeKind::Function
+                            | NodeKind::Module
+                    )
+                } else {
+                    false
+                }
+            })
+            .copied()
+            .collect();
+
+        let n = node_ids.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Build dependency matrix: deps[i][j] = node_ids[i] uses node_ids[j]
+        let mut deps = vec![vec![false; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                if i != j && self.cross_ref_count(node_ids[i], node_ids[j]) > 0 {
+                    deps[i][j] = true;
+                }
+            }
+        }
+
+        // Compute incoming count for each node (how many others use it)
+        let mut incoming = vec![0usize; n];
+        for j in 0..n {
+            for i in 0..n {
+                if deps[i][j] {
+                    incoming[j] += 1;
+                }
+            }
+        }
+
+        // Sort processing order: ascending by incoming count, tiebreak by node_id ascending
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| (incoming[i], node_ids[i]));
+
+        // LayoutBuilder places nodes depth-first in semantic order
+        struct LayoutBuilder {
+            n: usize,
+            placed: Vec<bool>,
+            result: Vec<SemanticEntry>,
+        }
+
+        impl LayoutBuilder {
+            fn place(&mut self, idx: usize, depth: usize, node_ids: &[usize], deps: &[Vec<bool>]) {
+                self.placed[idx] = true;
+                self.result.push(SemanticEntry::Node {
+                    id: node_ids[idx],
+                    depth,
+                });
+                for j in 0..self.n {
+                    if deps[idx][j] {
+                        if self.placed[j] {
+                            // Already placed: emit a SymRef
+                            self.result.push(SemanticEntry::SymRef {
+                                target_id: node_ids[j],
+                                depth: depth + 1,
+                            });
+                        } else if deps[j][idx] {
+                            // Mutual cycle: lower id is the "parent"
+                            if node_ids[idx] < node_ids[j] {
+                                self.place(j, depth + 1, node_ids, deps);
+                            } else {
+                                self.result.push(SemanticEntry::SymRef {
+                                    target_id: node_ids[j],
+                                    depth: depth + 1,
+                                });
+                            }
+                        } else {
+                            // Pure library: place as child
+                            self.place(j, depth + 1, node_ids, deps);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut builder = LayoutBuilder {
+            n,
+            placed: vec![false; n],
+            result: Vec::new(),
+        };
+
+        for &idx in &order {
+            if !builder.placed[idx] {
+                builder.place(idx, 0, &node_ids, &deps);
+            }
+        }
+
+        builder.result
     }
 }
 
@@ -498,15 +929,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lib_nodes() {
-        let mut tree = sample_tree();
-        tree.mark_as_lib(1); // fn_foo is a lib definition
-        let lib = tree.visible_lib_nodes();
-        assert_eq!(lib.len(), 1);
-        assert_eq!(lib[0].id, 1);
-    }
-
-    #[test]
     fn test_filter_visible() {
         let tree = sample_tree();
         let res = tree.filter_visible("foo");
@@ -553,5 +975,214 @@ mod tests {
         assert!(NodeKind::Line.is_finer_than(&NodeKind::Function));
         assert!(!NodeKind::File.is_finer_than(&NodeKind::Function));
         assert!(!NodeKind::SymRef.is_finer_than(&NodeKind::Line));
+    }
+
+    // -----------------------------------------------------------------------
+    // Reference graph tests
+    // -----------------------------------------------------------------------
+
+    /// Build a two-file tree for reference-graph tests:
+    ///
+    /// ```text
+    /// Folder "root"            (id 0)
+    ///   File "a.rs"            (id 1)
+    ///     Function "fn_a1"     (id 2)
+    ///     Function "fn_a2"     (id 3)
+    ///   File "b.rs"            (id 4)
+    ///     Function "fn_b1"     (id 5)
+    ///     Function "fn_b2"     (id 6)
+    /// ```
+    fn two_file_tree() -> CodeTree {
+        let mut tree = CodeTree::new();
+        let root = tree.add_node(NodeKind::Folder, "root", (0, 200), (0, 40), 0, None);
+        let file_a = tree.add_node(NodeKind::File, "a.rs", (0, 100), (0, 20), 1, Some(root));
+        let _fn_a1 = tree.add_node(NodeKind::Function, "fn_a1", (0, 50), (0, 10), 2, Some(file_a));
+        let _fn_a2 = tree.add_node(NodeKind::Function, "fn_a2", (51, 100), (11, 20), 2, Some(file_a));
+        let file_b = tree.add_node(NodeKind::File, "b.rs", (101, 200), (21, 40), 1, Some(root));
+        let _fn_b1 = tree.add_node(NodeKind::Function, "fn_b1", (101, 150), (21, 30), 2, Some(file_b));
+        let _fn_b2 = tree.add_node(NodeKind::Function, "fn_b2", (151, 200), (31, 40), 2, Some(file_b));
+        tree
+    }
+
+    #[test]
+    fn test_add_reference_and_query() {
+        let mut tree = two_file_tree();
+        // fn_a1 (2) calls fn_b1 (5)
+        tree.add_reference(2, 5, ReferenceKind::Call);
+        let refs = tree.references.references();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].from, 2);
+        assert_eq!(refs[0].to, 5);
+        assert_eq!(refs[0].kind, ReferenceKind::Call);
+    }
+
+    #[test]
+    fn test_refs_from_and_to() {
+        let mut tree = two_file_tree();
+        tree.add_reference(2, 5, ReferenceKind::Call);
+        tree.add_reference(3, 5, ReferenceKind::Import);
+
+        let from_2 = tree.references.refs_from(2);
+        assert_eq!(from_2.len(), 1);
+        assert_eq!(from_2[0].to, 5);
+
+        let to_5 = tree.references.refs_to(5);
+        assert_eq!(to_5.len(), 2);
+
+        assert!(tree.references.refs_from(5).is_empty());
+    }
+
+    #[test]
+    fn test_ancestor_at_granularity_same_level() {
+        let tree = two_file_tree();
+        // fn_a1 is already at Function level — querying at Function returns itself.
+        assert_eq!(tree.ancestor_at_granularity(2, &NodeKind::Function), Some(2));
+    }
+
+    #[test]
+    fn test_ancestor_at_granularity_walks_up() {
+        let tree = two_file_tree();
+        // fn_a1 (id=2, Function) → at File granularity should give file_a (id=1).
+        assert_eq!(tree.ancestor_at_granularity(2, &NodeKind::File), Some(1));
+        // fn_a1 (id=2) → at Folder granularity should give root (id=0).
+        assert_eq!(tree.ancestor_at_granularity(2, &NodeKind::Folder), Some(0));
+    }
+
+    #[test]
+    fn test_ancestor_at_granularity_coarser_node() {
+        let tree = two_file_tree();
+        // file_a is at File level; querying at Folder should give root (id=0).
+        assert_eq!(tree.ancestor_at_granularity(1, &NodeKind::Folder), Some(0));
+        // root is a Folder; querying at Folder should return root itself (id=0).
+        assert_eq!(tree.ancestor_at_granularity(0, &NodeKind::Folder), Some(0));
+    }
+
+    #[test]
+    fn test_ancestor_at_granularity_symref_returns_none() {
+        let tree = two_file_tree();
+        // SymRef has no level → ancestor_at_granularity returns None.
+        assert_eq!(tree.ancestor_at_granularity(0, &NodeKind::SymRef), None);
+    }
+
+    #[test]
+    fn test_aggregate_refs_at_file_granularity_deduplicates() {
+        let mut tree = two_file_tree();
+        // Two function-level calls from a.rs to b.rs.
+        tree.add_reference(2, 5, ReferenceKind::Call); // fn_a1 → fn_b1
+        tree.add_reference(3, 6, ReferenceKind::Call); // fn_a2 → fn_b2
+
+        // At File granularity both collapse to (file_a=1, file_b=4).
+        let agg = tree.aggregate_refs_at_granularity(&NodeKind::File);
+        assert_eq!(agg.len(), 1);
+        assert!(agg.contains(&(1, 4)));
+    }
+
+    #[test]
+    fn test_aggregate_refs_at_function_granularity_keeps_distinct() {
+        let mut tree = two_file_tree();
+        tree.add_reference(2, 5, ReferenceKind::Call); // fn_a1 → fn_b1
+        tree.add_reference(3, 6, ReferenceKind::Call); // fn_a2 → fn_b2
+
+        // At Function granularity the edges stay separate.
+        let agg = tree.aggregate_refs_at_granularity(&NodeKind::Function);
+        assert_eq!(agg.len(), 2);
+        assert!(agg.contains(&(2, 5)));
+        assert!(agg.contains(&(3, 6)));
+    }
+
+    #[test]
+    fn test_aggregate_refs_drops_self_loops() {
+        let mut tree = two_file_tree();
+        // Both functions are inside a.rs (id=1); at File level this is a self-loop.
+        tree.add_reference(2, 3, ReferenceKind::Call); // fn_a1 → fn_a2
+
+        let agg = tree.aggregate_refs_at_granularity(&NodeKind::File);
+        assert!(agg.is_empty());
+
+        // At Function granularity it remains a real edge (2 != 3).
+        let agg_fn = tree.aggregate_refs_at_granularity(&NodeKind::Function);
+        assert_eq!(agg_fn.len(), 1);
+        assert!(agg_fn.contains(&(2, 3)));
+    }
+
+    #[test]
+    fn test_aggregate_refs_mixed_granularity() {
+        let mut tree = two_file_tree();
+        // One cross-file call and one intra-file call.
+        tree.add_reference(2, 5, ReferenceKind::Call); // fn_a1 → fn_b1 (cross-file)
+        tree.add_reference(2, 3, ReferenceKind::Call); // fn_a1 → fn_a2 (intra-file)
+
+        let agg = tree.aggregate_refs_at_granularity(&NodeKind::File);
+        // Only the cross-file edge survives; intra-file becomes self-loop and is dropped.
+        assert_eq!(agg.len(), 1);
+        assert!(agg.contains(&(1, 4)));
+    }
+
+    #[test]
+    fn test_reference_kind_display() {
+        assert_eq!(ReferenceKind::Call.to_string(), "call");
+        assert_eq!(ReferenceKind::Import.to_string(), "import");
+        assert_eq!(ReferenceKind::TypeRef.to_string(), "type_ref");
+        assert_eq!(ReferenceKind::VarRef.to_string(), "var_ref");
+        assert_eq!(ReferenceKind::Generic.to_string(), "generic");
+    }
+
+    // -----------------------------------------------------------------------
+    // project_refs_onto_visible tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_project_refs_both_collapsed_gives_file_edge() {
+        let mut tree = two_file_tree();
+        // fn_a1 (2) → fn_b1 (5); both files collapsed → only folder(0), file_a(1), file_b(4) visible.
+        tree.add_reference(2, 5, ReferenceKind::Call);
+        let visible = vec![0usize, 1, 4]; // folder, file_a, file_b (functions collapsed)
+        let proj = tree.project_refs_onto_visible(&visible);
+        assert_eq!(proj.len(), 1);
+        assert!(proj.contains(&(1, 4)));
+    }
+
+    #[test]
+    fn test_project_refs_one_expanded_gives_mixed_edge() {
+        let mut tree = two_file_tree();
+        // fn_a1 (2) → fn_b1 (5); file_a expanded, file_b collapsed.
+        tree.add_reference(2, 5, ReferenceKind::Call);
+        let visible = vec![0usize, 1, 2, 3, 4]; // folder, file_a, fn_a1, fn_a2, file_b
+        let proj = tree.project_refs_onto_visible(&visible);
+        assert_eq!(proj.len(), 1);
+        // fn_a1 is visible, fn_b1 is not → walks up to file_b.
+        assert!(proj.contains(&(2, 4)));
+    }
+
+    #[test]
+    fn test_project_refs_both_expanded_gives_function_edge() {
+        let mut tree = two_file_tree();
+        tree.add_reference(2, 5, ReferenceKind::Call);
+        let visible = vec![0usize, 1, 2, 3, 4, 5, 6]; // all nodes
+        let proj = tree.project_refs_onto_visible(&visible);
+        assert_eq!(proj.len(), 1);
+        assert!(proj.contains(&(2, 5)));
+    }
+
+    #[test]
+    fn test_project_refs_intra_file_drops_self_loop_when_collapsed() {
+        let mut tree = two_file_tree();
+        // fn_a1 (2) → fn_a2 (3); both in file_a; when file_a is collapsed both map to file_a.
+        tree.add_reference(2, 3, ReferenceKind::Call);
+        let visible = vec![0usize, 1, 4]; // file_a collapsed
+        let proj = tree.project_refs_onto_visible(&visible);
+        // Both endpoints project to file_a (1) → self-loop, dropped.
+        assert!(proj.is_empty());
+    }
+
+    #[test]
+    fn test_project_refs_deduplicates() {
+        let mut tree = two_file_tree();
+        // Multiple function-level edges from a→b; all should deduplicate.
+        tree.add_reference(2, 5, ReferenceKind::Call);
+        tree.add_reference(3, 6, ReferenceKind::Call);
+        let visible = vec![0usize, 1, 4]; // both files collapsed
+        let proj = tree.project_refs_onto_visible(&visible);
+        assert_eq!(proj.len(), 1);
     }
 }
