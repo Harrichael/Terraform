@@ -1,6 +1,6 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{state::{AppMode, AppState}, tree::NodeKind};
+use crate::app::state::{AppMode, AppState};
 
 /// Process one terminal event and mutate `state` accordingly.
 /// Returns `true` if the application should quit.
@@ -26,53 +26,35 @@ fn handle_normal_key(state: &mut AppState, key: KeyEvent) {
         }
 
         // Navigation
-        KeyCode::Up | KeyCode::Char('k') => state.move_cursor_up(1),
-        KeyCode::Down | KeyCode::Char('j') => state.move_cursor_down(1),
-        KeyCode::PageUp => state.move_cursor_up(state.pane_height.max(1)),
-        KeyCode::PageDown => state.move_cursor_down(state.pane_height.max(1)),
+        KeyCode::Up | KeyCode::Char('k') => state.move_graph_cursor_up(1),
+        KeyCode::Down | KeyCode::Char('j') => state.move_graph_cursor_down(1),
+        KeyCode::PageUp => state.move_graph_cursor_up(state.pane_height.max(1)),
+        KeyCode::PageDown => state.move_graph_cursor_down(state.pane_height.max(1)),
         KeyCode::Home | KeyCode::Char('g') => {
-            state.cursor = 0;
-            state.scroll_offset = 0;
+            state.graph_cursor = 0;
+            state.graph_scroll_offset = 0;
         }
         KeyCode::End | KeyCode::Char('G') => {
-            if !state.visible_ids.is_empty() {
-                state.cursor = state.visible_ids.len() - 1;
+            if !state.graph_visible.is_empty() {
+                state.graph_cursor = state.graph_visible.len() - 1;
             }
         }
 
-        // Collapse / Expand (fold toggle for the current node)
-        KeyCode::Char(' ') => state.toggle_fold(),
+        // Fold toggle
+        KeyCode::Char(' ') | KeyCode::Enter => state.graph_toggle_fold(),
 
-        // Enter: fold/unfold, or jump to SymRef target
-        KeyCode::Enter => {
-            if let Some(&id) = state.visible_ids.get(state.cursor) {
-                if let Some(node) = state.tree.get(id) {
-                    if node.kind == NodeKind::SymRef {
-                        if !state.jump_to_sym_ref_target() {
-                            state.status = "Definition is not currently visible.".to_string();
-                        }
-                        return;
-                    }
-                }
-            }
-            state.toggle_fold();
-        }
+        // Zoom: Right/l = zoom in (expand one level), Left/h = zoom out
+        KeyCode::Right | KeyCode::Char('l') => state.graph_zoom_in(),
+        KeyCode::Left | KeyCode::Char('h') => state.graph_zoom_out(),
 
-        // Granularity: l / Right = expand (show finer detail on this node only)
-        //              h / Left  = shrink (show coarser detail on this node only)
-        KeyCode::Right | KeyCode::Char('l') => state.expand_cursor_granularity(),
-        KeyCode::Left | KeyCode::Char('h') => state.shrink_cursor_granularity(),
-
-        // Collapse/Expand all
-        KeyCode::Char('[') => state.collapse_all(),
-        KeyCode::Char(']') => state.expand_all(),
+        // Clear all folds
+        KeyCode::Char('[') | KeyCode::Char(']') => state.graph_clear_folds(),
 
         // Filter
         KeyCode::Char('/') => state.enter_filter(),
         KeyCode::Esc => {
             if !state.filter.is_empty() {
                 state.filter.clear();
-                state.refresh_visible();
                 state.status = String::from("Filter cleared.");
             }
         }

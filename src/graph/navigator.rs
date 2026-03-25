@@ -1,5 +1,5 @@
 use crate::graph::cursor::Cursor;
-use crate::graph::entity::{EntityGraph, EntityId};
+use crate::graph::entity::{Entity, EntityGraph, EntityId};
 use crate::graph::tree::{GraphTree, GraphTreeNodeId};
 
 /// The central controller that wraps the static entity graph and the dynamic
@@ -33,6 +33,14 @@ impl Navigator {
 
     pub fn tree(&self) -> &GraphTree {
         &self.view_tree
+    }
+
+    /// Look up an entity from the graph by its ID.
+    ///
+    /// Used by the UI layer to retrieve entity metadata (name, kind, etc.)
+    /// for rendering tree nodes without exposing the graph directly.
+    pub fn entity(&self, id: EntityId) -> Option<&Entity> {
+        self.graph.get(id)
     }
 
     /// Expand the entity represented by `focused_tree_node` one level down.
@@ -69,9 +77,24 @@ impl Navigator {
     ///
     /// Algorithm:
     /// 1. Register every active leaf as a `GraphTree` node.
-    /// 2. For each symbolic reference between *distinct* leaves, insert a tree
-    ///    edge via [`GraphTree::insert_edge`], which handles cycle detection and
-    ///    `NodeKind::Cycle` / `NodeKind::Ref` marking automatically.
+    /// 2. Build a deduplicated adjacency list from cursor references
+    ///    (self-loops suppressed).
+    /// 3. Walk the reference graph with a DFS spanning forest: only the first
+    ///    time a node is reached do we emit an `insert_edge` call.  Back-edges
+    ///    and cross-edges are silently dropped.
+    ///
+    /// Producing a spanning forest rather than inserting every edge has two
+    /// important benefits:
+    ///
+    /// - **No cycles in the view tree.**  Mutual references (A→B and B→A) no
+    ///   longer create `NodeKind::Cycle` / `NodeKind::Ref` stubs; the user
+    ///   just sees A→B without the confusing ↺ marker.
+    ///
+    /// - **No exponential node growth.**  Previously, inserting hundreds of
+    ///   deduplicated edges between the same small set of folder-level leaves
+    ///   triggered `deep_copy_subtree` for each duplicate parent, growing the
+    ///   tree exponentially.  The DFS guarantees each entity is placed in the
+    ///   tree exactly once.
     fn sync_tree(&mut self) {
         self.view_tree = GraphTree::new();
 
@@ -80,10 +103,46 @@ impl Navigator {
             self.view_tree.insert_entity(leaf, vec![]);
         }
 
-        // Self-loops don't affect tree structure and are suppressed from the view.
-        for cursor_ref in &self.cursor.references {
-            if cursor_ref.from_leaf != cursor_ref.to_leaf {
-                self.view_tree.insert_edge(cursor_ref.from_leaf, cursor_ref.to_leaf);
+        // Build a deduplicated adjacency list (self-loops suppressed).
+        let mut adj: std::collections::HashMap<EntityId, Vec<EntityId>> =
+            std::collections::HashMap::new();
+        {
+            let mut seen = std::collections::HashSet::new();
+            for cursor_ref in &self.cursor.references {
+                if cursor_ref.from_leaf != cursor_ref.to_leaf
+                    && seen.insert((cursor_ref.from_leaf, cursor_ref.to_leaf))
+                {
+                    adj.entry(cursor_ref.from_leaf)
+                        .or_default()
+                        .push(cursor_ref.to_leaf);
+                }
+            }
+        }
+
+        // DFS spanning forest: only tree edges are forwarded to insert_edge.
+        let leaves: Vec<EntityId> = self.cursor.active().to_vec();
+        let mut visited = std::collections::HashSet::new();
+        for &root in &leaves {
+            if visited.contains(&root) {
+                continue;
+            }
+            let mut stack: Vec<(EntityId, Option<EntityId>)> = vec![(root, None)];
+            while let Some((node, parent)) = stack.pop() {
+                if !visited.insert(node) {
+                    continue;
+                }
+                if let Some(p) = parent {
+                    self.view_tree.insert_edge(p, node);
+                }
+                if let Some(children) = adj.get(&node) {
+                    // Push in reverse so the first adjacency-list child is
+                    // processed first (LIFO stack, so last-pushed = first-popped).
+                    for &child in children.iter().rev() {
+                        if !visited.contains(&child) {
+                            stack.push((child, Some(node)));
+                        }
+                    }
+                }
             }
         }
     }
