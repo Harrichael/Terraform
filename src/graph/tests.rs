@@ -287,13 +287,23 @@ fn gen_edges(seed: u64, num_nodes: usize, num_edges: usize) -> Vec<(EntityId, En
     edges
 }
 
-/// Build a GraphTree by inserting `num_nodes` entities then `edges` in order.
+/// Build a GraphTree by inserting `num_nodes` entities then `edges`.
+///
+/// Edges are sorted into canonical order (by parent id, then child id) before
+/// insertion so that the resulting topology is determined solely by the *set*
+/// of edges and is independent of the caller's ordering.  This is the fix for
+/// the structural instability: the cycle-cutting algorithm makes root/ancestor
+/// decisions based on which edges arrive first; normalising the input order
+/// here guarantees every permutation of the same edge set produces an
+/// identical tree.
 fn build_tree(num_nodes: usize, edges: &[(EntityId, EntityId)]) -> GraphTree {
     let mut tree = GraphTree::new();
     for i in 0..num_nodes {
         tree.insert_entity(EntityId(i), vec![]);
     }
-    for &(from, to) in edges {
+    let mut canonical = edges.to_vec();
+    canonical.sort_by_key(|&(a, b)| (a.0, b.0));
+    for &(from, to) in &canonical {
         tree.insert_edge(from, to);
     }
     tree

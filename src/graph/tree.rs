@@ -139,21 +139,24 @@ impl GraphTree {
     }
 
     pub fn insert_edge(&mut self, parent_entity: EntityId, child_entity: EntityId) {
-        // Collect owned so we can mutably borrow self in the loop.
+        // Only Normal nodes are real structural parents — Cycle and Ref nodes
+        // are rendering artifacts and must never be treated as edge sources.
         let parent_node_ids: Vec<GraphTreeNodeId> = self.nodes_by_entity
             .get(&parent_entity)
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|&id| self.nodes.get(id.0).map_or(false, |n| n.kind == NodeKind::Normal))
+            .collect();
 
-        // Free root nodes for child_entity: nodes that have no parent yet.
-        // We claim these one-to-one for each parent occurrence before falling
-        // back to deep copies.
+        // Free root nodes for child_entity: Normal nodes with no parent yet.
         let free_roots: Vec<GraphTreeNodeId> = self.nodes_by_entity
             .get(&child_entity)
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter(|&id| self.nodes.get(id.0).map_or(false, |n| n.parent.is_none()))
+            .filter(|&id| self.nodes.get(id.0)
+                .map_or(false, |n| n.kind == NodeKind::Normal && n.parent.is_none()))
             .collect();
 
         let mut free_root_idx = 0;
@@ -268,10 +271,16 @@ impl GraphTree {
 
     /// Walk from `node_id` up to the tree root and collect every entity id on
     /// that path (inclusive).  Used to detect back-edges that would form cycles.
+    ///
+    /// A `visited` set guards against accidental cycles in parent pointers
+    /// (a structural invariant violation that should never happen, but if it
+    /// does we break rather than loop forever).
     fn build_ancestor_path(&self, node_id: GraphTreeNodeId) -> HashSet<EntityId> {
         let mut path = HashSet::new();
+        let mut visited = HashSet::new();
         let mut current = Some(node_id);
         while let Some(id) = current {
+            if !visited.insert(id) { break; }   // cycle in parent pointers — bail out
             match self.nodes.get(id.0) {
                 Some(node) => { path.insert(node.entity_id); current = node.parent; }
                 None => break,
