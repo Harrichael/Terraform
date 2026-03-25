@@ -1,4 +1,8 @@
-use super::entity::EntityId;
+use std::ops::Range;
+use std::path::PathBuf;
+
+use super::entity::{Entity, EntityGraph, EntityId, EntityKind, Reference, ReferenceKind};
+use super::navigator::Navigator;
 use super::tree::{GraphTree, GraphTreeNodeId, NodeKind};
 
 fn canonical_subtree(tree: &GraphTree, node_id: GraphTreeNodeId) -> String {
@@ -384,4 +388,156 @@ fn test_mutual_edge_both_roots() {
 
     assert_eq!(canonical_forest(&t1), "0[!1[]],1[!0[]]");
     assert_eq!(canonical_forest(&t2), "0[!1[]],1[!0[]]");
+}
+
+// ─── Navigator smoke tests ────────────────────────────────────────────────────
+
+fn make_entity(id: usize, name: &str, kind: EntityKind, parent: Option<EntityId>) -> Entity {
+    Entity {
+        id: EntityId(id),
+        kind,
+        name: name.to_string(),
+        parent,
+        children: Vec::new(),
+        path: PathBuf::from(format!("{name}.rs")),
+        byte_range: Range { start: 0, end: 0 },
+        line_range: Range { start: 0, end: 0 },
+    }
+}
+
+/// Return the first `Normal` tree node for `entity_id`, or `None` if absent.
+fn normal_tree_node(nav: &Navigator, entity_id: EntityId) -> Option<GraphTreeNodeId> {
+    nav.tree()
+        .nodes_by_entity
+        .get(&entity_id)?
+        .iter()
+        .find(|&&id| nav.tree().get(id).map_or(false, |n| n.kind == NodeKind::Normal))
+        .copied()
+}
+
+/// A Navigator over a single root entity produces a tree with exactly one node.
+#[test]
+fn test_navigator_new_single_root() {
+    let graph = EntityGraph {
+        entities: vec![make_entity(0, "root", EntityKind::Folder, None)],
+        references: vec![],
+    };
+    let nav = Navigator::new(graph);
+
+    assert_eq!(nav.tree().nodes.len(), 1);
+    let node = &nav.tree().nodes[0];
+    assert_eq!(node.entity_id, EntityId(0));
+    assert_eq!(node.kind, NodeKind::Normal);
+    assert!(node.parent.is_none());
+}
+
+/// Zooming into a root with one child reveals the child and returns its EntityId.
+#[test]
+fn test_navigator_zoom_in_reveals_child() {
+    let mut graph = EntityGraph {
+        entities: vec![
+            make_entity(0, "root",   EntityKind::Folder, None),
+            make_entity(1, "module", EntityKind::Module, Some(EntityId(0))),
+        ],
+        references: vec![],
+    };
+    graph.entities[0].children = vec![EntityId(1)];
+
+    let mut nav = Navigator::new(graph);
+    let root_node = normal_tree_node(&nav, EntityId(0)).unwrap();
+    let result = nav.zoom_in(root_node);
+
+    assert_eq!(result, Some(EntityId(1)));
+    let normal_count = nav.tree().nodes.iter().filter(|n| n.kind == NodeKind::Normal).count();
+    assert_eq!(normal_count, 1);
+    assert_eq!(nav.tree().nodes[0].entity_id, EntityId(1));
+}
+
+/// Zooming out from a child collapses back to its parent and returns the parent's EntityId.
+#[test]
+fn test_navigator_zoom_out_restores_parent() {
+    let mut graph = EntityGraph {
+        entities: vec![
+            make_entity(0, "root",   EntityKind::Folder, None),
+            make_entity(1, "module", EntityKind::Module, Some(EntityId(0))),
+        ],
+        references: vec![],
+    };
+    graph.entities[0].children = vec![EntityId(1)];
+
+    let mut nav = Navigator::new(graph);
+    let root_node = normal_tree_node(&nav, EntityId(0)).unwrap();
+    nav.zoom_in(root_node);
+
+    let child_node = normal_tree_node(&nav, EntityId(1)).unwrap();
+    let result = nav.zoom_out(child_node);
+
+    assert_eq!(result, Some(EntityId(0)));
+    let normal_count = nav.tree().nodes.iter().filter(|n| n.kind == NodeKind::Normal).count();
+    assert_eq!(normal_count, 1);
+    assert_eq!(nav.tree().nodes[0].entity_id, EntityId(0));
+}
+
+/// Zooming into a leaf entity (no children) returns None and leaves the tree unchanged.
+#[test]
+fn test_navigator_zoom_in_leaf_returns_none() {
+    let graph = EntityGraph {
+        entities: vec![make_entity(0, "fn_leaf", EntityKind::Function, None)],
+        references: vec![],
+    };
+    let mut nav = Navigator::new(graph);
+    let leaf_node = normal_tree_node(&nav, EntityId(0)).unwrap();
+
+    let result = nav.zoom_in(leaf_node);
+    assert!(result.is_none());
+    assert_eq!(nav.tree().nodes.len(), 1);
+}
+
+/// Zooming out from the root entity (no parent) returns None and leaves the tree unchanged.
+#[test]
+fn test_navigator_zoom_out_root_returns_none() {
+    let graph = EntityGraph {
+        entities: vec![make_entity(0, "root", EntityKind::Folder, None)],
+        references: vec![],
+    };
+    let mut nav = Navigator::new(graph);
+    let root_node = normal_tree_node(&nav, EntityId(0)).unwrap();
+
+    let result = nav.zoom_out(root_node);
+    assert!(result.is_none());
+    assert_eq!(nav.tree().nodes.len(), 1);
+}
+
+/// After zooming into a parent that has two children connected by a reference,
+/// the source child node gains the target child as a tree child.
+#[test]
+fn test_navigator_reference_visible_after_zoom_in() {
+    let mut graph = EntityGraph {
+        entities: vec![
+            make_entity(0, "root", EntityKind::Folder, None),
+            make_entity(1, "a",    EntityKind::Module, Some(EntityId(0))),
+            make_entity(2, "b",    EntityKind::Module, Some(EntityId(0))),
+        ],
+        references: vec![Reference {
+            from: EntityId(1),
+            to: EntityId(2),
+            kind: ReferenceKind::Call,
+        }],
+    };
+    graph.entities[0].children = vec![EntityId(1), EntityId(2)];
+
+    let mut nav = Navigator::new(graph);
+
+    // Before zoom: both modules are inside the root; only root is visible.
+    assert_eq!(nav.tree().nodes.len(), 1);
+
+    let root_node = normal_tree_node(&nav, EntityId(0)).unwrap();
+    nav.zoom_in(root_node);
+
+    // After zoom: the reference from a→b is now a tree edge.
+    let a_id = normal_tree_node(&nav, EntityId(1)).unwrap();
+    let a = nav.tree().get(a_id).unwrap();
+    assert_eq!(a.children.len(), 1);
+    let child = nav.tree().get(a.children[0]).unwrap();
+    assert_eq!(child.entity_id, EntityId(2));
 }

@@ -3,9 +3,8 @@ use std::path::PathBuf;
 
 use super::entity::{Entity, EntityGraph, EntityId, EntityKind, Reference, ReferenceKind, ReferenceId};
 use super::cursor::Cursor;
+use super::navigator::Navigator;
 use super::tree::{GraphTree, GraphTreeNodeId, NodeKind};
-// use super::tree::ReferenceTree;
-// use super::navigator::Navigator;
 
 fn make_entity(id: usize, name: &str, kind: EntityKind, parent: Option<EntityId>) -> Entity {
     Entity {
@@ -155,82 +154,6 @@ fn test_cursor_move_up_at_root() {
     assert!(!result);
     assert_eq!(cursor.active(), &[EntityId(0)]);
 }
-
-// #[test]
-// fn test_reference_tree_add_node() {
-//     let mut tree = ReferenceTree::new();
-//
-//     let id1 = tree.add_node(EntityId(10), 0, None);
-//     let id2 = tree.add_node(EntityId(20), 1, Some(id1));
-//
-//     assert_eq!(id1, 0);
-//     assert_eq!(id2, 1);
-//     assert_eq!(tree.root, Some(0));
-//     assert_eq!(tree.nodes.len(), 2);
-//
-//     let node1 = tree.get(id1).unwrap();
-//     assert_eq!(node1.entity_id, EntityId(10));
-//     assert_eq!(node1.depth, 0);
-//     assert_eq!(node1.children, vec![1]);
-//
-//     let node2 = tree.get(id2).unwrap();
-//     assert_eq!(node2.entity_id, EntityId(20));
-//     assert_eq!(node2.parent, Some(id1));
-// }
-
-// #[test]
-// fn test_tree_node_is_leaf() {
-//     let mut tree = ReferenceTree::new();
-//
-//     let id1 = tree.add_node(EntityId(10), 0, None);
-//     let _id2 = tree.add_node(EntityId(20), 1, Some(id1));
-//
-//     let node1 = tree.get(id1).unwrap();
-//     assert!(!node1.is_leaf());
-//
-//     let node2 = tree.get(1).unwrap();
-//     assert!(node2.is_leaf());
-// }
-
-// #[test]
-// fn test_navigator_creation() {
-//     let mut graph = EntityGraph {
-//         entities: vec![make_entity(0, "root", EntityKind::Folder, None)],
-//         references: Vec::new(),
-//     };
-//
-//     graph.entities[0].children = Vec::new();
-//
-//     let navigator = Navigator::new(graph);
-//
-//     assert!(navigator.tree().root.is_some());
-// }
-
-// #[test]
-// fn test_navigator_zoom_in_zoom_out() {
-//     let mut graph = EntityGraph {
-//         entities: vec![
-//             make_entity(0, "root", EntityKind::Folder, None),
-//             make_entity(1, "module", EntityKind::Module, Some(EntityId(0))),
-//             make_entity(2, "class", EntityKind::Class, Some(EntityId(1))),
-//         ],
-//         references: Vec::new(),
-//     };
-//
-//     graph.entities[0].children = vec![EntityId(1)];
-//     graph.entities[1].children = vec![EntityId(2)];
-//
-//     let mut navigator = Navigator::new(graph);
-//
-//     let root_tree_id = navigator.tree().root.unwrap();
-//     let first_child = navigator.zoom_in(super::tree::TreeNodeId(root_tree_id));
-//
-//     assert!(first_child.is_some());
-//     assert_eq!(first_child, Some(EntityId(1)));
-//
-//     let parent = navigator.zoom_out(super::tree::TreeNodeId(root_tree_id));
-//     assert!(parent.is_none()); // root has no parent
-// }
 
 #[test]
 fn test_entity_kind_display() {
@@ -422,4 +345,300 @@ fn test_graph_tree_topology_stable_under_edge_permutations() {
             );
         }
     }
+}
+
+// ─── Navigator helpers ────────────────────────────────────────────────────────
+
+/// Return the first `Normal` tree node for `entity_id`, or `None` if absent.
+fn normal_tree_node(nav: &Navigator, entity_id: EntityId) -> Option<GraphTreeNodeId> {
+    nav.tree()
+        .nodes_by_entity
+        .get(&entity_id)?
+        .iter()
+        .find(|&&id| nav.tree().get(id).map_or(false, |n| n.kind == NodeKind::Normal))
+        .copied()
+}
+
+// ─── Navigator deep tests ─────────────────────────────────────────────────────
+
+/// Multiple root entities (no parent) each become active leaves and get their
+/// own Normal node in the initial view tree.
+#[test]
+fn test_navigator_multiple_roots_initial_tree() {
+    let graph = EntityGraph {
+        entities: vec![
+            make_entity(0, "root_a", EntityKind::Folder, None),
+            make_entity(1, "root_b", EntityKind::Folder, None),
+        ],
+        references: vec![],
+    };
+    let nav = Navigator::new(graph);
+
+    let normal_count = nav.tree().nodes.iter().filter(|n| n.kind == NodeKind::Normal).count();
+    assert_eq!(normal_count, 2);
+    assert!(nav.tree().nodes_by_entity.contains_key(&EntityId(0)));
+    assert!(nav.tree().nodes_by_entity.contains_key(&EntityId(1)));
+}
+
+/// A reference between two root entities is wired as a tree edge immediately
+/// on construction — no zoom required.
+#[test]
+fn test_navigator_cross_root_reference() {
+    let graph = EntityGraph {
+        entities: vec![
+            make_entity(0, "a", EntityKind::Folder, None),
+            make_entity(1, "b", EntityKind::Folder, None),
+        ],
+        references: vec![Reference {
+            from: EntityId(0),
+            to: EntityId(1),
+            kind: ReferenceKind::Import,
+        }],
+    };
+    let nav = Navigator::new(graph);
+
+    let a_id = normal_tree_node(&nav, EntityId(0)).unwrap();
+    let a = nav.tree().get(a_id).unwrap();
+    assert_eq!(a.children.len(), 1);
+    let child = nav.tree().get(a.children[0]).unwrap();
+    assert_eq!(child.entity_id, EntityId(1));
+}
+
+/// Zooming into a three-level hierarchy one step at a time exposes exactly one
+/// new level per operation: root → module → [class_a, class_b].
+#[test]
+fn test_navigator_deep_zoom_in_sequence() {
+    let mut graph = EntityGraph {
+        entities: vec![
+            make_entity(0, "folder",  EntityKind::Folder, None),
+            make_entity(1, "module",  EntityKind::Module, Some(EntityId(0))),
+            make_entity(2, "class_a", EntityKind::Class,  Some(EntityId(1))),
+            make_entity(3, "class_b", EntityKind::Class,  Some(EntityId(1))),
+        ],
+        references: vec![],
+    };
+    graph.entities[0].children = vec![EntityId(1)];
+    graph.entities[1].children = vec![EntityId(2), EntityId(3)];
+
+    let mut nav = Navigator::new(graph);
+
+    // Level 0 — only the folder is active.
+    assert!(nav.tree().nodes_by_entity.contains_key(&EntityId(0)));
+    assert!(!nav.tree().nodes_by_entity.contains_key(&EntityId(1)));
+
+    // Level 1 — zoom into folder; module appears, folder vanishes.
+    let folder_node = normal_tree_node(&nav, EntityId(0)).unwrap();
+    let first = nav.zoom_in(folder_node);
+    assert_eq!(first, Some(EntityId(1)));
+    assert!(nav.tree().nodes_by_entity.contains_key(&EntityId(1)));
+    assert!(!nav.tree().nodes_by_entity.contains_key(&EntityId(2)));
+
+    // Level 2 — zoom into module; both classes appear, module vanishes.
+    let module_node = normal_tree_node(&nav, EntityId(1)).unwrap();
+    let first_class = nav.zoom_in(module_node);
+    assert_eq!(first_class, Some(EntityId(2)));
+    assert!(nav.tree().nodes_by_entity.contains_key(&EntityId(2)));
+    assert!(nav.tree().nodes_by_entity.contains_key(&EntityId(3)));
+    assert!(!nav.tree().nodes_by_entity.contains_key(&EntityId(0)));
+    assert!(!nav.tree().nodes_by_entity.contains_key(&EntityId(1)));
+}
+
+/// Zooming all the way in and then all the way back out restores the tree to
+/// its original single-root state; each zoom_out returns the correct parent id.
+#[test]
+fn test_navigator_zoom_out_restores_tree() {
+    let mut graph = EntityGraph {
+        entities: vec![
+            make_entity(0, "folder", EntityKind::Folder, None),
+            make_entity(1, "module", EntityKind::Module, Some(EntityId(0))),
+            make_entity(2, "class",  EntityKind::Class,  Some(EntityId(1))),
+        ],
+        references: vec![],
+    };
+    graph.entities[0].children = vec![EntityId(1)];
+    graph.entities[1].children = vec![EntityId(2)];
+
+    let mut nav = Navigator::new(graph);
+
+    // Zoom all the way in.
+    let n0 = normal_tree_node(&nav, EntityId(0)).unwrap();
+    nav.zoom_in(n0);
+    let n1 = normal_tree_node(&nav, EntityId(1)).unwrap();
+    nav.zoom_in(n1);
+    assert_eq!(nav.tree().nodes.iter().filter(|n| n.kind == NodeKind::Normal).count(), 1);
+    assert!(nav.tree().nodes_by_entity.contains_key(&EntityId(2)));
+
+    // Zoom out once — back to module level.
+    let n2 = normal_tree_node(&nav, EntityId(2)).unwrap();
+    let parent = nav.zoom_out(n2);
+    assert_eq!(parent, Some(EntityId(1)));
+    assert!(nav.tree().nodes_by_entity.contains_key(&EntityId(1)));
+
+    // Zoom out again — back to folder level.
+    let n1b = normal_tree_node(&nav, EntityId(1)).unwrap();
+    let grandparent = nav.zoom_out(n1b);
+    assert_eq!(grandparent, Some(EntityId(0)));
+    assert!(nav.tree().nodes_by_entity.contains_key(&EntityId(0)));
+    assert_eq!(nav.tree().nodes.iter().filter(|n| n.kind == NodeKind::Normal).count(), 1);
+}
+
+/// A reference between deeply nested functions is invisible at coarser zoom
+/// levels and becomes a visible tree edge only once both endpoints are leaves.
+#[test]
+fn test_navigator_reference_remaps_through_zoom() {
+    // Folder(0) → [Mod_A(1), Mod_B(2)]
+    // Mod_A(1) → [Fn_X(3)],  Mod_B(2) → [Fn_Y(4)]
+    // Reference: Fn_X(3) → Fn_Y(4)
+    let mut graph = EntityGraph {
+        entities: vec![
+            make_entity(0, "folder", EntityKind::Folder,   None),
+            make_entity(1, "mod_a",  EntityKind::Module,   Some(EntityId(0))),
+            make_entity(2, "mod_b",  EntityKind::Module,   Some(EntityId(0))),
+            make_entity(3, "fn_x",   EntityKind::Function, Some(EntityId(1))),
+            make_entity(4, "fn_y",   EntityKind::Function, Some(EntityId(2))),
+        ],
+        references: vec![Reference {
+            from: EntityId(3),
+            to: EntityId(4),
+            kind: ReferenceKind::Call,
+        }],
+    };
+    graph.entities[0].children = vec![EntityId(1), EntityId(2)];
+    graph.entities[1].children = vec![EntityId(3)];
+    graph.entities[2].children = vec![EntityId(4)];
+
+    let mut nav = Navigator::new(graph);
+
+    // Level 0 — reference is internal to folder; only one node, no edges.
+    assert_eq!(nav.tree().nodes.len(), 1);
+
+    // Level 1 — reference maps up to mod_a → mod_b edge.
+    let folder_node = normal_tree_node(&nav, EntityId(0)).unwrap();
+    nav.zoom_in(folder_node);
+
+    let mod_a_id = normal_tree_node(&nav, EntityId(1)).unwrap();
+    let mod_a = nav.tree().get(mod_a_id).unwrap();
+    assert_eq!(mod_a.children.len(), 1, "mod_a should have mod_b as its tree child");
+    let edge_target = nav.tree().get(mod_a.children[0]).unwrap();
+    assert_eq!(edge_target.entity_id, EntityId(2), "reference target should be mod_b");
+
+    // Level 2 — zoom into mod_a; fn_x appears, mod_b stays as a leaf.
+    let mod_a_id = normal_tree_node(&nav, EntityId(1)).unwrap();
+    nav.zoom_in(mod_a_id);
+
+    assert!(nav.tree().nodes_by_entity.contains_key(&EntityId(3)), "fn_x must be a leaf");
+    assert!(nav.tree().nodes_by_entity.contains_key(&EntityId(2)), "mod_b must still be a leaf");
+    assert!(!nav.tree().nodes_by_entity.contains_key(&EntityId(1)), "mod_a must not be a leaf");
+}
+
+/// Mutual references between two sibling leaves produce exactly two Cycle nodes
+/// (one for each entity involved in the back-edge).
+#[test]
+fn test_navigator_cyclic_references_produce_cycle_nodes() {
+    let mut graph = EntityGraph {
+        entities: vec![
+            make_entity(0, "root",  EntityKind::Folder, None),
+            make_entity(1, "mod_a", EntityKind::Module, Some(EntityId(0))),
+            make_entity(2, "mod_b", EntityKind::Module, Some(EntityId(0))),
+        ],
+        references: vec![
+            Reference { from: EntityId(1), to: EntityId(2), kind: ReferenceKind::Call },
+            Reference { from: EntityId(2), to: EntityId(1), kind: ReferenceKind::Call },
+        ],
+    };
+    graph.entities[0].children = vec![EntityId(1), EntityId(2)];
+
+    let mut nav = Navigator::new(graph);
+    let root_node = normal_tree_node(&nav, EntityId(0)).unwrap();
+    nav.zoom_in(root_node);
+
+    let cycle_nodes: Vec<_> = nav.tree().nodes.iter()
+        .filter(|n| n.kind == NodeKind::Cycle)
+        .collect();
+    assert_eq!(cycle_nodes.len(), 2, "mutual reference should produce exactly 2 Cycle nodes");
+
+    let mut ids: Vec<usize> = cycle_nodes.iter().map(|n| n.entity_id.0).collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2]);
+}
+
+/// A three-entity reference cycle (A→B→C→A) produces a finite tree with at
+/// least one Cycle node; the total node count stays well below a trivial bound.
+#[test]
+fn test_navigator_three_entity_reference_cycle() {
+    let mut graph = EntityGraph {
+        entities: vec![
+            make_entity(0, "root", EntityKind::Folder, None),
+            make_entity(1, "a",   EntityKind::Module,  Some(EntityId(0))),
+            make_entity(2, "b",   EntityKind::Module,  Some(EntityId(0))),
+            make_entity(3, "c",   EntityKind::Module,  Some(EntityId(0))),
+        ],
+        references: vec![
+            Reference { from: EntityId(1), to: EntityId(2), kind: ReferenceKind::Call },
+            Reference { from: EntityId(2), to: EntityId(3), kind: ReferenceKind::Call },
+            Reference { from: EntityId(3), to: EntityId(1), kind: ReferenceKind::Call },
+        ],
+    };
+    graph.entities[0].children = vec![EntityId(1), EntityId(2), EntityId(3)];
+
+    let mut nav = Navigator::new(graph);
+    let root_node = normal_tree_node(&nav, EntityId(0)).unwrap();
+    nav.zoom_in(root_node);
+
+    assert!(
+        nav.tree().nodes.len() < 50,
+        "tree must be finite after cycle detection, got {} nodes",
+        nav.tree().nodes.len()
+    );
+    let cycle_count = nav.tree().nodes.iter().filter(|n| n.kind == NodeKind::Cycle).count();
+    assert!(cycle_count > 0, "3-cycle must produce at least one Cycle node");
+}
+
+/// Zooming into one sibling while leaving another at the same depth results in
+/// a mixed active leaf set spanning two hierarchy levels simultaneously.
+#[test]
+fn test_navigator_mixed_depth_active_leaves() {
+    let mut graph = EntityGraph {
+        entities: vec![
+            make_entity(0, "root",  EntityKind::Folder,   None),
+            make_entity(1, "mod_a", EntityKind::Module,   Some(EntityId(0))),
+            make_entity(2, "mod_b", EntityKind::Module,   Some(EntityId(0))),
+            make_entity(3, "fn_x",  EntityKind::Function, Some(EntityId(1))),
+        ],
+        references: vec![],
+    };
+    graph.entities[0].children = vec![EntityId(1), EntityId(2)];
+    graph.entities[1].children = vec![EntityId(3)];
+
+    let mut nav = Navigator::new(graph);
+
+    let root_node = normal_tree_node(&nav, EntityId(0)).unwrap();
+    nav.zoom_in(root_node);
+
+    // Zoom into mod_a only; mod_b stays at module depth.
+    let mod_a_node = normal_tree_node(&nav, EntityId(1)).unwrap();
+    nav.zoom_in(mod_a_node);
+
+    assert!(nav.tree().nodes_by_entity.contains_key(&EntityId(3)), "fn_x should be a leaf");
+    assert!(nav.tree().nodes_by_entity.contains_key(&EntityId(2)), "mod_b should still be a leaf");
+    assert!(!nav.tree().nodes_by_entity.contains_key(&EntityId(0)), "root must not be active");
+    assert!(!nav.tree().nodes_by_entity.contains_key(&EntityId(1)), "mod_a must not be active");
+}
+
+/// A self-referencing entity's loop has `from_leaf == to_leaf` and is therefore
+/// suppressed from the view tree, keeping the single node child-free.
+#[test]
+fn test_navigator_self_loop_reference_suppressed() {
+    let graph = EntityGraph {
+        entities: vec![make_entity(0, "recursive_fn", EntityKind::Function, None)],
+        references: vec![Reference {
+            from: EntityId(0),
+            to: EntityId(0),
+            kind: ReferenceKind::Call,
+        }],
+    };
+    let nav = Navigator::new(graph);
+
+    let node = nav.tree().nodes.iter().find(|n| n.entity_id == EntityId(0)).unwrap();
+    assert!(node.children.is_empty(), "self-loop must not appear as a tree edge");
 }

@@ -1,5 +1,6 @@
 pub mod cursor;
 pub mod entity;
+pub mod navigator;
 pub mod tree;
 
 #[cfg(test)]
