@@ -7,8 +7,15 @@
 //! (Folder → Module → File → Class → Function); Block, Line, and SymRef nodes
 //! are filtered out and their reference edges are remapped to the nearest
 //! function-or-coarser ancestor.
+//!
+//! Additionally, Rust `mod.rs` files that contain only `pub mod` / `mod`
+//! declarations (no functions or classes) are treated as **glue modules** and
+//! omitted from the entity graph.  Their bare stub `Module` children (the
+//! `pub mod foo;` declaration nodes, which have no body and therefore no
+//! CodeTree children) are also omitted because they duplicate the real
+//! `Folder` / `File` nodes that represent each sub-module.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::app::tree::{CodeTree, NodeKind, ReferenceKind};
 use crate::graph::entity::{
@@ -35,16 +42,54 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
     };
 
     // ------------------------------------------------------------------
+    // Pre-pass: Identify Rust "glue" mod.rs files.
+    //
+    // A glue mod.rs contains only `pub mod` / `mod` declarations and
+    // `use` re-exports — no classes or functions.  In the CodeTree these
+    // files have no Class or Function children.  We skip:
+    //
+    //   1. The File node for the glue mod.rs itself.
+    //   2. Its direct Module children that are declaration-only stubs
+    //      (i.e., `pub mod foo;` with no body → no CodeTree children).
+    //
+    // This keeps the entity graph uncluttered: the real sub-module
+    // entities are the Folder / File nodes added by the directory walker.
+    // ------------------------------------------------------------------
+    let structural_count = tree.structural_count;
+    let mut glue_ids: HashSet<usize> = HashSet::new();
+
+    for code_id in 0..structural_count {
+        if !is_glue_mod_rs(code_id, tree, structural_count) {
+            continue;
+        }
+        glue_ids.insert(code_id);
+        // Also skip stub Module children (pub mod foo; with no body).
+        let children = tree.get(code_id).map(|n| n.children.clone()).unwrap_or_default();
+        for child_id in children {
+            if child_id >= structural_count {
+                continue;
+            }
+            let Some(child) = tree.get(child_id) else { continue };
+            if child.kind == NodeKind::Module && child.children.is_empty() {
+                glue_ids.insert(child_id);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Pass 1: Create entity stubs for every qualifying structural node.
     // We keep a mapping code_node_id → EntityId for use in later passes.
     // ------------------------------------------------------------------
-    let structural_count = tree.structural_count;
     let mut id_map: HashMap<usize, EntityId> = HashMap::new();
     let mut entities: Vec<Entity> = Vec::new();
 
     for code_id in 0..structural_count {
         if let Some(node) = tree.get(code_id) {
             if !is_entity_kind(&node.kind) {
+                continue;
+            }
+            // Skip glue mod.rs files and their stub Module children.
+            if glue_ids.contains(&code_id) {
                 continue;
             }
             let entity_id = EntityId(entities.len());
@@ -140,6 +185,28 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Return `true` if `code_id` is a Rust "glue" `mod.rs` file — a `File` node
+/// named `"mod.rs"` whose only entity-kind children are Module declaration
+/// stubs (`pub mod foo;` / `mod foo;`) with no functions or classes.
+///
+/// Files that contain real implementations (functions, structs, etc.) return
+/// `false` and are kept in the entity graph as normal.
+fn is_glue_mod_rs(code_id: usize, tree: &CodeTree, structural_count: usize) -> bool {
+    let Some(node) = tree.get(code_id) else { return false };
+    if node.kind != NodeKind::File || node.name != "mod.rs" {
+        return false;
+    }
+    // Not glue if any direct structural child is a Class or Function.
+    node.children.iter()
+        .filter(|&&c| c < structural_count)
+        .all(|&c| {
+            !matches!(
+                tree.get(c).map(|n| &n.kind),
+                Some(NodeKind::Class) | Some(NodeKind::Function)
+            )
+        })
+}
 
 /// Build a display path for `code_id` by walking up the containment hierarchy
 /// and joining entity-level ancestor names with `/`.
@@ -311,5 +378,65 @@ mod tests {
         let graph = code_tree_to_entity_graph(&tree);
         assert!(graph.entities.is_empty());
         assert!(graph.references.is_empty());
+    }
+
+    /// A `mod.rs` whose only children are Module declaration stubs (`pub mod foo;`)
+    /// should be omitted from the entity graph, along with its stub Module children.
+    /// References to the folder that owned the mod.rs should still be reachable.
+    #[test]
+    fn test_glue_mod_rs_excluded() {
+        let mut tree = CodeTree::new();
+        // src/ (Folder)
+        let src = tree.add_node(NodeKind::Folder, "src", (0, 500), (0, 50), 0, None);
+        // src/mod.rs (File) — contains only `pub mod app;` and `pub mod graph;`
+        let modrs = tree.add_node(NodeKind::File, "mod.rs", (0, 50), (0, 5), 1, Some(src));
+        // `pub mod app;` — Module stub with no body (no children)
+        let _stub_app = tree.add_node(NodeKind::Module, "app", (0, 20), (0, 1), 2, Some(modrs));
+        // `pub mod graph;` — Module stub with no body (no children)
+        let _stub_graph = tree.add_node(NodeKind::Module, "graph", (21, 50), (2, 5), 2, Some(modrs));
+        // src/app/ (Folder) — real sub-module
+        let app_folder = tree.add_node(NodeKind::Folder, "app", (100, 300), (10, 30), 1, Some(src));
+        // src/app/state.rs (File)
+        let _state_rs = tree.add_node(NodeKind::File, "state.rs", (100, 300), (10, 30), 2, Some(app_folder));
+        tree.structural_count = tree.node_count();
+
+        let graph = code_tree_to_entity_graph(&tree);
+
+        // mod.rs and its two stub Module children must NOT appear
+        assert!(
+            graph.entities.iter().all(|e| e.name != "mod.rs"),
+            "glue mod.rs should not appear as an entity"
+        );
+        // The bare stub Module nodes (app, graph declared in mod.rs) must NOT appear
+        // as separate entities — the real Folder "app" node is still present.
+        let module_entities: Vec<_> = graph.entities.iter()
+            .filter(|e| e.kind == EntityKind::Module)
+            .collect();
+        assert!(
+            module_entities.is_empty(),
+            "stub Module declarations from glue mod.rs should not appear"
+        );
+        // The Folder "src", Folder "app", and File "state.rs" should still appear
+        let names: Vec<&str> = graph.entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"src"), "Folder 'src' must be in graph");
+        assert!(names.contains(&"app"), "Folder 'app' must be in graph");
+        assert!(names.contains(&"state.rs"), "File 'state.rs' must be in graph");
+    }
+
+    /// A `mod.rs` that contains a function is NOT glue and should appear normally.
+    #[test]
+    fn test_non_glue_mod_rs_included() {
+        let mut tree = CodeTree::new();
+        let src = tree.add_node(NodeKind::Folder, "src", (0, 500), (0, 50), 0, None);
+        let modrs = tree.add_node(NodeKind::File, "mod.rs", (0, 200), (0, 20), 1, Some(src));
+        // This mod.rs has a real function — not pure glue
+        let _fn_main = tree.add_node(NodeKind::Function, "main", (0, 100), (0, 10), 2, Some(modrs));
+        tree.structural_count = tree.node_count();
+
+        let graph = code_tree_to_entity_graph(&tree);
+
+        let names: Vec<&str> = graph.entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"mod.rs"), "non-glue mod.rs must appear as entity");
+        assert!(names.contains(&"main"), "function inside non-glue mod.rs must appear");
     }
 }
