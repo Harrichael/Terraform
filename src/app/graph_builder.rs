@@ -149,11 +149,23 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
     // Remap both endpoints to their nearest entity-level ancestor so that
     // references inside Block/Line nodes still appear at the Function level.
     // Self-loops produced by remapping are discarded.
+    //
+    // References where the raw `from` or `to` code node is itself a glue
+    // node (a glue mod.rs File or one of its declaration-only Module stubs)
+    // are dropped entirely.  These are structural plumbing edges (pub mod,
+    // pub use re-exports) that, if kept, remap to the parent Folder entity
+    // and leave stale cursor leaf pointers after the user zooms in on that
+    // folder — which causes the folder node to reappear in the view tree
+    // even though it has been zoomed past.
     // ------------------------------------------------------------------
     let mut seen: std::collections::HashSet<(EntityId, EntityId)> = std::collections::HashSet::new();
     let mut references: Vec<GraphReference> = Vec::new();
 
     for r in tree.references.references() {
+        // Drop references that touch glue mod.rs nodes or their stubs.
+        if glue_ids.contains(&r.from) || glue_ids.contains(&r.to) {
+            continue;
+        }
         let from = match find_entity_ancestor_or_self(r.from, tree, &id_map) {
             Some(id) => id,
             None => continue,
@@ -438,5 +450,63 @@ mod tests {
         let names: Vec<&str> = graph.entities.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"mod.rs"), "non-glue mod.rs must appear as entity");
         assert!(names.contains(&"main"), "function inside non-glue mod.rs must appear");
+    }
+
+    /// References originating from a glue `mod.rs` (e.g. `pub use mod_impl::render;`)
+    /// must be dropped from the entity graph so they do not produce stale cursor
+    /// leaf pointers that cause the parent folder to reappear after zoom-in.
+    #[test]
+    fn test_glue_mod_rs_references_dropped() {
+        let mut tree = CodeTree::new();
+        // src/ (Folder)
+        let src = tree.add_node(NodeKind::Folder, "src", (0, 500), (0, 50), 0, None);
+        // src/ui/ (Folder)
+        let ui = tree.add_node(NodeKind::Folder, "ui", (0, 400), (0, 40), 1, Some(src));
+        // src/ui/mod.rs — glue file
+        let modrs = tree.add_node(NodeKind::File, "mod.rs", (0, 50), (0, 5), 2, Some(ui));
+        let _stub = tree.add_node(NodeKind::Module, "mod_impl", (0, 20), (0, 1), 3, Some(modrs));
+        // src/ui/mod_impl.rs — real file
+        let mod_impl = tree.add_node(NodeKind::File, "mod_impl.rs", (50, 200), (5, 20), 2, Some(ui));
+        let render = tree.add_node(NodeKind::Function, "render", (50, 100), (5, 10), 3, Some(mod_impl));
+        tree.structural_count = tree.node_count();
+
+        // Reference from glue mod.rs (file-level) to render function:
+        // simulates `pub use mod_impl::render;`
+        tree.add_reference(modrs, render, ReferenceKind::Import);
+
+        let graph = code_tree_to_entity_graph(&tree);
+
+        // The reference from the glue mod.rs must NOT appear in the entity graph.
+        assert!(
+            graph.references.is_empty(),
+            "references from glue mod.rs must be dropped (got {:?})", graph.references
+        );
+    }
+
+    /// References whose raw `to` endpoint is a glue stub Module node must be
+    /// dropped, preventing the parent folder from appearing after zoom-in.
+    #[test]
+    fn test_references_to_glue_stub_dropped() {
+        let mut tree = CodeTree::new();
+        let src = tree.add_node(NodeKind::Folder, "src", (0, 500), (0, 50), 0, None);
+        let ui = tree.add_node(NodeKind::Folder, "ui", (0, 400), (0, 40), 1, Some(src));
+        let modrs = tree.add_node(NodeKind::File, "mod.rs", (0, 50), (0, 5), 2, Some(ui));
+        let stub_events = tree.add_node(NodeKind::Module, "events", (0, 20), (0, 1), 3, Some(modrs));
+        // Another real file with a function that "calls" the events module stub.
+        let main_rs = tree.add_node(NodeKind::File, "main.rs", (100, 300), (10, 30), 1, Some(src));
+        let fn_main = tree.add_node(NodeKind::Function, "main", (100, 200), (10, 20), 2, Some(main_rs));
+        tree.structural_count = tree.node_count();
+
+        // Reference from fn_main to the stub Module "events" — this simulates a
+        // reference resolved to a glue stub, e.g. `events::something()` where
+        // "events" maps to the stub Module node in build_name_to_id_map.
+        tree.add_reference(fn_main, stub_events, ReferenceKind::Call);
+
+        let graph = code_tree_to_entity_graph(&tree);
+
+        assert!(
+            graph.references.is_empty(),
+            "references to glue stub modules must be dropped (got {:?})", graph.references
+        );
     }
 }
