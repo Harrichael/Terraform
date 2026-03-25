@@ -651,3 +651,55 @@ fn test_navigator_self_loop_reference_suppressed() {
     let node = nav.tree().nodes.iter().find(|n| n.entity_id == EntityId(0)).unwrap();
     assert!(node.children.is_empty(), "self-loop must not appear as a tree edge");
 }
+
+/// Regression test: target leaf appearing before source leaf in iteration order
+/// must still be shown as a child of the source after zooming in.
+///
+/// Scenario (mirrors the real-world bug):
+///   root
+///   ├── entity_file  (id=1, leaf[0] — alphabetically first)
+///   └── tree_file    (id=2, leaf[1] — has a TypeRef to entity_file)
+///
+/// Before the fix, the single-pass DFS would visit `entity_file` as a
+/// standalone root first, mark it as visited, and then skip the
+/// `insert_edge(tree_file, entity_file)` call when processing `tree_file`.
+/// After the fix, `entity_file` (which has an incoming edge) is deferred to
+/// pass-2 / only adopted during `tree_file`'s DFS, producing the correct
+/// tree: `tree_file → entity_file`.
+#[test]
+fn test_navigator_target_before_source_in_leaf_order() {
+    let mut graph = EntityGraph {
+        entities: vec![
+            make_entity(0, "root",        EntityKind::Folder, None),
+            make_entity(1, "entity_file", EntityKind::File,   Some(EntityId(0))),
+            make_entity(2, "tree_file",   EntityKind::File,   Some(EntityId(0))),
+        ],
+        references: vec![
+            // tree_file (id=2) uses a type from entity_file (id=1)
+            Reference { from: EntityId(2), to: EntityId(1), kind: ReferenceKind::TypeRef },
+        ],
+    };
+    // Children are ordered alphabetically: entity_file (1) before tree_file (2).
+    graph.entities[0].children = vec![EntityId(1), EntityId(2)];
+
+    let mut nav = Navigator::new(graph);
+    let root_node = normal_tree_node(&nav, EntityId(0)).unwrap();
+    nav.zoom_in(root_node);
+
+    // entity_file must appear as a child of tree_file, not as a standalone root.
+    let entity_node = nav.tree().nodes.iter()
+        .find(|n| n.entity_id == EntityId(1) && n.kind == NodeKind::Normal)
+        .expect("entity_file must be present as a Normal node");
+    assert!(
+        entity_node.parent.is_some(),
+        "entity_file should be a child of tree_file, not a standalone root"
+    );
+
+    let tree_node = nav.tree().nodes.iter()
+        .find(|n| n.entity_id == EntityId(2) && n.kind == NodeKind::Normal)
+        .expect("tree_file must be present as a Normal node");
+    assert!(
+        tree_node.children.contains(&entity_node.id),
+        "tree_file should have entity_file as a child"
+    );
+}
