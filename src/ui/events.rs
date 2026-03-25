@@ -18,6 +18,9 @@ pub fn handle_event(state: &mut AppState) -> anyhow::Result<bool> {
 }
 
 fn handle_normal_key(state: &mut AppState, key: KeyEvent) {
+    // When a Navigator is present, route navigation through the graph view.
+    let has_navigator = state.navigator.is_some();
+
     match key.code {
         // Quit
         KeyCode::Char('q') => state.should_quit = true,
@@ -25,47 +28,117 @@ fn handle_normal_key(state: &mut AppState, key: KeyEvent) {
             state.should_quit = true
         }
 
-        // Navigation
-        KeyCode::Up | KeyCode::Char('k') => state.move_cursor_up(1),
-        KeyCode::Down | KeyCode::Char('j') => state.move_cursor_down(1),
-        KeyCode::PageUp => state.move_cursor_up(state.pane_height.max(1)),
-        KeyCode::PageDown => state.move_cursor_down(state.pane_height.max(1)),
+        // Navigation — graph view when navigator available, legacy otherwise
+        KeyCode::Up | KeyCode::Char('k') => {
+            if has_navigator {
+                state.move_graph_cursor_up(1);
+            } else {
+                state.move_cursor_up(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if has_navigator {
+                state.move_graph_cursor_down(1);
+            } else {
+                state.move_cursor_down(1);
+            }
+        }
+        KeyCode::PageUp => {
+            let h = state.pane_height.max(1);
+            if has_navigator {
+                state.move_graph_cursor_up(h);
+            } else {
+                state.move_cursor_up(h);
+            }
+        }
+        KeyCode::PageDown => {
+            let h = state.pane_height.max(1);
+            if has_navigator {
+                state.move_graph_cursor_down(h);
+            } else {
+                state.move_cursor_down(h);
+            }
+        }
         KeyCode::Home | KeyCode::Char('g') => {
-            state.cursor = 0;
-            state.scroll_offset = 0;
+            if has_navigator {
+                state.graph_cursor = 0;
+                state.graph_scroll_offset = 0;
+            } else {
+                state.cursor = 0;
+                state.scroll_offset = 0;
+            }
         }
         KeyCode::End | KeyCode::Char('G') => {
-            if !state.visible_ids.is_empty() {
+            if has_navigator {
+                if !state.graph_visible.is_empty() {
+                    state.graph_cursor = state.graph_visible.len() - 1;
+                }
+            } else if !state.visible_ids.is_empty() {
                 state.cursor = state.visible_ids.len() - 1;
             }
         }
 
-        // Collapse / Expand (fold toggle for the current node)
-        KeyCode::Char(' ') => state.toggle_fold(),
-
-        // Enter: fold/unfold, or jump to SymRef target
-        KeyCode::Enter => {
-            if let Some(&id) = state.visible_ids.get(state.cursor) {
-                if let Some(node) = state.tree.get(id) {
-                    if node.kind == NodeKind::SymRef {
-                        if !state.jump_to_sym_ref_target() {
-                            state.status = "Definition is not currently visible.".to_string();
-                        }
-                        return;
-                    }
-                }
+        // Fold toggle — graph fold when navigator available, legacy otherwise
+        KeyCode::Char(' ') => {
+            if has_navigator {
+                state.graph_toggle_fold();
+            } else {
+                state.toggle_fold();
             }
-            state.toggle_fold();
         }
 
-        // Granularity: l / Right = expand (show finer detail on this node only)
-        //              h / Left  = shrink (show coarser detail on this node only)
-        KeyCode::Right | KeyCode::Char('l') => state.expand_cursor_granularity(),
-        KeyCode::Left | KeyCode::Char('h') => state.shrink_cursor_granularity(),
+        // Enter: same as Space in graph mode; legacy fold/SymRef jump otherwise
+        KeyCode::Enter => {
+            if has_navigator {
+                state.graph_toggle_fold();
+            } else {
+                if let Some(&id) = state.visible_ids.get(state.cursor) {
+                    if let Some(node) = state.tree.get(id) {
+                        if node.kind == NodeKind::SymRef {
+                            if !state.jump_to_sym_ref_target() {
+                                state.status = "Definition is not currently visible.".to_string();
+                            }
+                            return;
+                        }
+                    }
+                }
+                state.toggle_fold();
+            }
+        }
 
-        // Collapse/Expand all
-        KeyCode::Char('[') => state.collapse_all(),
-        KeyCode::Char(']') => state.expand_all(),
+        // Zoom: Right/l = zoom in (expand one level), Left/h = zoom out
+        // When navigator is present these drive the Navigator cursor;
+        // otherwise they adjust the legacy granularity limit.
+        KeyCode::Right | KeyCode::Char('l') => {
+            if has_navigator {
+                state.graph_zoom_in();
+            } else {
+                state.expand_cursor_granularity();
+            }
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            if has_navigator {
+                state.graph_zoom_out();
+            } else {
+                state.shrink_cursor_granularity();
+            }
+        }
+
+        // Collapse/Expand all — in graph mode clears folds only
+        KeyCode::Char('[') => {
+            if has_navigator {
+                state.graph_clear_folds();
+            } else {
+                state.collapse_all();
+            }
+        }
+        KeyCode::Char(']') => {
+            if has_navigator {
+                state.graph_clear_folds();
+            } else {
+                state.expand_all();
+            }
+        }
 
         // Filter
         KeyCode::Char('/') => state.enter_filter(),

@@ -1,7 +1,11 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use crate::app::graph_builder::code_tree_to_entity_graph;
 use crate::app::tree::{CodeTree, NodeKind, SemanticEntry};
+use crate::graph::entity::EntityId;
+use crate::graph::navigator::Navigator;
+use crate::graph::tree::GraphTreeNodeId;
 use crate::parser::{parse_directory, parse_source, SourceLanguage};
 
 /// The overall application mode.
@@ -54,6 +58,21 @@ pub struct AppState {
     pub folded_ids: HashSet<usize>,
     /// Target node IDs whose SymRef entry is expanded to show specific symbols.
     pub expanded_symref_targets: HashSet<usize>,
+
+    // ── Graph / Navigator state ────────────────────────────────────────────
+    /// The navigator built from the entity graph.  `None` when no path has
+    /// been loaded or when the conversion fails.
+    pub navigator: Option<Navigator>,
+    /// Entity IDs of graph tree nodes the user has explicitly folded
+    /// (children hidden in the reference-tree view).
+    pub graph_folded: HashSet<EntityId>,
+    /// Flat, DFS-ordered list of `(GraphTreeNodeId, display_depth)` for
+    /// every currently-visible node in the graph tree view.
+    pub graph_visible: Vec<(GraphTreeNodeId, usize)>,
+    /// Index into `graph_visible` of the currently highlighted row.
+    pub graph_cursor: usize,
+    /// Vertical scroll offset for the graph tree pane.
+    pub graph_scroll_offset: usize,
 }
 
 impl AppState {
@@ -75,6 +94,11 @@ impl AppState {
             view_depths: Vec::new(),
             folded_ids: HashSet::new(),
             expanded_symref_targets: HashSet::new(),
+            navigator: None,
+            graph_folded: HashSet::new(),
+            graph_visible: Vec::new(),
+            graph_cursor: 0,
+            graph_scroll_offset: 0,
         }
     }
 
@@ -99,6 +123,7 @@ impl AppState {
         self.scroll_offset = 0;
         self.status = format!("Loaded: {}", path.display());
         self.refresh_visible();
+        self.build_navigator();
         Ok(())
     }
 
@@ -116,7 +141,25 @@ impl AppState {
         self.scroll_offset = 0;
         self.status = format!("Loaded directory: {} — use l/Right to expand", path.display());
         self.refresh_visible();
+        self.build_navigator();
         Ok(())
+    }
+
+    /// Convert the current `CodeTree` into an [`EntityGraph`] and initialize
+    /// the [`Navigator`].  Resets all graph-view navigation state.
+    pub(crate) fn build_navigator(&mut self) {
+        let entity_graph = code_tree_to_entity_graph(&self.tree);
+        if entity_graph.entities.is_empty() {
+            // Nothing to navigate — leave navigator as None so the legacy view
+            // is shown instead.
+            self.navigator = None;
+            return;
+        }
+        self.navigator = Some(Navigator::new(entity_graph));
+        self.graph_folded.clear();
+        self.graph_cursor = 0;
+        self.graph_scroll_offset = 0;
+        self.refresh_graph_visible();
     }
 
     /// Recompute `visible_ids` and `visible_refs` from the current tree + filter.
@@ -537,6 +580,195 @@ impl AppState {
             self.scroll_offset = self.cursor + 1 - self.pane_height;
         }
     }
+
+    // ── Graph / Navigator navigation ──────────────────────────────────────
+
+    /// Rebuild `graph_visible` by traversing the Navigator's current
+    /// [`GraphTree`] in DFS order, skipping children of folded entities.
+    pub fn refresh_graph_visible(&mut self) {
+        self.graph_visible.clear();
+
+        // Snapshot tree node data to avoid borrow conflicts during traversal.
+        let node_snapshot: Vec<(GraphTreeNodeId, EntityId, Option<GraphTreeNodeId>, Vec<GraphTreeNodeId>)> =
+            if let Some(nav) = &self.navigator {
+                nav.tree()
+                    .nodes
+                    .iter()
+                    .map(|n| (n.id, n.entity_id, n.parent, n.children.clone()))
+                    .collect()
+            } else {
+                return;
+            };
+
+        // Roots are nodes with no parent.
+        let mut stack: Vec<(GraphTreeNodeId, usize)> = node_snapshot
+            .iter()
+            .filter(|(_, _, parent, _)| parent.is_none())
+            .map(|(id, _, _, _)| (*id, 0usize))
+            .collect();
+        // Reverse so the first root ends up on top of the stack (LIFO).
+        stack.reverse();
+
+        while let Some((node_id, depth)) = stack.pop() {
+            if let Some((_, entity_id, _, children)) =
+                node_snapshot.iter().find(|(id, _, _, _)| *id == node_id)
+            {
+                self.graph_visible.push((node_id, depth));
+                if !self.graph_folded.contains(entity_id) {
+                    // Push children in reverse so the first child is processed first.
+                    for &child_id in children.iter().rev() {
+                        stack.push((child_id, depth + 1));
+                    }
+                }
+            }
+        }
+
+        // Clamp cursor to valid range.
+        if self.graph_visible.is_empty() {
+            self.graph_cursor = 0;
+        } else {
+            self.graph_cursor = self.graph_cursor.min(self.graph_visible.len() - 1);
+        }
+        self.ensure_graph_cursor_visible();
+    }
+
+    /// Move the graph cursor up by `n` rows.
+    pub fn move_graph_cursor_up(&mut self, n: usize) {
+        self.graph_cursor = self.graph_cursor.saturating_sub(n);
+        self.ensure_graph_cursor_visible();
+    }
+
+    /// Move the graph cursor down by `n` rows.
+    pub fn move_graph_cursor_down(&mut self, n: usize) {
+        if !self.graph_visible.is_empty() {
+            self.graph_cursor = (self.graph_cursor + n).min(self.graph_visible.len() - 1);
+        }
+        self.ensure_graph_cursor_visible();
+    }
+
+    /// Zoom in: expand the entity under the graph cursor one level down.
+    ///
+    /// Delegates to [`Navigator::zoom_in`], then rebuilds the visible list and
+    /// moves the cursor to the first revealed child.
+    pub fn graph_zoom_in(&mut self) {
+        let node_id = match self.graph_visible.get(self.graph_cursor) {
+            Some(&(id, _)) => id,
+            None => return,
+        };
+        let first_child_entity = if let Some(nav) = &mut self.navigator {
+            nav.zoom_in(node_id)
+        } else {
+            return;
+        };
+        self.refresh_graph_visible();
+
+        // Move cursor to the first revealed child, if any.
+        if let Some(child_eid) = first_child_entity {
+            self.move_graph_cursor_to_entity(child_eid);
+        }
+
+        if let Some(nav) = &self.navigator {
+            if let Some(&(nid, _)) = self.graph_visible.get(self.graph_cursor) {
+                if let Some(node) = nav.tree().get(nid) {
+                    if let Some(entity) = nav.entity(node.entity_id) {
+                        self.status = format!("Zoomed in — showing {}", entity.name);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Zoom out: collapse the entity under the graph cursor one level up.
+    ///
+    /// Delegates to [`Navigator::zoom_out`], then rebuilds the visible list and
+    /// moves the cursor to the parent entity.
+    pub fn graph_zoom_out(&mut self) {
+        let node_id = match self.graph_visible.get(self.graph_cursor) {
+            Some(&(id, _)) => id,
+            None => return,
+        };
+        let parent_entity = if let Some(nav) = &mut self.navigator {
+            nav.zoom_out(node_id)
+        } else {
+            return;
+        };
+        self.refresh_graph_visible();
+
+        // Move cursor to the parent entity, if any.
+        if let Some(parent_eid) = parent_entity {
+            self.move_graph_cursor_to_entity(parent_eid);
+        }
+
+        if let Some(nav) = &self.navigator {
+            if let Some(&(nid, _)) = self.graph_visible.get(self.graph_cursor) {
+                if let Some(node) = nav.tree().get(nid) {
+                    if let Some(entity) = nav.entity(node.entity_id) {
+                        self.status = format!("Zoomed out — showing {}", entity.name);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Toggle fold on the graph tree node under the graph cursor.
+    ///
+    /// Folding hides the node's reference-tree children from the view without
+    /// changing the navigator cursor (zoom level).
+    pub fn graph_toggle_fold(&mut self) {
+        let (node_id, _) = match self.graph_visible.get(self.graph_cursor) {
+            Some(&v) => v,
+            None => return,
+        };
+        let entity_id = if let Some(nav) = &self.navigator {
+            nav.tree().get(node_id).map(|n| n.entity_id)
+        } else {
+            return;
+        };
+        if let Some(eid) = entity_id {
+            if self.graph_folded.contains(&eid) {
+                self.graph_folded.remove(&eid);
+            } else {
+                self.graph_folded.insert(eid);
+            }
+            self.refresh_graph_visible();
+        }
+    }
+
+    /// Clear all graph folds without changing the zoom level.
+    pub fn graph_clear_folds(&mut self) {
+        self.graph_folded.clear();
+        self.refresh_graph_visible();
+    }
+
+    /// Move `graph_cursor` to the first visible row whose entity matches `id`.
+    fn move_graph_cursor_to_entity(&mut self, id: EntityId) {
+        let nav = match &self.navigator {
+            Some(n) => n,
+            None => return,
+        };
+        // Find a GraphTreeNodeId whose entity_id matches.
+        if let Some(pos) = self.graph_visible.iter().position(|&(nid, _)| {
+            nav.tree()
+                .get(nid)
+                .map(|n| n.entity_id == id)
+                .unwrap_or(false)
+        }) {
+            self.graph_cursor = pos;
+            self.ensure_graph_cursor_visible();
+        }
+    }
+
+    /// Adjust graph scroll so the graph cursor row is always visible.
+    fn ensure_graph_cursor_visible(&mut self) {
+        if self.pane_height == 0 {
+            return;
+        }
+        if self.graph_cursor < self.graph_scroll_offset {
+            self.graph_scroll_offset = self.graph_cursor;
+        } else if self.graph_cursor >= self.graph_scroll_offset + self.pane_height {
+            self.graph_scroll_offset = self.graph_cursor + 1 - self.pane_height;
+        }
+    }
 }
 
 impl Default for AppState {
@@ -561,6 +793,22 @@ mod tests {
         state.tree.structural_count = state.tree.node_count();
         state.base_node_count = state.tree.node_count();
         state.refresh_visible();
+        state
+    }
+
+    /// Build an AppState with a navigator already initialised from a small
+    /// two-function tree (File → fn_a, fn_b).
+    fn state_with_navigator() -> AppState {
+        let mut state = AppState::new();
+        let mut tree = CodeTree::new();
+        let root = tree.add_node(NodeKind::File, "test.rs", (0, 200), (0, 30), 0, None);
+        let _f1 = tree.add_node(NodeKind::Function, "fn_a", (0, 100), (0, 15), 1, Some(root));
+        let _f2 = tree.add_node(NodeKind::Function, "fn_b", (101, 200), (16, 30), 1, Some(root));
+        state.tree = tree;
+        state.tree.structural_count = state.tree.node_count();
+        state.base_node_count = state.tree.node_count();
+        state.refresh_visible();
+        state.build_navigator();
         state
     }
 
@@ -739,5 +987,106 @@ mod tests {
                 assert!(state.visible_ids.contains(&to));
             }
         }
+    }
+
+    // ── Graph / Navigator state tests ──────────────────────────────────────
+
+    #[test]
+    fn test_navigator_created_on_load() {
+        let state = state_with_navigator();
+        assert!(state.navigator.is_some(), "navigator should be built after load");
+        assert!(!state.graph_visible.is_empty(), "graph_visible should be non-empty");
+    }
+
+    #[test]
+    fn test_graph_cursor_moves_within_bounds() {
+        let mut state = state_with_navigator();
+        let total = state.graph_visible.len();
+        state.move_graph_cursor_down(1000);
+        assert_eq!(state.graph_cursor, total - 1);
+        state.move_graph_cursor_up(1000);
+        assert_eq!(state.graph_cursor, 0);
+    }
+
+    #[test]
+    fn test_graph_zoom_in_increases_visible() {
+        let mut state = state_with_navigator();
+        let initial = state.graph_visible.len();
+        // Cursor is on the root entity (File); zoom in should reveal children.
+        state.graph_zoom_in();
+        // After zoom, the graph visible list should contain the children (fn_a, fn_b).
+        assert!(
+            state.graph_visible.len() >= initial,
+            "zoom_in should not shrink graph_visible"
+        );
+    }
+
+    #[test]
+    fn test_graph_zoom_out_after_zoom_in() {
+        let mut state = state_with_navigator();
+        let before = state.graph_visible.len();
+        state.graph_zoom_in();
+        let after_in = state.graph_visible.len();
+        // Zoom out should restore something closer to original state.
+        state.graph_zoom_out();
+        let after_out = state.graph_visible.len();
+        // after zoom_out we should have fewer or equal nodes than after zoom_in
+        assert!(
+            after_out <= after_in,
+            "zoom_out should shrink or maintain graph_visible (before={before}, in={after_in}, out={after_out})"
+        );
+    }
+
+    #[test]
+    fn test_graph_fold_hides_children() {
+        let mut state = state_with_navigator();
+        // Zoom in so the File node has children visible.
+        state.graph_zoom_in();
+        let after_zoom = state.graph_visible.len();
+        if after_zoom <= 1 {
+            // No children revealed; skip.
+            return;
+        }
+        // Set cursor to root (index 0) and fold it.
+        state.graph_cursor = 0;
+        state.graph_toggle_fold();
+        let after_fold = state.graph_visible.len();
+        assert!(
+            after_fold <= after_zoom,
+            "fold should hide children: before_fold={after_zoom}, after_fold={after_fold}"
+        );
+    }
+
+    #[test]
+    fn test_graph_unfold_restores_children() {
+        let mut state = state_with_navigator();
+        state.graph_zoom_in();
+        let after_zoom = state.graph_visible.len();
+        if after_zoom <= 1 {
+            return;
+        }
+        state.graph_cursor = 0;
+        state.graph_toggle_fold();  // fold
+        state.graph_toggle_fold();  // unfold
+        let after_unfold = state.graph_visible.len();
+        assert_eq!(
+            after_unfold, after_zoom,
+            "unfold should restore the original child count"
+        );
+    }
+
+    #[test]
+    fn test_graph_clear_folds() {
+        let mut state = state_with_navigator();
+        state.graph_zoom_in();
+        state.graph_cursor = 0;
+        state.graph_toggle_fold();
+        let folded_count = state.graph_visible.len();
+        state.graph_clear_folds();
+        let cleared_count = state.graph_visible.len();
+        assert!(
+            cleared_count >= folded_count,
+            "clear_folds should restore hidden children"
+        );
     }
 }

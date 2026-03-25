@@ -1,5 +1,5 @@
 use crate::graph::cursor::Cursor;
-use crate::graph::entity::{EntityGraph, EntityId};
+use crate::graph::entity::{Entity, EntityGraph, EntityId};
 use crate::graph::tree::{GraphTree, GraphTreeNodeId};
 
 /// The central controller that wraps the static entity graph and the dynamic
@@ -33,6 +33,14 @@ impl Navigator {
 
     pub fn tree(&self) -> &GraphTree {
         &self.view_tree
+    }
+
+    /// Look up an entity from the graph by its ID.
+    ///
+    /// Used by the UI layer to retrieve entity metadata (name, kind, etc.)
+    /// for rendering tree nodes without exposing the graph directly.
+    pub fn entity(&self, id: EntityId) -> Option<&Entity> {
+        self.graph.get(id)
     }
 
     /// Expand the entity represented by `focused_tree_node` one level down.
