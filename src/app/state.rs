@@ -41,9 +41,9 @@ pub struct AppState {
     // ── Graph / Navigator state ────────────────────────────────────────────
     /// The navigator wrapping the entity graph.  `None` until a path is loaded.
     pub navigator: Option<Navigator>,
-    /// Entity IDs of graph tree nodes the user has explicitly folded
+    /// GraphTreeNodeIds of tree nodes the user has explicitly folded
     /// (children hidden in the reference-tree view).
-    pub graph_folded: HashSet<EntityId>,
+    pub graph_folded: HashSet<crate::graph::tree::GraphTreeNodeId>,
     /// Flat, DFS-ordered list of `(GraphTreeNodeId, display_depth)` for
     /// every currently-visible node in the graph tree view.
     pub graph_visible: Vec<(GraphTreeNodeId, usize)>,
@@ -189,7 +189,7 @@ impl AppState {
             // O(1) direct index into the arena instead of a linear scan.
             if let Some((entity_id, _, children)) = node_snapshot.get(node_id.0) {
                 self.graph_visible.push((node_id, depth));
-                if !self.graph_folded.contains(entity_id) {
+                if !self.graph_folded.contains(&node_id) {
                     // Push children in reverse so the first child is processed first.
                     for &child_id in children.iter().rev() {
                         stack.push((child_id, depth + 1));
@@ -300,10 +300,10 @@ impl AppState {
             return;
         };
         if let Some(eid) = entity_id {
-            if self.graph_folded.contains(&eid) {
-                self.graph_folded.remove(&eid);
+            if self.graph_folded.contains(&node_id) {
+                self.graph_folded.remove(&node_id);
             } else {
-                self.graph_folded.insert(eid);
+                self.graph_folded.insert(node_id);
             }
             self.refresh_graph_visible();
         }

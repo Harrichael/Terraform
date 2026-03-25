@@ -170,7 +170,7 @@ fn build_graph_tree_item<'a>(
     let indent = "  ".repeat(depth);
 
     // Expand / fold icon.
-    let is_folded = state.graph_folded.contains(&graph_node.entity_id);
+    let is_folded = state.graph_folded.contains(&node_id);
     let fold_icon = if !graph_node.children.is_empty() {
         if is_folded { "▶ " } else { "▼ " }
     } else {
@@ -199,9 +199,18 @@ fn build_graph_tree_item<'a>(
         entity_kind_style(&entity.kind)
     };
 
+    // Show full path for the entity (relative to workspace root)
+    let rel_path = if let Some(root) = &state.current_path {
+        match entity.path.strip_prefix(root) {
+            Ok(p) => p.display().to_string(),
+            Err(_) => entity.path.display().to_string(),
+        }
+    } else {
+        entity.path.display().to_string()
+    };
     let line = Line::from(vec![
         Span::raw(format!("{indent}{fold_icon}")),
-        Span::styled(format!("[{kind_icon}] {}", entity.name), name_style),
+        Span::styled(format!("[{kind_icon}] {}", rel_path), name_style),
         Span::styled(
             cycle_marker.to_string(),
             Style::default()
