@@ -59,9 +59,10 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
                 _ => unreachable!(),
             };
 
-            // Build a best-effort path from the node name; the path field is
-            // informational and not used by any graph algorithm.
-            let path = std::path::PathBuf::from(&node.name);
+            // Build the full display path by walking up the ancestor chain so
+            // the UI can show e.g. "src/graph/entity.rs" or
+            // "src/graph/cursor.rs/Cursor" instead of bare symbol names.
+            let path = build_node_path(code_id, tree);
 
             entities.push(Entity {
                 id: entity_id,
@@ -139,6 +140,43 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Build a display path for `code_id` by walking up the containment hierarchy
+/// and joining entity-level ancestor names with `/`.
+///
+/// Only Folder, Module, File, Class, and Function nodes contribute a path
+/// segment; Block, Line, and SymRef nodes are skipped.  Examples:
+///
+/// - `src/` folder         → `src`
+/// - `src/graph/entity.rs` → `src/graph/entity.rs`
+/// - `Cursor` struct       → `src/graph/cursor.rs/Cursor`
+fn build_node_path(code_id: usize, tree: &CodeTree) -> std::path::PathBuf {
+    let is_entity = |k: &NodeKind| {
+        matches!(
+            k,
+            NodeKind::Folder
+                | NodeKind::Module
+                | NodeKind::File
+                | NodeKind::Class
+                | NodeKind::Function
+        )
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = Some(code_id);
+    while let Some(id) = current {
+        match tree.get(id) {
+            Some(node) => {
+                if is_entity(&node.kind) {
+                    parts.push(node.name.clone());
+                }
+                current = node.parent;
+            }
+            None => break,
+        }
+    }
+    parts.reverse();
+    std::path::PathBuf::from(parts.join("/"))
+}
 
 /// Walk up the containment hierarchy from `code_id` (exclusive) until we
 /// reach a node that has an [`EntityId`] mapping.

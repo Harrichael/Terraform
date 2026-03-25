@@ -531,10 +531,12 @@ fn test_navigator_reference_remaps_through_zoom() {
     assert!(!nav.tree().nodes_by_entity.contains_key(&EntityId(1)), "mod_a must not be a leaf");
 }
 
-/// Mutual references between two sibling leaves produce exactly two Cycle nodes
-/// (one for each entity involved in the back-edge).
+/// Mutual references between two sibling leaves produce a clean tree with no
+/// Cycle nodes.  The DFS spanning forest only inserts the forward edge (the
+/// first direction encountered), so the back-edge is silently dropped and the
+/// confusing ↺ marker never appears.
 #[test]
-fn test_navigator_cyclic_references_produce_cycle_nodes() {
+fn test_navigator_mutual_references_no_cycle_nodes() {
     let mut graph = EntityGraph {
         entities: vec![
             make_entity(0, "root",  EntityKind::Folder, None),
@@ -552,18 +554,24 @@ fn test_navigator_cyclic_references_produce_cycle_nodes() {
     let root_node = normal_tree_node(&nav, EntityId(0)).unwrap();
     nav.zoom_in(root_node);
 
+    // The DFS spanning forest suppresses back-edges, so no Cycle nodes appear.
     let cycle_nodes: Vec<_> = nav.tree().nodes.iter()
         .filter(|n| n.kind == NodeKind::Cycle)
         .collect();
-    assert_eq!(cycle_nodes.len(), 2, "mutual reference should produce exactly 2 Cycle nodes");
+    assert_eq!(cycle_nodes.len(), 0, "mutual reference should NOT produce Cycle nodes in the spanning-forest view");
 
-    let mut ids: Vec<usize> = cycle_nodes.iter().map(|n| n.entity_id.0).collect();
-    ids.sort();
-    assert_eq!(ids, vec![1, 2]);
+    // Both entities must still be present as Normal nodes.
+    let normal_entities: Vec<_> = nav.tree().nodes.iter()
+        .filter(|n| n.kind == NodeKind::Normal)
+        .map(|n| n.entity_id)
+        .collect();
+    assert!(normal_entities.contains(&EntityId(1)));
+    assert!(normal_entities.contains(&EntityId(2)));
 }
 
-/// A three-entity reference cycle (A→B→C→A) produces a finite tree with at
-/// least one Cycle node; the total node count stays well below a trivial bound.
+/// A three-entity reference cycle (A→B→C→A) produces a finite, acyclic tree.
+/// The DFS spanning forest inserts only forward edges (A→B and B→C); the
+/// back-edge C→A is dropped.  No Cycle nodes appear.
 #[test]
 fn test_navigator_three_entity_reference_cycle() {
     let mut graph = EntityGraph {
@@ -585,13 +593,14 @@ fn test_navigator_three_entity_reference_cycle() {
     let root_node = normal_tree_node(&nav, EntityId(0)).unwrap();
     nav.zoom_in(root_node);
 
+    // The spanning forest must be finite and contain no Cycle nodes.
     assert!(
         nav.tree().nodes.len() < 50,
-        "tree must be finite after cycle detection, got {} nodes",
+        "tree must be finite, got {} nodes",
         nav.tree().nodes.len()
     );
     let cycle_count = nav.tree().nodes.iter().filter(|n| n.kind == NodeKind::Cycle).count();
-    assert!(cycle_count > 0, "3-cycle must produce at least one Cycle node");
+    assert_eq!(cycle_count, 0, "3-cycle back-edge is dropped; no Cycle nodes expected");
 }
 
 /// Zooming into one sibling while leaving another at the same depth results in

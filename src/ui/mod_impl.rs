@@ -199,18 +199,13 @@ fn build_graph_tree_item<'a>(
         entity_kind_style(&entity.kind)
     };
 
-    // Show full path for the entity (relative to workspace root)
-    let rel_path = if let Some(root) = &state.current_path {
-        match entity.path.strip_prefix(root) {
-            Ok(p) => p.display().to_string(),
-            Err(_) => entity.path.display().to_string(),
-        }
-    } else {
-        entity.path.display().to_string()
-    };
+    // Show the full path built during graph construction (e.g. "src/graph/entity.rs",
+    // "src/graph/cursor.rs/Cursor").  The path is already relative to the root
+    // directory so we display it as-is without stripping any prefix.
+    let display_name = entity.path.display().to_string();
     let line = Line::from(vec![
         Span::raw(format!("{indent}{fold_icon}")),
-        Span::styled(format!("[{kind_icon}] {}", rel_path), name_style),
+        Span::styled(format!("[{kind_icon}] {}", display_name), name_style),
         Span::styled(
             cycle_marker.to_string(),
             Style::default()
