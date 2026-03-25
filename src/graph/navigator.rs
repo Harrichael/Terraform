@@ -88,9 +88,16 @@ impl Navigator {
             self.view_tree.insert_entity(leaf, vec![]);
         }
 
-        // Self-loops don't affect tree structure and are suppressed from the view.
+        // Many cursor references may collapse to the same (from_leaf, to_leaf) pair at the
+        // current zoom level (e.g. hundreds of function-to-function edges all map to the same
+        // pair of folder leaves).  Inserting duplicates is both redundant and triggers
+        // deep_copy_subtree for every extra copy, causing exponential tree growth.
+        // Deduplicate here so each unique pair is inserted exactly once.
+        let mut seen = std::collections::HashSet::new();
         for cursor_ref in &self.cursor.references {
-            if cursor_ref.from_leaf != cursor_ref.to_leaf {
+            if cursor_ref.from_leaf != cursor_ref.to_leaf
+                && seen.insert((cursor_ref.from_leaf, cursor_ref.to_leaf))
+            {
                 self.view_tree.insert_edge(cursor_ref.from_leaf, cursor_ref.to_leaf);
             }
         }

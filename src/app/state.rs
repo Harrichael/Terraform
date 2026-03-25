@@ -162,12 +162,14 @@ impl AppState {
         self.graph_visible.clear();
 
         // Snapshot tree node data to avoid borrow conflicts during traversal.
-        let node_snapshot: Vec<(GraphTreeNodeId, EntityId, Option<GraphTreeNodeId>, Vec<GraphTreeNodeId>)> =
+        // The tree's node arena is indexed by GraphTreeNodeId(i) == nodes[i],
+        // so the Vec is effectively a direct-access map: snapshot[id.0] → node data.
+        let node_snapshot: Vec<(EntityId, Option<GraphTreeNodeId>, Vec<GraphTreeNodeId>)> =
             if let Some(nav) = &self.navigator {
                 nav.tree()
                     .nodes
                     .iter()
-                    .map(|n| (n.id, n.entity_id, n.parent, n.children.clone()))
+                    .map(|n| (n.entity_id, n.parent, n.children.clone()))
                     .collect()
             } else {
                 return;
@@ -176,16 +178,16 @@ impl AppState {
         // Roots are nodes with no parent.
         let mut stack: Vec<(GraphTreeNodeId, usize)> = node_snapshot
             .iter()
-            .filter(|(_, _, parent, _)| parent.is_none())
-            .map(|(id, _, _, _)| (*id, 0usize))
+            .enumerate()
+            .filter(|(_, (_, parent, _))| parent.is_none())
+            .map(|(i, _)| (GraphTreeNodeId(i), 0usize))
             .collect();
         // Reverse so the first root ends up on top of the stack (LIFO).
         stack.reverse();
 
         while let Some((node_id, depth)) = stack.pop() {
-            if let Some((_, entity_id, _, children)) =
-                node_snapshot.iter().find(|(id, _, _, _)| *id == node_id)
-            {
+            // O(1) direct index into the arena instead of a linear scan.
+            if let Some((entity_id, _, children)) = node_snapshot.get(node_id.0) {
                 self.graph_visible.push((node_id, depth));
                 if !self.graph_folded.contains(entity_id) {
                     // Push children in reverse so the first child is processed first.
