@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use super::entity::{Entity, EntityGraph, EntityId, EntityKind, Reference, ReferenceKind, ReferenceId};
 use super::cursor::Cursor;
-use super::tree::{GraphTree, GraphTreeNodeId};
+use super::tree::{GraphTree, GraphTreeNodeId, NodeKind};
 // use super::tree::ReferenceTree;
 // use super::navigator::Navigator;
 
@@ -299,27 +299,30 @@ fn build_tree(num_nodes: usize, edges: &[(EntityId, EntityId)]) -> GraphTree {
     tree
 }
 
-/// Canonical string for a subtree rooted at `node_id`.
-/// Children are sorted so sibling order doesn't affect the result.
 fn canonical_subtree(tree: &GraphTree, node_id: GraphTreeNodeId) -> String {
     let node = tree.get(node_id).unwrap();
-    let mut child_strs: Vec<String> = node.children
-        .iter()
-        .map(|&c| canonical_subtree(tree, c))
-        .collect();
-    child_strs.sort();
-    format!("{}[{}]", node.entity_id.0, child_strs.join(","))
+    match node.kind {
+        NodeKind::Cycle  => format!("!{}[]", node.entity_id.0),
+        NodeKind::Ref    => format!("~{}[]", node.entity_id.0),
+        NodeKind::Normal => {
+            let mut children = node.children.clone();
+            // Sort by entity id (numeric) — stable regardless of subtree complexity.
+            children.sort_by_key(|&id| tree.get(id).map_or(usize::MAX, |n| n.entity_id.0));
+            let child_strs: Vec<String> = children.iter()
+                .map(|&c| canonical_subtree(tree, c))
+                .collect();
+            format!("{}[{}]", node.entity_id.0, child_strs.join(","))
+        }
+    }
 }
 
-/// Canonical string for the whole forest (all root nodes, sorted).
+/// Canonical string for the whole forest (all root nodes, sorted by entity id).
 fn canonical_forest(tree: &GraphTree) -> String {
-    let mut root_strs: Vec<String> = tree.nodes
-        .iter()
-        .filter(|n| n.parent.is_none())
-        .map(|n| canonical_subtree(tree, n.id))
+    let mut roots: Vec<_> = tree.nodes.iter()
+        .filter(|n| n.parent.is_none() && n.kind == NodeKind::Normal)
         .collect();
-    root_strs.sort();
-    root_strs.join("|")
+    roots.sort_by_key(|n| n.entity_id.0);
+    roots.iter().map(|n| canonical_subtree(tree, n.id)).collect::<Vec<_>>().join("|")
 }
 
 // ─── GraphTree tests ──────────────────────────────────────────────────────────
