@@ -338,8 +338,73 @@ fn collect_ref_edges(
         }
     }
 
+    // Type references: struct/enum field types, function parameter types,
+    // function return types (Rust), and explicit type annotations (TS/Python).
+    let from_id = find_containing_scope(node.start_byte(), scope_nodes, file_id);
+    match kind {
+        // Rust struct/enum field types and function parameter types.
+        // e.g. `pub entity_id: EntityId` or `fn f(x: EntityId)` → TypeRef to EntityId
+        "field_declaration" | "parameter" | "const_item" | "static_item" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                push_type_refs(from_id, type_node, source, result);
+            }
+        }
+        // Rust function return types.
+        // `return_type` is a field on `function_item`, not a separate node kind.
+        // e.g. `fn foo() -> EntityId` → TypeRef to EntityId
+        "function_item" | "function_signature_item" => {
+            if let Some(ret_type) = node.child_by_field_name("return_type") {
+                push_type_refs(from_id, ret_type, source, result);
+            }
+        }
+        // TypeScript / Python type annotations.
+        // e.g. `: EntityId` in TS field declarations or Python function params
+        "type_annotation" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                push_type_refs(from_id, child, source, result);
+            }
+        }
+        _ => {}
+    }
+
     for child in node.children(&mut node.walk()) {
         collect_ref_edges(child, source, scope_nodes, file_id, result);
+    }
+}
+
+/// Push `TypeRef` edges for each non-trivial type identifier found under `type_node`.
+fn push_type_refs(
+    from_id: usize,
+    type_node: Node<'_>,
+    source: &[u8],
+    result: &mut Vec<(usize, String, ReferenceKind)>,
+) {
+    let mut names = Vec::new();
+    collect_type_idents(type_node, source, &mut names);
+    for name in names {
+        if !is_trivial_name(&name) {
+            result.push((from_id, name, ReferenceKind::TypeRef));
+        }
+    }
+}
+
+/// Recursively collect all type identifier names from a type node.
+///
+/// Handles simple types (`EntityId`), generic types (`Vec<EntityId>`),
+/// reference types (`&EntityId`), tuple types (`(A, B)`), and other compound
+/// type expressions by recursing into named children.
+fn collect_type_idents(node: Node<'_>, source: &[u8], names: &mut Vec<String>) {
+    match node.kind() {
+        "type_identifier" | "identifier" => {
+            names.push(extract_node_text(node, source));
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_type_idents(child, source, names);
+            }
+        }
     }
 }
 
@@ -445,14 +510,15 @@ fn collect_import_names(node: Node<'_>, source: &[u8], names: &mut Vec<String>) 
 /// Names that are too common/generic to be meaningful reference targets.
 ///
 /// This list filters out standard-library/runtime functions, common helpers,
-/// and language built-ins so that the reference graph is not cluttered with
-/// noise.  Extend the list as new noisy patterns are encountered; all entries
-/// should have near-universal presence across many files (e.g. `new`, `len`,
-/// `println`) rather than project-specific names.
+/// language built-ins, and primitive types so that the reference graph is not
+/// cluttered with noise.  Extend the list as new noisy patterns are
+/// encountered; all entries should have near-universal presence across many
+/// files (e.g. `new`, `len`, `println`) rather than project-specific names.
 fn is_trivial_name(name: &str) -> bool {
     name.len() <= 1
         || matches!(
             name,
+            // Common Rust methods / functions
             "new"
                 | "clone"
                 | "unwrap"
@@ -541,6 +607,54 @@ fn is_trivial_name(name: &str) -> bool {
                 | "assert_eq"
                 | "assert_ne"
                 | "vec"
+                // Rust primitive / standard types (not defined in user projects)
+                | "String"
+                | "Vec"
+                | "HashMap"
+                | "HashSet"
+                | "BTreeMap"
+                | "BTreeSet"
+                | "Option"
+                | "Result"
+                | "Box"
+                | "Rc"
+                | "Arc"
+                | "Cell"
+                | "RefCell"
+                | "Mutex"
+                | "RwLock"
+                | "usize"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "f32"
+                | "f64"
+                | "char"
+                | "Path"
+                | "PathBuf"
+                // TypeScript / JavaScript built-in types
+                | "string"
+                | "number"
+                | "boolean"
+                | "void"
+                | "null"
+                | "undefined"
+                | "never"
+                | "unknown"
+                | "any"
+                | "symbol"
+                | "bigint"
+                | "Promise"
+                | "Map"
+                | "Set"
         )
 }
 
@@ -1050,5 +1164,97 @@ SELECT id, name FROM users;
         let all = tree.all_nodes_dfs();
         let fn_count = all.iter().filter(|n| n.kind == NodeKind::Function).count();
         assert!(fn_count >= 2, "Both files should have their own function nodes");
+    }
+
+    #[test]
+    fn test_struct_field_type_reference() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        // entity.rs defines `EntityId`; tree.rs uses it as a struct field type.
+        // This should produce a TypeRef edge from tree.rs to EntityId.
+        std::fs::write(
+            dir.path().join("entity.rs"),
+            "pub struct EntityId(pub usize);",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tree.rs"),
+            r#"pub struct GraphNode { pub entity_id: EntityId }"#,
+        )
+        .unwrap();
+        let tree = parse_directory(dir.path()).unwrap();
+        let refs = tree.references.references();
+        assert!(
+            refs.iter().any(|r| r.kind == ReferenceKind::TypeRef),
+            "Expected a TypeRef edge for EntityId field type usage"
+        );
+        // Find the EntityId node and the tree.rs file node.
+        let all = tree.all_nodes_dfs();
+        let entity_id_node = all.iter().find(|n| n.name == "EntityId");
+        assert!(entity_id_node.is_some(), "EntityId should be parsed as a node");
+        // Check that there is a reference pointing to EntityId.
+        let entity_id_node_id = entity_id_node.unwrap().id;
+        assert!(
+            refs.iter().any(|r| r.to == entity_id_node_id),
+            "Expected a reference edge pointing to EntityId"
+        );
+    }
+
+    #[test]
+    fn test_function_return_type_reference() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        // entity.rs defines `Widget`; lib.rs has a function returning `Widget`.
+        std::fs::write(
+            dir.path().join("entity.rs"),
+            "pub struct Widget { pub value: u32 }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn make_widget() -> Widget { Widget { value: 42 } }",
+        )
+        .unwrap();
+        let tree = parse_directory(dir.path()).unwrap();
+        let refs = tree.references.references();
+        assert!(
+            refs.iter().any(|r| r.kind == ReferenceKind::TypeRef),
+            "Expected a TypeRef edge for return type usage"
+        );
+        let all = tree.all_nodes_dfs();
+        let widget_node = all.iter().find(|n| n.name == "Widget");
+        assert!(widget_node.is_some(), "Widget should be parsed as a node");
+        let widget_node_id = widget_node.unwrap().id;
+        assert!(
+            refs.iter().any(|r| r.to == widget_node_id),
+            "Expected a reference edge pointing to Widget"
+        );
+    }
+
+    #[test]
+    fn test_function_parameter_type_reference() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        // entity.rs defines `Config`; lib.rs has a function that takes `Config` as a param.
+        std::fs::write(
+            dir.path().join("entity.rs"),
+            "pub struct Config { pub debug: bool }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn run(cfg: Config) { let _ = cfg; }",
+        )
+        .unwrap();
+        let tree = parse_directory(dir.path()).unwrap();
+        let refs = tree.references.references();
+        let all = tree.all_nodes_dfs();
+        let config_node = all.iter().find(|n| n.name == "Config");
+        assert!(config_node.is_some(), "Config should be parsed as a node");
+        let config_node_id = config_node.unwrap().id;
+        assert!(
+            refs.iter().any(|r| r.to == config_node_id),
+            "Expected a reference edge pointing to Config from parameter type usage"
+        );
     }
 }
