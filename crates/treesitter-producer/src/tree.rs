@@ -1,5 +1,4 @@
 /// Hierarchical code node kinds, ordered from coarsest to finest granularity.
-/// `SymRef` is a special non-granularity kind for symbolic references.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum NodeKind {
@@ -10,22 +9,19 @@ pub enum NodeKind {
     Function,
     Block,
     Line,
-    /// A symbolic reference to another node (not a granularity level).
-    SymRef,
 }
 
 impl NodeKind {
-    /// Granularity level: lower number = coarser detail. `None` for SymRef.
-    pub fn level(&self) -> Option<u8> {
+    /// Granularity level: lower number = coarser detail.
+    pub fn level(&self) -> u8 {
         match self {
-            NodeKind::Folder => Some(0),
-            NodeKind::Module => Some(1),
-            NodeKind::File => Some(2),
-            NodeKind::Class => Some(3),
-            NodeKind::Function => Some(4),
-            NodeKind::Block => Some(5),
-            NodeKind::Line => Some(6),
-            NodeKind::SymRef => None,
+            NodeKind::Folder => 0,
+            NodeKind::Module => 1,
+            NodeKind::File => 2,
+            NodeKind::Class => 3,
+            NodeKind::Function => 4,
+            NodeKind::Block => 5,
+            NodeKind::Line => 6,
         }
     }
 
@@ -38,7 +34,7 @@ impl NodeKind {
             NodeKind::Function => Some(NodeKind::Class),
             NodeKind::Block => Some(NodeKind::Function),
             NodeKind::Line => Some(NodeKind::Block),
-            NodeKind::Folder | NodeKind::SymRef => None,
+            NodeKind::Folder => None,
         }
     }
 
@@ -51,16 +47,13 @@ impl NodeKind {
             NodeKind::Class => Some(NodeKind::Function),
             NodeKind::Function => Some(NodeKind::Block),
             NodeKind::Block => Some(NodeKind::Line),
-            NodeKind::Line | NodeKind::SymRef => None,
+            NodeKind::Line => None,
         }
     }
 
     /// True if this kind is at a finer granularity than `other`.
     pub fn is_finer_than(&self, other: &NodeKind) -> bool {
-        match (self.level(), other.level()) {
-            (Some(a), Some(b)) => a > b,
-            _ => false,
-        }
+        self.level() > other.level()
     }
 }
 
@@ -74,7 +67,6 @@ impl std::fmt::Display for NodeKind {
             NodeKind::Function => "fn/method",
             NodeKind::Block => "block",
             NodeKind::Line => "line",
-            NodeKind::SymRef => "symref",
         };
         write!(f, "{s}")
     }
@@ -191,8 +183,6 @@ pub struct CodeNode {
     /// Granularity limit: only show children whose kind is at most this
     /// level of detail. `None` means "show all children".
     pub granularity_limit: Option<NodeKind>,
-    /// For `SymRef` nodes: the ID of the canonical definition this references.
-    pub sym_ref_target: Option<usize>,
 }
 
 impl CodeNode {
@@ -217,7 +207,6 @@ impl CodeNode {
             children: Vec::new(),
             collapsed: false,
             granularity_limit: None,
-            sym_ref_target: None,
         }
     }
 
@@ -251,21 +240,10 @@ impl CodeNode {
 pub struct CodeTree {
     /// Flat storage; index == node.id.
     pub(crate) nodes: Vec<CodeNode>,
-    /// Number of structural nodes after initial parse (virtual nodes have id >= this).
-    pub structural_count: usize,
     /// Root node index (always 0 when the tree is non-empty).
     pub root: Option<usize>,
     /// Directed symbolic references between nodes (the reference graph).
     pub references: ReferenceGraph,
-}
-
-/// Describes one entry in the semantic dependency layout of a node's children.
-#[derive(Debug, Clone)]
-pub enum SemanticEntry {
-    /// A real structural node at the given depth relative to the expansion level.
-    Node { id: usize, depth: usize },
-    /// A "→ target" SymRef arrow at the given relative depth.
-    SymRef { target_id: usize, depth: usize },
 }
 
 impl CodeTree {
@@ -355,29 +333,6 @@ impl CodeTree {
                 }
             }
         }
-    }
-
-    /// Add a SymRef node pointing to `target_id` as a child of `parent_id`.
-    #[allow(dead_code)]
-    pub fn add_sym_ref(
-        &mut self,
-        name: impl Into<String>,
-        target_id: usize,
-        depth: usize,
-        parent_id: usize,
-    ) -> usize {
-        let id = self.add_node(
-            NodeKind::SymRef,
-            name,
-            (0, 0),
-            (0, 0),
-            depth,
-            Some(parent_id),
-        );
-        if let Some(n) = self.nodes.get_mut(id) {
-            n.sym_ref_target = Some(target_id);
-        }
-        id
     }
 
     /// Set detail text for a node.
@@ -472,22 +427,19 @@ impl CodeTree {
     /// Walk the parent chain of `node_id` and return the nearest ancestor
     /// (inclusive) whose [`NodeKind`] is at or coarser than `granularity`.
     ///
-    /// Returns `None` only when `granularity` is [`NodeKind::SymRef`] (which
-    /// has no level) or when `node_id` is invalid.
+    /// Returns `None` only when `node_id` is invalid.
     #[allow(dead_code)]
     pub fn ancestor_at_granularity(
         &self,
         node_id: usize,
         granularity: &NodeKind,
     ) -> Option<usize> {
-        let gran_level = granularity.level()?;
+        let gran_level = granularity.level();
         let mut current_id = node_id;
         loop {
             let node = self.nodes.get(current_id)?;
-            if let Some(level) = node.kind.level() {
-                if level <= gran_level {
-                    return Some(current_id);
-                }
+            if node.kind.level() <= gran_level {
+                return Some(current_id);
             }
             match node.parent {
                 Some(pid) => current_id = pid,
@@ -506,8 +458,8 @@ impl CodeTree {
     /// into a single file-level edge.
     ///
     /// Self-loops (where both endpoints resolve to the same ancestor) are
-    /// dropped.  Edges whose endpoints cannot be resolved (invalid IDs or
-    /// SymRef granularity) are also dropped.
+    /// dropped.  Edges whose endpoints cannot be resolved (invalid IDs) are
+    /// also dropped.
     ///
     /// # Example
     ///
@@ -616,19 +568,6 @@ impl CodeTree {
         self.nodes.iter()
     }
 
-    /// Remove virtual SymRef nodes added during view construction
-    /// (all nodes with id >= structural_count).
-    pub fn clear_virtual_nodes(&mut self) {
-        for id in self.structural_count..self.nodes.len() {
-            if let Some(pid) = self.nodes[id].parent {
-                if pid < self.structural_count {
-                    self.nodes[pid].children.retain(|&c| c < self.structural_count);
-                }
-            }
-        }
-        self.nodes.truncate(self.structural_count);
-    }
-
     /// Collect all node IDs in the subtree rooted at root_id.
     pub fn subtree_ids(&self, root_id: usize) -> std::collections::HashSet<usize> {
         let mut result = std::collections::HashSet::new();
@@ -672,121 +611,6 @@ impl CodeTree {
         }
         parts.reverse();
         parts.join("/")
-    }
-
-    /// Compute the semantic layout of direct meaningful children of parent_id.
-    /// Returns flat list of SemanticEntry (depth is relative to the expansion level).
-    /// Only includes Folder/File/Class/Function/Module children (no Block/Line).
-    pub fn semantic_children_of(&self, parent_id: usize) -> Vec<SemanticEntry> {
-        let node = match self.nodes.get(parent_id) {
-            Some(n) => n,
-            None => return Vec::new(),
-        };
-
-        // Filter to only meaningful kinds
-        let node_ids: Vec<usize> = node
-            .children
-            .iter()
-            .filter(|&&c| {
-                if let Some(child) = self.nodes.get(c) {
-                    matches!(
-                        child.kind,
-                        NodeKind::Folder
-                            | NodeKind::File
-                            | NodeKind::Class
-                            | NodeKind::Function
-                            | NodeKind::Module
-                    )
-                } else {
-                    false
-                }
-            })
-            .copied()
-            .collect();
-
-        let n = node_ids.len();
-        if n == 0 {
-            return Vec::new();
-        }
-
-        // Build dependency matrix: deps[i][j] = node_ids[i] uses node_ids[j]
-        let mut deps = vec![vec![false; n]; n];
-        for i in 0..n {
-            for j in 0..n {
-                if i != j && self.cross_ref_count(node_ids[i], node_ids[j]) > 0 {
-                    deps[i][j] = true;
-                }
-            }
-        }
-
-        // Compute incoming count for each node (how many others use it)
-        let mut incoming = vec![0usize; n];
-        for j in 0..n {
-            for i in 0..n {
-                if deps[i][j] {
-                    incoming[j] += 1;
-                }
-            }
-        }
-
-        // Sort processing order: ascending by incoming count, tiebreak by node_id ascending
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by_key(|&i| (incoming[i], node_ids[i]));
-
-        // LayoutBuilder places nodes depth-first in semantic order
-        struct LayoutBuilder {
-            n: usize,
-            placed: Vec<bool>,
-            result: Vec<SemanticEntry>,
-        }
-
-        impl LayoutBuilder {
-            fn place(&mut self, idx: usize, depth: usize, node_ids: &[usize], deps: &[Vec<bool>]) {
-                self.placed[idx] = true;
-                self.result.push(SemanticEntry::Node {
-                    id: node_ids[idx],
-                    depth,
-                });
-                for j in 0..self.n {
-                    if deps[idx][j] {
-                        if self.placed[j] {
-                            // Already placed: emit a SymRef
-                            self.result.push(SemanticEntry::SymRef {
-                                target_id: node_ids[j],
-                                depth: depth + 1,
-                            });
-                        } else if deps[j][idx] {
-                            // Mutual cycle: lower id is the "parent"
-                            if node_ids[idx] < node_ids[j] {
-                                self.place(j, depth + 1, node_ids, deps);
-                            } else {
-                                self.result.push(SemanticEntry::SymRef {
-                                    target_id: node_ids[j],
-                                    depth: depth + 1,
-                                });
-                            }
-                        } else {
-                            // Pure library: place as child
-                            self.place(j, depth + 1, node_ids, deps);
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut builder = LayoutBuilder {
-            n,
-            placed: vec![false; n],
-            result: Vec::new(),
-        };
-
-        for &idx in &order {
-            if !builder.placed[idx] {
-                builder.place(idx, 0, &node_ids, &deps);
-            }
-        }
-
-        builder.result
     }
 }
 
@@ -919,16 +743,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sym_ref_nodes() {
-        let mut tree = sample_tree();
-        // Add a SymRef to fn_foo (id=1) as a child of fn_bar (id=3)
-        let ref_id = tree.add_sym_ref("fn_foo", 1, 2, 3);
-        let ref_node = tree.get(ref_id).unwrap();
-        assert_eq!(ref_node.kind, NodeKind::SymRef);
-        assert_eq!(ref_node.sym_ref_target, Some(1));
-    }
-
-    #[test]
     fn test_filter_visible() {
         let tree = sample_tree();
         let res = tree.filter_visible("foo");
@@ -959,7 +773,6 @@ mod tests {
     fn test_nodekind_level_ordering() {
         assert!(NodeKind::Folder.level() < NodeKind::Line.level());
         assert!(NodeKind::Function.level() < NodeKind::Block.level());
-        assert!(NodeKind::SymRef.level().is_none());
     }
 
     #[test]
@@ -974,7 +787,6 @@ mod tests {
     fn test_is_finer_than() {
         assert!(NodeKind::Line.is_finer_than(&NodeKind::Function));
         assert!(!NodeKind::File.is_finer_than(&NodeKind::Function));
-        assert!(!NodeKind::SymRef.is_finer_than(&NodeKind::Line));
     }
 
     // -----------------------------------------------------------------------
@@ -1055,13 +867,6 @@ mod tests {
         assert_eq!(tree.ancestor_at_granularity(1, &NodeKind::Folder), Some(0));
         // root is a Folder; querying at Folder should return root itself (id=0).
         assert_eq!(tree.ancestor_at_granularity(0, &NodeKind::Folder), Some(0));
-    }
-
-    #[test]
-    fn test_ancestor_at_granularity_symref_returns_none() {
-        let tree = two_file_tree();
-        // SymRef has no level → ancestor_at_granularity returns None.
-        assert_eq!(tree.ancestor_at_granularity(0, &NodeKind::SymRef), None);
     }
 
     #[test]

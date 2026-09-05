@@ -1,7 +1,6 @@
-use std::ops::Range;
-use std::path::PathBuf;
+use entity_graph::test_support::make_entity;
 
-use super::entity::{Entity, EntityGraph, EntityId, EntityKind, Reference, ReferenceKind};
+use super::entity::{EntityGraph, EntityId, EntityKind, Reference, ReferenceKind};
 use super::navigator::Navigator;
 use super::tree::{GraphTree, GraphTreeNodeId, NodeKind};
 
@@ -391,19 +390,6 @@ fn test_mutual_edge_both_roots() {
 }
 
 // ─── Navigator smoke tests ────────────────────────────────────────────────────
-
-fn make_entity(id: usize, name: &str, kind: EntityKind, parent: Option<EntityId>) -> Entity {
-    Entity {
-        id: EntityId(id),
-        kind,
-        name: name.to_string(),
-        parent,
-        children: Vec::new(),
-        path: PathBuf::from(format!("{name}.rs")),
-        byte_range: Range { start: 0, end: 0 },
-        line_range: Range { start: 0, end: 0 },
-    }
-}
 
 /// Return the first `Normal` tree node for `entity_id`, or `None` if absent.
 fn normal_tree_node(nav: &Navigator, entity_id: EntityId) -> Option<GraphTreeNodeId> {

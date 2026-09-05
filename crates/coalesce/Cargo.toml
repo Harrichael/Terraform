@@ -1,0 +1,12 @@
+[package]
+name = "coalesce"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Zoomable coalesced view of an EntityGraph: a set of active leaves and the references projected onto them."
+
+[dependencies]
+entity-graph = { workspace = true }
+
+[dev-dependencies]
+entity-graph = { workspace = true, features = ["test-support"] }

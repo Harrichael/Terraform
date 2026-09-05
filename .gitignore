@@ -24,3 +24,11 @@ target
 # Added by cargo
 
 /target
+
+# SCIP test fixtures are indexed in place; only their sources and index.scip are tracked
+crates/scip-producer/tests/fixtures/*/target/
+crates/scip-producer/tests/fixtures/*/node_modules/
+crates/scip-producer/tests/fixtures/*/Cargo.lock
+
+# Generated SCIP index for this repo (scripts/scip-index.sh)
+/index.scip

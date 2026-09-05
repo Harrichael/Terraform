@@ -1,25 +1,41 @@
+[workspace]
+resolver = "2"
+members = [".", "crates/*"]
+# SCIP test fixtures are standalone projects indexed by external tools; they
+# must never be pulled into this workspace's build.
+exclude = ["crates/scip-producer/tests/fixtures"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+entity-graph = { path = "crates/entity-graph" }
+treesitter-producer = { path = "crates/treesitter-producer" }
+scip-producer = { path = "crates/scip-producer" }
+coalesce = { path = "crates/coalesce" }
+
 [package]
 name = "terraform-tui"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+license.workspace = true
 description = "Terminal-based hierarchical code viewer and editor"
-license = "MIT"
 
 [[bin]]
 name = "terraform"
 path = "src/main.rs"
 
 [dependencies]
+entity-graph = { workspace = true }
+coalesce = { workspace = true }
+treesitter-producer = { workspace = true }
 ratatui = "0.29"
 crossterm = "0.28"
-tree-sitter = "0.24"
-tree-sitter-rust = "0.23"
-tree-sitter-python = "0.23"
-tree-sitter-javascript = "0.23"
-tree-sitter-typescript = "0.23"
-tree-sitter-sequel = "0.3"
-anyhow = "1"
+anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+entity-graph = { workspace = true, features = ["test-support"] }

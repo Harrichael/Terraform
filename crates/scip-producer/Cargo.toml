@@ -1,0 +1,15 @@
+[package]
+name = "scip-producer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Produces an EntityGraph from a SCIP index (index.scip) emitted by rust-analyzer, scip-typescript, scip-go, etc."
+
+[dependencies]
+entity-graph = { workspace = true }
+anyhow = { workspace = true }
+scip = "0.10"
+protobuf = "3"
+
+[dev-dependencies]
+entity-graph = { workspace = true, features = ["test-support"] }

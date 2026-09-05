@@ -1,6 +1,5 @@
 mod app;
 mod graph;
-mod parser;
 mod ui;
 
 use std::io;

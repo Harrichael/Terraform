@@ -1,12 +1,10 @@
-//! Converts the parsed [`CodeTree`] into a [`EntityGraph`] suitable for the
-//! [`Navigator`] core engine.
+//! Converts the parsed [`CodeTree`] into an [`EntityGraph`].
 //!
 //! The [`CodeTree`] produced by the parser contains all granularity levels
-//! (Folder → Module → File → Class → Function → Block → Line) plus virtual
-//! SymRef nodes.  The [`EntityGraph`] only models the coarser levels
-//! (Folder → Module → File → Class → Function); Block, Line, and SymRef nodes
-//! are filtered out and their reference edges are remapped to the nearest
-//! function-or-coarser ancestor.
+//! (Folder → Module → File → Class → Function → Block → Line).  The
+//! [`EntityGraph`] only models the coarser levels (Folder → Module → File →
+//! Class → Function); Block and Line nodes are filtered out and their
+//! reference edges are remapped to the nearest function-or-coarser ancestor.
 //!
 //! Additionally, Rust `mod.rs` files that contain only `pub mod` / `mod`
 //! declarations (no functions or classes) are treated as **glue modules** and
@@ -17,8 +15,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::app::tree::{CodeTree, NodeKind, ReferenceKind};
-use crate::graph::entity::{
+use crate::tree::{CodeTree, NodeKind, ReferenceKind};
+use entity_graph::{
     Entity, EntityGraph, EntityId, EntityKind,
     Reference as GraphReference, ReferenceKind as GraphReferenceKind,
 };
@@ -26,7 +24,7 @@ use crate::graph::entity::{
 /// Build an [`EntityGraph`] from a fully-parsed [`CodeTree`].
 ///
 /// Only structural nodes up to [`NodeKind::Function`] are translated;
-/// Block, Line, and SymRef nodes are skipped.  References that originate
+/// Block and Line nodes are skipped.  References that originate
 /// from or target finer-grained nodes are remapped upward to the nearest
 /// entity-level ancestor so no symbolic edges are lost.
 pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
@@ -55,20 +53,16 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
     // This keeps the entity graph uncluttered: the real sub-module
     // entities are the Folder / File nodes added by the directory walker.
     // ------------------------------------------------------------------
-    let structural_count = tree.structural_count;
     let mut glue_ids: HashSet<usize> = HashSet::new();
 
-    for code_id in 0..structural_count {
-        if !is_glue_mod_rs(code_id, tree, structural_count) {
+    for code_id in 0..tree.node_count() {
+        if !is_glue_mod_rs(code_id, tree) {
             continue;
         }
         glue_ids.insert(code_id);
         // Also skip stub Module children (pub mod foo; with no body).
         let children = tree.get(code_id).map(|n| n.children.clone()).unwrap_or_default();
         for child_id in children {
-            if child_id >= structural_count {
-                continue;
-            }
             let Some(child) = tree.get(child_id) else { continue };
             if child.kind == NodeKind::Module && child.children.is_empty() {
                 glue_ids.insert(child_id);
@@ -83,7 +77,7 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
     let mut id_map: HashMap<usize, EntityId> = HashMap::new();
     let mut entities: Vec<Entity> = Vec::new();
 
-    for code_id in 0..structural_count {
+    for code_id in 0..tree.node_count() {
         if let Some(node) = tree.get(code_id) {
             if !is_entity_kind(&node.kind) {
                 continue;
@@ -128,7 +122,7 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
     // Function whose parent is a Block), we walk up until we find an
     // entity-level ancestor.
     // ------------------------------------------------------------------
-    for code_id in 0..structural_count {
+    for code_id in 0..tree.node_count() {
         if let Some(&entity_id) = id_map.get(&code_id) {
             if let Some(node) = tree.get(code_id) {
                 // Parent: walk up to find nearest entity ancestor.
@@ -148,7 +142,9 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
     // Pass 3: Convert reference edges.
     // Remap both endpoints to their nearest entity-level ancestor so that
     // references inside Block/Line nodes still appear at the Function level.
-    // Self-loops produced by remapping are discarded.
+    // Self-loops produced by remapping are discarded, and the remaining edges
+    // are deduplicated on (from, to, kind): a Call and an Import between the
+    // same pair are distinct facts a consumer may want to tell apart.
     //
     // References where the raw `from` or `to` code node is itself a glue
     // node (a glue mod.rs File or one of its declaration-only Module stubs)
@@ -158,7 +154,7 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
     // folder — which causes the folder node to reappear in the view tree
     // even though it has been zoomed past.
     // ------------------------------------------------------------------
-    let mut seen: std::collections::HashSet<(EntityId, EntityId)> = std::collections::HashSet::new();
+    let mut seen: HashSet<(EntityId, EntityId, GraphReferenceKind)> = HashSet::new();
     let mut references: Vec<GraphReference> = Vec::new();
 
     for r in tree.references.references() {
@@ -175,14 +171,8 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
             None => continue,
         };
         if from == to {
-            continue; // skip self-loops produced by remapping
+            continue;
         }
-        let key = (from, to);
-        if seen.contains(&key) {
-            continue; // deduplicate
-        }
-        seen.insert(key);
-
         let kind = match r.kind {
             ReferenceKind::Call => GraphReferenceKind::Call,
             ReferenceKind::Import => GraphReferenceKind::Import,
@@ -190,7 +180,9 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
             ReferenceKind::VarRef => GraphReferenceKind::VarRef,
             ReferenceKind::Generic => GraphReferenceKind::Generic,
         };
-        references.push(GraphReference { from, to, kind });
+        if seen.insert((from, to, kind)) {
+            references.push(GraphReference { from, to, kind });
+        }
     }
 
     EntityGraph { entities, references }
@@ -204,14 +196,13 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
 ///
 /// Files that contain real implementations (functions, structs, etc.) return
 /// `false` and are kept in the entity graph as normal.
-fn is_glue_mod_rs(code_id: usize, tree: &CodeTree, structural_count: usize) -> bool {
+fn is_glue_mod_rs(code_id: usize, tree: &CodeTree) -> bool {
     let Some(node) = tree.get(code_id) else { return false };
     if node.kind != NodeKind::File || node.name != "mod.rs" {
         return false;
     }
-    // Not glue if any direct structural child is a Class or Function.
+    // Not glue if any direct child is a Class or Function.
     node.children.iter()
-        .filter(|&&c| c < structural_count)
         .all(|&c| {
             !matches!(
                 tree.get(c).map(|n| &n.kind),
@@ -224,7 +215,7 @@ fn is_glue_mod_rs(code_id: usize, tree: &CodeTree, structural_count: usize) -> b
 /// and joining entity-level ancestor names with `/`.
 ///
 /// Only Folder, Module, File, Class, and Function nodes contribute a path
-/// segment; Block, Line, and SymRef nodes are skipped.  Examples:
+/// segment; Block and Line nodes are skipped.  Examples:
 ///
 /// - `src/` folder         → `src`
 /// - `src/graph/entity.rs` → `src/graph/entity.rs`
@@ -314,8 +305,6 @@ fn collect_entity_children(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tree::{CodeTree, NodeKind, ReferenceKind};
-    use crate::graph::entity::EntityKind;
 
     fn two_file_tree() -> CodeTree {
         let mut tree = CodeTree::new();
@@ -324,7 +313,6 @@ mod tests {
         let _fn_a = tree.add_node(NodeKind::Function, "fn_a", (0, 50), (0, 10), 2, Some(fa));
         let fb = tree.add_node(NodeKind::File, "b.rs", (101, 200), (21, 40), 1, Some(root));
         let _fn_b = tree.add_node(NodeKind::Function, "fn_b", (101, 150), (21, 30), 2, Some(fb));
-        tree.structural_count = tree.node_count();
         tree
     }
 
@@ -343,7 +331,6 @@ mod tests {
         let func = tree.add_node(NodeKind::Function, "fn_x", (0, 50), (0, 5), 1, Some(root));
         let _blk = tree.add_node(NodeKind::Block, "{}", (0, 30), (0, 3), 2, Some(func));
         let _ln = tree.add_node(NodeKind::Line, "let x = 1;", (0, 20), (0, 2), 3, Some(func));
-        tree.structural_count = tree.node_count();
         let graph = code_tree_to_entity_graph(&tree);
         // Only File + Function should appear
         assert_eq!(graph.entities.len(), 2);
@@ -373,20 +360,24 @@ mod tests {
         assert!(graph.references[0].from != graph.references[0].to);
     }
 
+    /// Edges are deduplicated on the full (from, to, kind) triple: two kinds
+    /// between the same pair both survive, while a repeated identical edge
+    /// collapses to one.
     #[test]
-    fn test_references_deduplicated() {
+    fn test_references_deduplicated_per_kind() {
         let mut tree = two_file_tree();
         tree.add_reference(2, 4, ReferenceKind::Call);
         tree.add_reference(2, 4, ReferenceKind::Import);
+        tree.add_reference(2, 4, ReferenceKind::Call);
         let graph = code_tree_to_entity_graph(&tree);
-        // Deduplication by (from, to) pair keeps only one edge
-        assert_eq!(graph.references.len(), 1);
+        let kinds: Vec<_> = graph.references.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![GraphReferenceKind::Call, GraphReferenceKind::Import]);
+        assert!(graph.references.iter().all(|r| r.from != r.to));
     }
 
     #[test]
     fn test_empty_tree_gives_empty_graph() {
-        let mut tree = CodeTree::new();
-        tree.structural_count = 0;
+        let tree = CodeTree::new();
         let graph = code_tree_to_entity_graph(&tree);
         assert!(graph.entities.is_empty());
         assert!(graph.references.is_empty());
@@ -410,7 +401,6 @@ mod tests {
         let app_folder = tree.add_node(NodeKind::Folder, "app", (100, 300), (10, 30), 1, Some(src));
         // src/app/state.rs (File)
         let _state_rs = tree.add_node(NodeKind::File, "state.rs", (100, 300), (10, 30), 2, Some(app_folder));
-        tree.structural_count = tree.node_count();
 
         let graph = code_tree_to_entity_graph(&tree);
 
@@ -443,7 +433,6 @@ mod tests {
         let modrs = tree.add_node(NodeKind::File, "mod.rs", (0, 200), (0, 20), 1, Some(src));
         // This mod.rs has a real function — not pure glue
         let _fn_main = tree.add_node(NodeKind::Function, "main", (0, 100), (0, 10), 2, Some(modrs));
-        tree.structural_count = tree.node_count();
 
         let graph = code_tree_to_entity_graph(&tree);
 
@@ -468,7 +457,6 @@ mod tests {
         // src/ui/mod_impl.rs — real file
         let mod_impl = tree.add_node(NodeKind::File, "mod_impl.rs", (50, 200), (5, 20), 2, Some(ui));
         let render = tree.add_node(NodeKind::Function, "render", (50, 100), (5, 10), 3, Some(mod_impl));
-        tree.structural_count = tree.node_count();
 
         // Reference from glue mod.rs (file-level) to render function:
         // simulates `pub use mod_impl::render;`
@@ -495,7 +483,6 @@ mod tests {
         // Another real file with a function that "calls" the events module stub.
         let main_rs = tree.add_node(NodeKind::File, "main.rs", (100, 300), (10, 30), 1, Some(src));
         let fn_main = tree.add_node(NodeKind::Function, "main", (100, 200), (10, 20), 2, Some(main_rs));
-        tree.structural_count = tree.node_count();
 
         // Reference from fn_main to the stub Module "events" — this simulates a
         // reference resolved to a glue stub, e.g. `events::something()` where

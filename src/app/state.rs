@@ -1,12 +1,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::app::graph_builder::code_tree_to_entity_graph;
-use crate::app::tree::CodeTree;
-use crate::graph::entity::EntityId;
+use crate::graph::entity::{EntityGraph, EntityId};
 use crate::graph::navigator::Navigator;
 use crate::graph::tree::GraphTreeNodeId;
-use crate::parser::{parse_directory, parse_source, SourceLanguage};
 
 /// The overall application mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,10 +18,6 @@ pub enum AppMode {
 
 /// All runtime state for the TUI application.
 pub struct AppState {
-    /// The parsed code tree, used to build the entity graph via [`build_navigator`].
-    /// Retained in state so that `build_navigator` can be called without taking
-    /// ownership; after that point it is not used for rendering.
-    tree: CodeTree,
     /// Path to the currently open file or directory (None = nothing loaded).
     pub current_path: Option<PathBuf>,
     /// Height of the tree pane (updated every render).
@@ -56,7 +49,6 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         AppState {
-            tree: CodeTree::new(),
             current_path: None,
             pane_height: 24,
             mode: AppMode::Normal,
@@ -73,38 +65,28 @@ impl AppState {
 
     /// Load a single source file, parse it, and build the navigator.
     pub fn load_file(&mut self, path: PathBuf) -> anyhow::Result<()> {
-        let source = std::fs::read_to_string(&path)?;
-        let lang = SourceLanguage::from_path(&path);
-        let fname = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-        self.tree = parse_source(&source, &lang, &fname)?;
-        self.tree.structural_count = self.tree.node_count();
+        let graph = treesitter_producer::graph_from_path(&path)?;
         self.current_path = Some(path.clone());
         self.filter.clear();
         self.status = format!("Loaded: {}", path.display());
-        self.build_navigator();
+        self.build_navigator(graph);
         Ok(())
     }
 
     /// Load a directory, parse all source files in it, and build the navigator.
     pub fn load_directory(&mut self, path: PathBuf) -> anyhow::Result<()> {
-        self.tree = parse_directory(&path)?;
-        self.tree.structural_count = self.tree.node_count();
+        let graph = treesitter_producer::graph_from_path(&path)?;
         self.current_path = Some(path.clone());
         self.filter.clear();
         self.status = format!("Loaded directory: {} — use l/Right to zoom in", path.display());
-        self.build_navigator();
+        self.build_navigator(graph);
         Ok(())
     }
 
-    /// Convert the current `CodeTree` into an [`EntityGraph`] and initialize
-    /// the [`Navigator`].  Resets all graph-view navigation state.
-    pub(crate) fn build_navigator(&mut self) {
-        let entity_graph = code_tree_to_entity_graph(&self.tree);
-        self.navigator = Some(Navigator::new(entity_graph));
+    /// Initialize the [`Navigator`] over `graph`, resetting all graph-view
+    /// navigation state.
+    pub(crate) fn build_navigator(&mut self, graph: EntityGraph) {
+        self.navigator = Some(Navigator::new(graph));
         self.graph_folded.clear();
         self.graph_cursor = 0;
         self.graph_scroll_offset = 0;
@@ -187,7 +169,7 @@ impl AppState {
 
         while let Some((node_id, depth)) = stack.pop() {
             // O(1) direct index into the arena instead of a linear scan.
-            if let Some((entity_id, _, children)) = node_snapshot.get(node_id.0) {
+            if let Some((_, _, children)) = node_snapshot.get(node_id.0) {
                 self.graph_visible.push((node_id, depth));
                 if !self.graph_folded.contains(&node_id) {
                     // Push children in reverse so the first child is processed first.
@@ -294,19 +276,17 @@ impl AppState {
             Some(&v) => v,
             None => return,
         };
-        let entity_id = if let Some(nav) = &self.navigator {
-            nav.tree().get(node_id).map(|n| n.entity_id)
-        } else {
+        let node_exists = self
+            .navigator
+            .as_ref()
+            .is_some_and(|nav| nav.tree().get(node_id).is_some());
+        if !node_exists {
             return;
-        };
-        if let Some(eid) = entity_id {
-            if self.graph_folded.contains(&node_id) {
-                self.graph_folded.remove(&node_id);
-            } else {
-                self.graph_folded.insert(node_id);
-            }
-            self.refresh_graph_visible();
         }
+        if !self.graph_folded.remove(&node_id) {
+            self.graph_folded.insert(node_id);
+        }
+        self.refresh_graph_visible();
     }
 
     /// Clear all graph folds without changing the zoom level.
@@ -355,18 +335,21 @@ impl Default for AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tree::{CodeTree, NodeKind};
+    use entity_graph::EntityKind;
+    use entity_graph::test_support::graph_from_parents;
 
     /// Build an AppState with a navigator initialised from a two-function file.
     fn state_with_navigator() -> AppState {
         let mut state = AppState::new();
-        let mut tree = CodeTree::new();
-        let root = tree.add_node(NodeKind::File, "test.rs", (0, 200), (0, 30), 0, None);
-        let _f1 = tree.add_node(NodeKind::Function, "fn_a", (0, 100), (0, 15), 1, Some(root));
-        let _f2 = tree.add_node(NodeKind::Function, "fn_b", (101, 200), (16, 30), 1, Some(root));
-        state.tree = tree;
-        state.tree.structural_count = state.tree.node_count();
-        state.build_navigator();
+        let graph = graph_from_parents(
+            &[
+                ("test.rs", EntityKind::File, None),
+                ("fn_a", EntityKind::Function, Some(0)),
+                ("fn_b", EntityKind::Function, Some(0)),
+            ],
+            &[],
+        );
+        state.build_navigator(graph);
         state
     }
 

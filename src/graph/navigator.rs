@@ -77,8 +77,8 @@ impl Navigator {
     ///
     /// Algorithm:
     /// 1. Register every active leaf as a `GraphTree` node.
-    /// 2. Build a deduplicated adjacency list from cursor references
-    ///    (self-loops suppressed).
+    /// 2. Build an adjacency list from the coalesced edges, deduplicated by
+    ///    `(from, to)` since the tree does not distinguish reference kinds.
     /// 3. Walk the reference graph with a DFS spanning forest: only the first
     ///    time a node is reached do we emit an `insert_edge` call.  Back-edges
     ///    and cross-edges are silently dropped.
@@ -97,30 +97,26 @@ impl Navigator {
     ///   tree exactly once.
     fn sync_tree(&mut self) {
         self.view_tree = GraphTree::new();
+        let coalesced = self.cursor.coalesced();
 
         // All active leaves must exist before any edges are wired.
-        for &leaf in self.cursor.active() {
+        for &leaf in &coalesced.leaves {
             self.view_tree.insert_entity(leaf, vec![]);
         }
 
-        // Build a deduplicated adjacency list (self-loops suppressed).
         let mut adj: std::collections::HashMap<EntityId, Vec<EntityId>> =
             std::collections::HashMap::new();
         {
             let mut seen = std::collections::HashSet::new();
-            for cursor_ref in &self.cursor.references {
-                if cursor_ref.from_leaf != cursor_ref.to_leaf
-                    && seen.insert((cursor_ref.from_leaf, cursor_ref.to_leaf))
-                {
-                    adj.entry(cursor_ref.from_leaf)
-                        .or_default()
-                        .push(cursor_ref.to_leaf);
+            for edge in &coalesced.edges {
+                if seen.insert((edge.from, edge.to)) {
+                    adj.entry(edge.from).or_default().push(edge.to);
                 }
             }
         }
 
         // DFS spanning forest: only tree edges are forwarded to insert_edge.
-        let leaves: Vec<EntityId> = self.cursor.active().to_vec();
+        let leaves = coalesced.leaves;
         let mut visited = std::collections::HashSet::new();
         for &root in &leaves {
             if visited.contains(&root) {

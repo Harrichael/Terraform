@@ -1,0 +1,925 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Entity graph</title>
+<link rel="stylesheet" href="https://esm.sh/@xyflow/react@12.11.6/dist/style.css">
+<style>
+  :root {
+    --bg: #f4f5f7; --panel: #ffffff; --line: #d9dce1; --text: #1f2328; --muted: #6b7280;
+    --accent: #1a73e8; --error: #c62828;
+    --c-call: #2f80ed; --c-import: #27ae60; --c-type_ref: #9b51e0; --c-var_ref: #f2994a; --c-generic: #8a8f98;
+  }
+  html, body, #root { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .app { display: flex; flex-direction: column; height: 100%; }
+  .toolbar { display: flex; align-items: center; gap: 12px; padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .toolbar .sep { width: 1px; height: 20px; background: var(--line); }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .seg button { border: 0; background: var(--panel); color: var(--text); padding: 4px 12px; cursor: pointer; font: inherit; }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button.on { background: var(--accent); color: #fff; }
+  button.btn { border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; }
+  button.btn:hover { border-color: #b8bcc4; }
+  button.btn:disabled { opacity: .5; cursor: default; }
+  label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); cursor: pointer; }
+  .status { color: var(--error); font-size: 12px; margin-left: auto; max-width: 50%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .main { display: flex; flex: 1; min-height: 0; }
+  .canvas { flex: 1; min-width: 0; position: relative; }
+  .panel { width: 300px; flex: none; background: var(--panel); border-left: 1px solid var(--line); overflow: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+  .panel h2 { margin: 0; font-size: 14px; word-break: break-all; }
+  .panel .meta { color: var(--muted); font-size: 12px; word-break: break-all; }
+  .panel h3 { margin: 6px 0 2px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .panel ul { margin: 0; padding-left: 0; list-style: none; }
+  .panel li { padding: 2px 0; display: flex; gap: 6px; align-items: baseline; }
+  .panel li button { border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; font: inherit; text-align: left; }
+  .panel .empty { color: var(--muted); font-style: italic; }
+  .panel .row { display: flex; gap: 6px; }
+  .panel .err { color: var(--error); font-size: 12px; }
+  .tag { display: inline-block; font-size: 10px; padding: 0 5px; border-radius: 8px; color: #fff; line-height: 15px; }
+  .legend { margin-top: auto; display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: var(--muted); }
+  .legend i { display: inline-block; width: 14px; height: 3px; vertical-align: middle; margin-right: 4px; border-radius: 2px; }
+
+  .ent { position: relative; border: 1.5px solid #999; border-radius: 6px; padding: 5px 10px; background: #fff; min-width: 90px; max-width: 320px; box-shadow: 0 1px 2px rgba(0,0,0,.08); box-sizing: border-box; height: 100%; }
+  .zoom { position: absolute; top: -8px; right: -8px; width: 18px; height: 18px; border-radius: 50%; border: 1px solid #b8bcc4; background: #fff; color: var(--text); font: 13px/16px monospace; padding: 0; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.15); }
+  .zoom:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .box .zoom { top: 2px; right: 4px; }
+  .edge-count { font: 600 10px sans-serif; text-anchor: middle; dominant-baseline: middle; paint-order: stroke; stroke: #fff; stroke-width: 3px; pointer-events: none; }
+  .ent-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ent-sub { font-size: 10px; color: var(--muted); white-space: nowrap; }
+  .kind-folder   { background: #fdf1cf; border-color: #d4a12a; }
+  .kind-module   { background: #dbe9fb; border-color: #4a86d1; }
+  .kind-file     { background: #e3f4e5; border-color: #4caf50; }
+  .kind-class    { background: #ece4f7; border-color: #7e57c2; }
+  .kind-function { background: #ffffff; border-color: #a0a4ab; }
+  .react-flow__node.selected .ent { box-shadow: 0 0 0 2px var(--accent); }
+  .box { width: 100%; height: 100%; box-sizing: border-box; border: 1.5px dashed #999; border-radius: 8px; position: relative; }
+  .box-label { position: absolute; top: 3px; left: 8px; font-size: 11px; font-weight: 600; color: var(--muted); white-space: nowrap; }
+  .box.kind-folder   { background: rgba(212,161,42,.07);  border-color: #d4a12a; }
+  .box.kind-module   { background: rgba(74,134,209,.07);  border-color: #4a86d1; }
+  .box.kind-file     { background: rgba(76,175,80,.07);   border-color: #4caf50; }
+  .box.kind-class    { background: rgba(126,87,194,.07);  border-color: #7e57c2; }
+  .box.kind-function { background: rgba(160,164,171,.07); border-color: #a0a4ab; }
+  .react-flow__node.selected .box { box-shadow: 0 0 0 2px var(--accent); }
+  .react-flow__handle { opacity: 0; pointer-events: none; }
+  .react-flow__node { cursor: grab; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?deps=react@18.3.1",
+    "@xyflow/react": "https://esm.sh/@xyflow/react@12.11.6?deps=react@18.3.1,react-dom@18.3.1",
+    "@dagrejs/dagre": "https://esm.sh/@dagrejs/dagre@1.1.8",
+    "htm": "https://esm.sh/htm@3.1.1"
+  }
+}
+</script>
+</head>
+<body>
+<div id="root"></div>
+<script type="module">
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { createRoot } from 'react-dom/client';
+import {
+  ReactFlow, ReactFlowProvider, Controls, Background, Handle, Position, MarkerType, BaseEdge, getBezierPath,
+  applyNodeChanges, applyEdgeChanges, useReactFlow, useInternalNode, getViewportForBounds,
+} from '@xyflow/react';
+import dagre from '@dagrejs/dagre';
+import htm from 'htm';
+
+const html = htm.bind(React.createElement);
+
+const EDGE_COLOR = { call: '#2f80ed', import: '#27ae60', type_ref: '#9b51e0', var_ref: '#f2994a', generic: '#8a8f98' };
+const edgeColor = (kind) => EDGE_COLOR[kind] || EDGE_COLOR.generic;
+const NODE_H = 48;
+const estWidth = (name) => Math.min(320, Math.max(120, 8 * name.length + 40));
+
+// Node components are defined once, outside App, so they reach the current
+// zoom handlers through this mutable slot instead of per-render node data.
+const actions = { zoomIn: () => {}, collapse: () => {} };
+
+function ZoomButton({ glyph, title, onClick }) {
+  return html`<button class="zoom nodrag nopan" title=${title}
+    onClick=${(e) => { e.stopPropagation(); onClick(); }}>${glyph}</button>`;
+}
+
+function EntityNode({ data, sourcePosition, targetPosition }) {
+  const lines = data.line_end > 0 ? ` · ${data.line_start}–${data.line_end}` : '';
+  return html`<div class=${'ent kind-' + data.kind} title=${data.path}>
+    <${Handle} type="target" position=${targetPosition} />
+    <div class="ent-name">${data.name}</div>
+    <div class="ent-sub">${data.kind}${lines}</div>
+    <${Handle} type="source" position=${sourcePosition} />
+    ${data.zoomable && html`<${ZoomButton} glyph="+" title="Zoom in" onClick=${() => actions.zoomIn(data.id)} />`}
+  </div>`;
+}
+function ContainerNode({ data, sourcePosition, targetPosition }) {
+  return html`<div class=${'box kind-' + data.kind} title=${data.path}>
+    <${Handle} type="target" position=${targetPosition} />
+    <div class="box-label">${data.name}</div>
+    <${ZoomButton} glyph="−" title="Zoom out" onClick=${() => actions.collapse(data.id)} />
+    <${Handle} type="source" position=${sourcePosition} />
+  </div>`;
+}
+const nodeTypes = { entity: EntityNode, container: ContainerNode };
+
+// Smooth polyline through dagre's routing points: corners are rounded by
+// curving through each interior point toward the midpoint of the next segment.
+function routedPath(pts) {
+  let d = `M ${pts[0].x} ${pts[0].y}`;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const mx = (pts[i].x + pts[i + 1].x) / 2, my = (pts[i].y + pts[i + 1].y) / 2;
+    d += ` Q ${pts[i].x} ${pts[i].y} ${mx} ${my}`;
+  }
+  const last = pts[pts.length - 1];
+  return d + ` L ${last.x} ${last.y}`;
+}
+const moved = (node, at) => !node || !at || Math.abs(node.internals.positionAbsolute.x - at.x) > 0.5 || Math.abs(node.internals.positionAbsolute.y - at.y) > 0.5;
+
+// Edges sharing an endpoint pair (e.g. an import and a call between the same
+// two leaves) would otherwise draw exactly on top of each other, hiding all
+// but one; shift each one sideways by data.offset.
+//
+// When the layout supplied dagre routing points (data.points) the edge follows
+// them, which is what keeps it out of the nodes between its endpoints. The
+// points are only valid while both endpoints sit where the layout put them;
+// after a drag the edge falls back to a plain bezier until the next re-layout.
+function RefEdge({ source, target, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, markerEnd, style, data }) {
+  const s = useInternalNode(source), t = useInternalNode(target);
+  const routed = data?.points && !moved(s, data.at?.s) && !moved(t, data.at?.t);
+  let path, lx, ly;
+  if (routed) {
+    path = routedPath(data.points);
+    const m = data.points[Math.floor(data.points.length / 2)];
+    lx = m.x; ly = m.y;
+  } else {
+    [path, lx, ly] = getBezierPath({ sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition });
+  }
+  const dx = targetX - sourceX, dy = targetY - sourceY, len = Math.hypot(dx, dy) || 1;
+  const k = data?.offset || 0;
+  return html`<g transform=${`translate(${(-dy / len) * k} ${(dx / len) * k})`}>
+    <${BaseEdge} path=${path} markerEnd=${markerEnd} style=${style} />
+    ${data?.count > 1 && html`<text class="edge-count" x=${lx} y=${ly} fill=${style.stroke}>${data.count}</text>`}
+  </g>`;
+}
+const edgeTypes = { ref: RefEdge };
+
+// One edge per node pair, keeping the kind that says most about coupling. An
+// import is a prerequisite of the call or type use it enables, and `generic`
+// is mostly path qualifiers, so hiding them behind a stronger edge loses
+// little; the panel still lists every kind.
+const PRECEDENCE = ['call', 'type_ref', 'var_ref', 'import', 'generic'];
+const rank = (kind) => { const i = PRECEDENCE.indexOf(kind); return i < 0 ? PRECEDENCE.length : i; };
+function collapseByPrecedence(edges) {
+  const byPair = new Map();
+  for (const e of edges) {
+    const key = `${e.source}>${e.target}`;
+    const cur = byPair.get(key);
+    if (!cur) { byPair.set(key, { ...e, data: { ...e.data, kinds: { [e.data.kind]: e.data.count }, members: e.data.members ? [...e.data.members] : undefined } }); continue; }
+    cur.data.kinds[e.data.kind] = (cur.data.kinds[e.data.kind] || 0) + e.data.count;
+    cur.data.count += e.data.count;
+    if (cur.data.members && e.data.members) cur.data.members.push(...e.data.members);
+    if (rank(e.data.kind) < rank(cur.data.kind)) {
+      cur.data.kind = e.data.kind; cur.style = e.style; cur.markerEnd = e.markerEnd; cur.id = e.id;
+    }
+  }
+  return [...byPair.values()].map((e) => ({ ...e, style: { ...e.style, strokeWidth: 1.5 + Math.min(e.data.count, 12) * 0.25 } }));
+}
+
+function assignOffsets(edges) {
+  const groups = new Map();
+  for (const e of edges) {
+    const key = e.source < e.target ? `${e.source}|${e.target}` : `${e.target}|${e.source}`;
+    (groups.get(key) || groups.set(key, []).get(key)).push(e);
+  }
+  for (const g of groups.values()) {
+    g.forEach((e, i) => {
+      const sign = e.source < e.target ? 1 : -1;
+      e.data.offset = sign * (i - (g.length - 1) / 2) * 10;
+    });
+  }
+  return edges;
+}
+
+function mkNode(ent, dir) {
+  return {
+    id: String(ent.id), type: 'entity', position: { x: 0, y: 0 }, data: ent,
+    // Explicit dimensions make every node "initialized" up front. Without
+    // them, onlyRenderVisibleElements leaves off-screen nodes unmeasured and
+    // fitView (which skips unmeasured nodes) frames only what is on screen.
+    width: estWidth(ent.name), height: NODE_H,
+    sourcePosition: dir === 'LR' ? Position.Right : Position.Bottom,
+    targetPosition: dir === 'LR' ? Position.Left : Position.Top,
+  };
+}
+function mkRefEdge(source, target, kind, count = 1) {
+  const color = edgeColor(kind);
+  return {
+    id: `r-${source}-${target}-${kind}`, source, target, type: 'ref',
+    data: { kind, ref: true, offset: 0, count },
+    style: { stroke: color, strokeWidth: 1.5 + Math.min(count, 12) * 0.25 },
+    markerEnd: { type: MarkerType.ArrowClosed, color, width: 16, height: 16 },
+  };
+}
+function mkContainEdge(parent, child) {
+  return {
+    id: `c-${parent}-${child}`, source: String(parent), target: String(child), type: 'ref',
+    data: { kind: 'contains', ref: false, offset: 0 }, style: { stroke: '#b0b4bb', strokeDasharray: '4 3' },
+  };
+}
+
+// Raw mode ranks on containment only: ranking on references too makes dagre
+// slow and the tree very wide, so references are drawn but not fed to dagre.
+function buildModel(graph, coalesced, view, dir, bundle, onePerPair) {
+  const finish = (refs) => assignOffsets(onePerPair ? collapseByPrecedence(refs) : refs);
+  if (view === 'raw') {
+    const nodes = graph.nodes.map((n) => mkNode(n, dir));
+    const contain = graph.nodes.filter((n) => n.parent != null).map((n) => mkContainEdge(n.parent, n.id));
+    const refs = finish(graph.references.map((e) => mkRefEdge(String(e.from), String(e.to), e.kind)));
+    return { nodes, edges: [...contain, ...refs], rankEdges: contain };
+  }
+  if (!coalesced) return { nodes: [], edges: [], rankEdges: [] };
+  // Every ancestor of a leaf is an entity the user has zoomed into; draw it
+  // as a container around its descendants. Roots are skipped: a box around
+  // the whole diagram says nothing.
+  const containers = new Map();
+  for (const id of coalesced.leaves) {
+    for (let p = graph.nodes[id]?.parent; p != null; p = graph.nodes[p].parent) {
+      if (graph.nodes[p].parent != null) containers.set(p, graph.nodes[p]);
+    }
+  }
+  const boxId = (id) => (containers.has(id) ? `c${id}` : undefined);
+  // Parents must precede children in the node list; walking ancestors from
+  // the leaves builds the map deepest-first, so sort by depth.
+  const depth = (n) => { let d = 0; for (let p = n.parent; p != null; p = graph.nodes[p].parent) d++; return d; };
+  const boxes = [...containers.values()].sort((a, b) => depth(a) - depth(b)).map((ent) => ({
+    id: `c${ent.id}`, type: 'container', position: { x: 0, y: 0 }, data: ent,
+    parentId: boxId(ent.parent), width: 200, height: 100, selectable: true,
+  }));
+  const hasChildren = new Set(graph.nodes.filter((n) => n.parent != null).map((n) => n.parent));
+  const leaves = coalesced.leaves.map((id) => graph.nodes[id]).filter(Boolean)
+    .map((n) => ({
+      ...mkNode(n, dir), parentId: boxId(n.parent),
+      data: { ...n, zoomable: hasChildren.has(n.id) },
+    }));
+  if (!bundle) {
+    const edges = finish(coalesced.edges.map((e) => mkRefEdge(String(e.from), String(e.to), e.kind)));
+    return { nodes: [...boxes, ...leaves], edges, rankEdges: edges };
+  }
+  // Lift each leaf-to-leaf edge to the pair of siblings at the level where the
+  // two sides meet (a box and a node, or two boxes), then bundle per kind. Every
+  // drawn edge then lives inside one layout level, so it can be routed there
+  // instead of crossing whatever lies between two distant leaves.
+  const chain = (leaf) => {
+    const out = [{ id: String(leaf), parent: boxId(graph.nodes[leaf].parent) ?? null }];
+    for (let p = graph.nodes[leaf].parent; p != null && containers.has(p); p = graph.nodes[p].parent) {
+      out.push({ id: `c${p}`, parent: boxId(graph.nodes[p].parent) ?? null });
+    }
+    return out;
+  };
+  const bundles = new Map();
+  for (const e of coalesced.edges) {
+    const cf = chain(e.from), ct = chain(e.to);
+    let pair = null;
+    for (const a of cf) { const b = ct.find((x) => x.parent === a.parent); if (b) { pair = [a.id, b.id]; break; } }
+    if (!pair || pair[0] === pair[1]) continue;
+    const key = `${pair[0]}|${pair[1]}|${e.kind}`;
+    const b = bundles.get(key) || bundles.set(key, { source: pair[0], target: pair[1], kind: e.kind, members: [] }).get(key);
+    b.members.push(e);
+  }
+  const edges = finish([...bundles.values()].map((b) => {
+    const edge = mkRefEdge(b.source, b.target, b.kind, b.members.length);
+    edge.data.members = b.members;
+    return edge;
+  }));
+  return { nodes: [...boxes, ...leaves], edges, rankEdges: edges };
+}
+
+// Bottom-up layout: each container's direct children are laid out on their
+// own, ranked only by the edges among them (an edge into another box is
+// lifted to that box). The finished container is then a fixed-size node at
+// the level above. Dagre's compound mode was tried first and ranks globally,
+// so one edge to a far-away node stretched a whole box tall and thin.
+const PAD = 10, LABEL_H = 18;
+function layout(nodes, rankEdges, dir) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const byParent = new Map();
+  for (const n of nodes) {
+    const key = n.parentId ?? null;
+    (byParent.get(key) || byParent.set(key, []).get(key)).push(n);
+  }
+  // The child of `level` that contains `id`, or null when `id` is elsewhere.
+  const liftTo = (id, level) => {
+    let cur = byId.get(id);
+    while (cur && (cur.parentId ?? null) !== level) cur = byId.get(cur.parentId);
+    return cur ? cur.id : null;
+  };
+
+  const size = new Map(), pos = new Map(), dirOf = new Map();
+  const run = (kids, edges, rankdir, spacing) => {
+    const g = new dagre.graphlib.Graph();
+    g.setGraph({ rankdir, marginx: 0, marginy: 0, ...spacing });
+    g.setDefaultEdgeLabel(() => ({}));
+    for (const k of kids) {
+      const s = k.type === 'container' ? size.get(k.id) : { w: k.width, h: k.height };
+      g.setNode(k.id, { width: s.w, height: s.h });
+    }
+    for (const [a, b] of edges) g.setEdge(a, b);
+    dagre.layout(g);
+    let w = 0, h = 0;
+    for (const k of kids) { const p = g.node(k.id); w = Math.max(w, p.x + p.width / 2); h = Math.max(h, p.y + p.height / 2); }
+    return { g, w, h };
+  };
+  const place = (level) => {
+    const kids = byParent.get(level) || [];
+    for (const k of kids) if (k.type === 'container') place(k.id);
+    const seen = new Set(), edges = [];
+    for (const e of rankEdges) {
+      const a = liftTo(e.source, level), b = liftTo(e.target, level);
+      if (!a || !b || a === b || seen.has(`${a}>${b}`)) continue;
+      seen.add(`${a}>${b}`);
+      edges.push([a, b]);
+    }
+    let best;
+    if (level === null) {
+      best = { ...run(kids, edges, dir, { nodesep: 36, ranksep: 64 }), rankdir: dir };
+    } else {
+      // A dependency chain inside a box makes dagre stack every node on its
+      // own rank. Rather than let that dictate a tall thin box, lay the box
+      // out both ways and keep the orientation nearest a wide, readable shape.
+      const target = Math.log(1.6);
+      for (const rankdir of ['TB', 'LR']) {
+        const r = { ...run(kids, edges, rankdir, { nodesep: 28, ranksep: 52 }), rankdir };
+        r.score = Math.abs(Math.log(r.w / r.h) - target);
+        if (!best || r.score < best.score) best = r;
+      }
+    }
+    dirOf.set(level, best.rankdir);
+    const inset = level === null ? { x: 0, y: 0 } : { x: PAD, y: PAD + LABEL_H };
+    for (const k of kids) {
+      const p = best.g.node(k.id);
+      pos.set(k.id, { x: p.x - p.width / 2 + inset.x, y: p.y - p.height / 2 + inset.y });
+    }
+    // Edges drawn between two direct children of this level take dagre's
+    // routing, which already bends around the ranks in between.
+    for (const e of rankEdges) {
+      if ((byId.get(e.source)?.parentId ?? null) !== level || (byId.get(e.target)?.parentId ?? null) !== level) continue;
+      const de = best.g.edge(e.source, e.target);
+      if (de?.points) routedLocal.set(e.id, { level, points: de.points.map((p) => ({ x: p.x + inset.x, y: p.y + inset.y })) });
+    }
+    if (level !== null) {
+      const label = estWidth(byId.get(level).data.name) + 30;
+      size.set(level, { w: Math.max(best.w + 2 * PAD, label), h: best.h + 2 * PAD + LABEL_H });
+    }
+  };
+  const routedLocal = new Map();
+  place(null);
+
+  const absCache = new Map();
+  const abs = (id) => {
+    if (id == null) return { x: 0, y: 0 };
+    if (!absCache.has(id)) {
+      const p = pos.get(id), o = abs(byId.get(id).parentId ?? null);
+      absCache.set(id, { x: p.x + o.x, y: p.y + o.y });
+    }
+    return absCache.get(id);
+  };
+  const routed = new Map();
+  for (const [id, r] of routedLocal) {
+    const o = abs(r.level);
+    const e = rankEdges.find((x) => x.id === id);
+    routed.set(id, {
+      points: r.points.map((p) => ({ x: p.x + o.x, y: p.y + o.y })),
+      at: { s: abs(e.source), t: abs(e.target) },
+    });
+  }
+
+  const laid = nodes.map((n) => {
+    const d = dirOf.get(n.parentId ?? null);
+    const out = {
+      ...n, position: pos.get(n.id),
+      sourcePosition: d === 'LR' ? Position.Right : Position.Bottom,
+      targetPosition: d === 'LR' ? Position.Left : Position.Top,
+    };
+    if (n.type === 'container') { const s = size.get(n.id); out.width = s.w; out.height = s.h; }
+    return out;
+  });
+  return { nodes: laid, routed };
+}
+
+function withRouting(edges, routed) {
+  return edges.map((e) => {
+    const r = routed.get(e.id);
+    return r ? { ...e, data: { ...e.data, ...r } } : { ...e, data: { ...e.data, points: undefined, at: undefined } };
+  });
+}
+
+// Drag invariant: a node stays inside its box, and boxes never overlap their
+// siblings. Rather than clamping the node at the box edge, the box grows to
+// keep containing it (and its parent grows in turn); the drag hits a wall
+// only when a grown or moved box would intersect a sibling. Boxes never
+// shrink during a drag; Re-layout recomputes them.
+function growContainers(state) {
+  const depth = (n) => { let d = 0; for (let p = n.parentId; p; p = state.get(p)?.parentId) d++; return d; };
+  const boxes = [...state.values()].filter((n) => n.type === 'container').sort((a, b) => depth(b) - depth(a));
+  for (const c of boxes) {
+    const kids = [...state.values()].filter((n) => n.parentId === c.id);
+    if (!kids.length) continue;
+    let left = 0, top = 0, right = c.width, bottom = c.height;
+    for (const k of kids) {
+      left = Math.min(left, k.position.x - PAD);
+      top = Math.min(top, k.position.y - PAD - LABEL_H);
+      right = Math.max(right, k.position.x + k.width + PAD);
+      bottom = Math.max(bottom, k.position.y + k.height + PAD);
+    }
+    if (left < 0 || top < 0) {
+      c.position = { x: c.position.x + left, y: c.position.y + top };
+      for (const k of kids) k.position = { x: k.position.x - left, y: k.position.y - top };
+    }
+    c.width = right - left;
+    c.height = bottom - top;
+  }
+}
+
+function violates(state, original) {
+  const changed = (n) => {
+    const o = original.get(n.id);
+    return !o || o.position.x !== n.position.x || o.position.y !== n.position.y || o.width !== n.width || o.height !== n.height;
+  };
+  const groups = new Map();
+  for (const n of state.values()) {
+    const key = n.parentId ?? null;
+    (groups.get(key) || groups.set(key, []).get(key)).push(n);
+  }
+  const eps = 0.5;
+  for (const sib of groups.values()) {
+    for (let i = 0; i < sib.length; i++) for (let j = i + 1; j < sib.length; j++) {
+      const a = sib[i], b = sib[j];
+      if (a.type !== 'container' && b.type !== 'container') continue;
+      if (!changed(a) && !changed(b)) continue;
+      const apart = a.position.x + a.width <= b.position.x + eps || b.position.x + b.width <= a.position.x + eps
+        || a.position.y + a.height <= b.position.y + eps || b.position.y + b.height <= a.position.y + eps;
+      if (!apart) return true;
+    }
+  }
+  return false;
+}
+
+// Applies proposed drag positions, letting boxes grow, and scales the move
+// back along each axis separately when it would breach a wall, so a node
+// dragged diagonally into a wall slides along it.
+function resolveDrag(nodes, proposals) {
+  const original = new Map(nodes.map((n) => [n.id, n]));
+  const attempt = (tx, ty) => {
+    const state = new Map(nodes.map((n) => [n.id, { ...n, position: { ...n.position } }]));
+    for (const [id, target] of proposals) {
+      const n = state.get(id);
+      if (n) n.position = { x: n.position.x + (target.x - n.position.x) * tx, y: n.position.y + (target.y - n.position.y) * ty };
+    }
+    growContainers(state);
+    return state;
+  };
+  const ok = (s) => !violates(s, original);
+  let state = attempt(1, 1);
+  if (!ok(state)) {
+    const maxT = (f) => { let lo = 0, hi = 1; for (let i = 0; i < 10; i++) { const m = (lo + hi) / 2; if (ok(f(m))) lo = m; else hi = m; } return lo; };
+    const tx = maxT((t) => attempt(t, 0)), ty = maxT((t) => attempt(0, t));
+    state = attempt(tx, ty);
+    if (!ok(state)) state = tx >= ty ? attempt(tx, 0) : attempt(0, ty);
+  }
+  return nodes.map((n) => state.get(n.id));
+}
+
+// Post-move edge routing. Dagre's points only describe the layout it
+// produced; once a node is dragged, the edges around it need a new route.
+// This finds the taut shortest path around the inflated sibling rectangles
+// at the edge's level (a visibility graph over their corners, nested boxes
+// opaque), then smooths it exactly like the dagre routes so the two are
+// indistinguishable in style: a curve that bends around obstacles and meets
+// each node straight on through a short perpendicular stub.
+const ROUTE_GAP = 14;
+function routeEdge(edge, nodes, abs) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const s = byId.get(edge.source), t = byId.get(edge.target);
+  if (!s || !t || (s.parentId ?? null) !== (t.parentId ?? null)) return null;
+  const level = s.parentId ?? null;
+  const rectOf = (n) => { const a = abs(n.id); return { x: a.x, y: a.y, r: a.x + n.width, b: a.y + n.height }; };
+  const grow = (o, m) => ({ x: o.x - m, y: o.y - m, r: o.r + m, b: o.b + m });
+  const handle = (o, pos) => pos === Position.Bottom ? { x: (o.x + o.r) / 2, y: o.b }
+    : pos === Position.Top ? { x: (o.x + o.r) / 2, y: o.y }
+    : pos === Position.Right ? { x: o.r, y: (o.y + o.b) / 2 } : { x: o.x, y: (o.y + o.b) / 2 };
+  const step = (p, pos, d) => pos === Position.Bottom ? { x: p.x, y: p.y + d } : pos === Position.Top ? { x: p.x, y: p.y - d }
+    : pos === Position.Right ? { x: p.x + d, y: p.y } : { x: p.x - d, y: p.y };
+  const sr = rectOf(s), tr = rectOf(t);
+  const sh = handle(sr, s.sourcePosition), th = handle(tr, t.targetPosition);
+  const sp = step(sh, s.sourcePosition, ROUTE_GAP), tp = step(th, t.targetPosition, ROUTE_GAP);
+
+  const region = grow({ x: Math.min(sr.x, tr.x, sp.x, tp.x), y: Math.min(sr.y, tr.y, sp.y, tp.y), r: Math.max(sr.r, tr.r, sp.x, tp.x), b: Math.max(sr.b, tr.b, sp.y, tp.y) }, 80);
+  const hits = (a, o) => a.x < o.r && o.x < a.r && a.y < o.b && o.y < a.b;
+  const obstacles = nodes
+    .filter((n) => (n.parentId ?? null) === level && n.id !== s.id && n.id !== t.id)
+    .map(rectOf).filter((o) => hits(o, region)).map((o) => grow(o, ROUTE_GAP - 2));
+  obstacles.push(grow(sr, ROUTE_GAP - 4), grow(tr, ROUTE_GAP - 4));
+  if (obstacles.length > 60) return null;
+
+  // Liang–Barsky style test: does the open segment enter a rectangle's interior?
+  const crosses = (p, q, o) => {
+    let t0 = 0, t1 = 1;
+    const dx = q.x - p.x, dy = q.y - p.y;
+    const clip = (num, den) => {
+      if (den === 0) return num <= 0;
+      const r = num / den;
+      if (den < 0) { if (r > t1) return false; if (r > t0) t0 = r; } else { if (r < t0) return false; if (r < t1) t1 = r; }
+      return true;
+    };
+    const e = 0.01;
+    return clip(p.x - (o.x + e), -dx) && clip((o.r - e) - p.x, dx) && clip(p.y - (o.y + e), -dy) && clip((o.b - e) - p.y, dy) && t0 < t1;
+  };
+  const inside = (pt) => obstacles.some((o) => pt.x > o.x && pt.x < o.r && pt.y > o.y && pt.y < o.b);
+  if (inside(sp) || inside(tp)) return null;
+  const verts = [sp, tp];
+  for (const o of obstacles) {
+    for (const c of [{ x: o.x, y: o.y }, { x: o.r, y: o.y }, { x: o.x, y: o.b }, { x: o.r, y: o.b }]) if (!inside(c)) verts.push(c);
+  }
+  const visible = (a, b) => !obstacles.some((o) => crosses(a, b, o));
+
+  // A* over the visibility graph with Euclidean lengths.
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const g = new Array(verts.length).fill(Infinity), prev = new Array(verts.length).fill(-1), closed = new Set();
+  g[0] = 0;
+  const open = [0];
+  let found = false;
+  while (open.length) {
+    let bi = 0;
+    for (let k = 1; k < open.length; k++) if (g[open[k]] + dist(verts[open[k]], tp) < g[open[bi]] + dist(verts[open[bi]], tp)) bi = k;
+    const u = open.splice(bi, 1)[0];
+    if (closed.has(u)) continue;
+    closed.add(u);
+    if (u === 1) { found = true; break; }
+    for (let v = 0; v < verts.length; v++) {
+      if (closed.has(v) || !visible(verts[u], verts[v])) continue;
+      const cand = g[u] + dist(verts[u], verts[v]);
+      if (cand < g[v]) { g[v] = cand; prev[v] = u; open.push(v); }
+    }
+  }
+  if (!found) return null;
+  const taut = [];
+  for (let v = 1; v !== -1; v = prev[v]) taut.unshift(verts[v]);
+
+  // Subdivide long legs so the midpoint smoothing rounds only the corners
+  // (radius about half a piece) and leaves straight runs straight.
+  const pts = [sh];
+  const chain = [sp, ...taut.slice(1, -1), tp];
+  for (let i = 0; i < chain.length; i++) {
+    const a = i === 0 ? sh : chain[i - 1], b = chain[i];
+    const n = Math.max(1, Math.round(dist(a, b) / 40));
+    for (let k = 1; k <= n; k++) pts.push({ x: a.x + (b.x - a.x) * k / n, y: a.y + (b.y - a.y) * k / n });
+  }
+  pts.push(th);
+  return pts;
+}
+
+// Re-route every routable edge that touches a dirty node or whose current
+// path runs through one; everything else keeps its route.
+function rerouteEdges(edges, nodes, dirty) {
+  const abs = absolutePositions(nodes);
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const dirtyRects = [...dirty].map((id) => byId.get(id)).filter(Boolean)
+    .map((n) => { const a = abs(n.id); return { x: a.x, y: a.y, r: a.x + n.width, b: a.y + n.height }; });
+  const crosses = (pts) => pts && pts.some((p, i) => i > 0 && dirtyRects.some((o) => {
+    const q = pts[i - 1];
+    return Math.min(p.x, q.x) < o.r && Math.max(p.x, q.x) > o.x && Math.min(p.y, q.y) < o.b && Math.max(p.y, q.y) > o.y;
+  }));
+  return edges.map((e) => {
+    if (!dirty.has(e.source) && !dirty.has(e.target) && !crosses(e.data.points)) return e;
+    const points = routeEdge(e, nodes, abs);
+    if (!points) return { ...e, data: { ...e.data, points: undefined, at: undefined } };
+    return { ...e, data: { ...e.data, points, at: { s: abs(e.source), t: abs(e.target) } } };
+  });
+}
+
+// Absolute (flow-space) top-left of a node whose position is relative to its
+// parent box, as React Flow stores it.
+function absolutePositions(nodes) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const cache = new Map();
+  const abs = (id) => {
+    if (id == null) return { x: 0, y: 0 };
+    if (!cache.has(id)) {
+      const n = byId.get(id), o = abs(n.parentId ?? null);
+      cache.set(id, { x: n.position.x + o.x, y: n.position.y + o.y });
+    }
+    return cache.get(id);
+  };
+  return abs;
+}
+
+const lerp = (a, b, t) => a + (b - a) * t;
+const easeInOut = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+const ANIM_MS = 350;
+
+// One frame of the old→new interpolation. Nodes that did not exist before
+// appear in place; routed edges interpolate their points only when the same
+// edge survived with the same shape, otherwise they draw as beziers until
+// the animation settles.
+function interpolate(prevNodes, prevEdges, finalNodes, finalEdges, t) {
+  const nodes = finalNodes.map((n) => {
+    const p = prevNodes.get(n.id);
+    if (!p) return n;
+    const out = { ...n, position: { x: lerp(p.position.x, n.position.x, t), y: lerp(p.position.y, n.position.y, t) } };
+    if (n.type === 'container' && p.width) { out.width = lerp(p.width, n.width, t); out.height = lerp(p.height, n.height, t); }
+    return out;
+  });
+  const edges = finalEdges.map((e) => {
+    if (!e.data.points) return e;
+    const p = prevEdges.get(e.id);
+    if (!p?.data?.points || p.data.points.length !== e.data.points.length) return { ...e, data: { ...e.data, points: undefined } };
+    const pt = (a, b) => ({ x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t) });
+    return { ...e, data: { ...e.data, points: e.data.points.map((q, i) => pt(p.data.points[i], q)), at: { s: pt(p.data.at.s, e.data.at.s), t: pt(p.data.at.t, e.data.at.t) } } };
+  });
+  return { nodes, edges };
+}
+
+async function readJson(res) {
+  try { return await res.json(); } catch { return null; }
+}
+async function fetchJson(url, init) {
+  const res = await fetch(url, init);
+  const body = await readJson(res);
+  if (!res.ok) {
+    const msg = body && body.error ? body.error : `${res.status} ${res.statusText}`.trim();
+    throw Object.assign(new Error(msg), { status: res.status, body });
+  }
+  return body;
+}
+
+function App() {
+  const { getViewport, setViewport } = useReactFlow();
+  const canvasRef = useRef(null);
+  const [view, setView] = useState('raw');
+  const [dir, setDir] = useState('TB');
+  const [graph, setGraph] = useState(null);
+  const [coalesced, setCoalesced] = useState(null);
+  const [nodes, setNodes] = useState([]);
+  const [edges, setEdges] = useState([]);
+  const [showContain, setShowContain] = useState(true);
+  const [showRefs, setShowRefs] = useState(true);
+  const [bundle, setBundle] = useState(true);
+  const [onePerPair, setOnePerPair] = useState(true);
+  const [selectedId, setSelectedId] = useState(null);
+  const [status, setStatus] = useState('');
+  const [panelError, setPanelError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    fetchJson('./graph.json').then(setGraph).catch((e) => setStatus(`graph.json: ${e.message}`));
+    fetchJson('./coalesced.json').then(setCoalesced).catch((e) => setStatus(`coalesced.json: ${e.message}`));
+  }, []);
+
+  const model = useMemo(
+    () => (graph ? buildModel(graph, coalesced, view, dir, bundle, onePerPair) : null),
+    [graph, coalesced, view, dir, bundle, onePerPair],
+  );
+
+  // Every layout change is animated: nodes glide from where they were to where
+  // they belong, and the viewport moves with them to the node the user acted
+  // on (focusRef holds candidate node ids, first existing one wins) or, with
+  // no focus, to the whole graph. A timer commits the final state even if
+  // animation frames never fire (background tab), so nothing is left midway.
+  const nodesRef = useRef(nodes); nodesRef.current = nodes;
+  const edgesRef = useRef(edges); edgesRef.current = edges;
+  const focusRef = useRef(null);
+  const animRef = useRef(0);
+
+  const transitionTo = (finalNodes, finalEdges, focusIds) => {
+    const token = ++animRef.current;
+    const prevNodes = new Map(nodesRef.current.map((n) => [n.id, n]));
+    const prevEdges = new Map(edgesRef.current.map((e) => [e.id, e]));
+    const abs = absolutePositions(finalNodes);
+
+    const el = canvasRef.current;
+    const W = el?.clientWidth || 800, H = el?.clientHeight || 600;
+    const focus = (focusIds || []).map((id) => finalNodes.find((n) => n.id === id)).find(Boolean);
+    let vp = null;
+    if (focus) {
+      const a = abs(focus.id);
+      // Never zoom out past what is needed to show the target, and zoom in
+      // no further than 1:1 so a small collapsed node does not fill the screen.
+      vp = getViewportForBounds({ x: a.x, y: a.y, width: focus.width, height: focus.height }, W, H, 0.05, Math.max(getViewport().zoom, 1), 0.3);
+    } else if (finalNodes.length) {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const n of finalNodes) {
+        if (n.parentId) continue;
+        const a = abs(n.id);
+        x0 = Math.min(x0, a.x); y0 = Math.min(y0, a.y); x1 = Math.max(x1, a.x + n.width); y1 = Math.max(y1, a.y + n.height);
+      }
+      vp = getViewportForBounds({ x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, W, H, 0.05, 2, 0.15);
+    }
+
+    let done = false;
+    const finish = () => {
+      if (done || animRef.current !== token) return;
+      done = true;
+      setNodes(finalNodes); setEdges(finalEdges);
+      if (vp) setViewport(vp);
+    };
+    if (!prevNodes.size) { finish(); return; }
+
+    if (vp) setViewport(vp, { duration: ANIM_MS });
+    const start = performance.now();
+    const step = () => {
+      if (done || animRef.current !== token) return;
+      const t = Math.min(1, (performance.now() - start) / ANIM_MS);
+      const f = interpolate(prevNodes, prevEdges, finalNodes, finalEdges, easeInOut(t));
+      setNodes(f.nodes); setEdges(f.edges);
+      if (t < 1) requestAnimationFrame(step); else finish();
+    };
+    requestAnimationFrame(step);
+    setTimeout(finish, ANIM_MS + 80);
+  };
+
+  useEffect(() => {
+    if (!model) return;
+    const laid = layout(model.nodes, model.rankEdges, dir);
+    setPanelError('');
+    // focusRef is not cleared here: with React batching, a follow-up zoom
+    // request can set the next focus before this effect has run for the
+    // previous one. Actions that want the whole graph clear it themselves.
+    transitionTo(laid.nodes, withRouting(model.edges, laid.routed), focusRef.current);
+  }, [model, dir]);
+
+  useEffect(() => {
+    if (selectedId != null && !nodes.some((n) => n.id === selectedId)) setSelectedId(null);
+  }, [nodes, selectedId]);
+
+  const switchView = (v) => { focusRef.current = null; setView(v); setStatus(''); };
+  const switchDir = (d) => { focusRef.current = null; setDir(d); };
+  const reset = () => { focusRef.current = null; return post('./coalesced/reset'); };
+  const toggleBundle = (on) => { focusRef.current = null; setBundle(on); };
+  const toggleOnePerPair = (on) => { focusRef.current = null; setOnePerPair(on); };
+
+  const relayout = () => {
+    if (!model) return;
+    const laid = layout(model.nodes, model.rankEdges, dir);
+    transitionTo(laid.nodes, withRouting(model.edges, laid.routed), null);
+  };
+
+  const visibleEdges = useMemo(
+    () => edges.map((e) => ({ ...e, hidden: e.data.ref ? !showRefs : !showContain })),
+    [edges, showContain, showRefs],
+  );
+
+  // Position changes go through the drag resolver instead of straight into
+  // the node list; everything else (selection, dragging flags) applies as-is.
+  // Nodes whose position or size changed during a drag are collected, and
+  // when the drag ends the edges around them are re-routed.
+  const dirtyRef = useRef(new Set());
+  const rerouteRef = useRef(false);
+  const onNodesChange = useCallback((changes) => setNodes((ns) => {
+    const moves = changes.filter((c) => c.type === 'position' && c.position);
+    const rest = changes.filter((c) => !(c.type === 'position' && c.position));
+    let next = ns;
+    if (moves.length) {
+      next = resolveDrag(ns, new Map(moves.map((c) => [c.id, c.position])));
+      ns.forEach((o, i) => {
+        const n = next[i];
+        if (o.position.x !== n.position.x || o.position.y !== n.position.y || o.width !== n.width || o.height !== n.height) dirtyRef.current.add(n.id);
+      });
+    }
+    if (changes.some((c) => c.type === 'position' && c.dragging === false) && dirtyRef.current.size) rerouteRef.current = true;
+    const flags = moves.filter((c) => c.dragging !== undefined).map((c) => ({ id: c.id, type: 'position', dragging: c.dragging }));
+    return applyNodeChanges([...rest, ...flags], next);
+  }), []);
+  useEffect(() => {
+    if (!rerouteRef.current) return;
+    rerouteRef.current = false;
+    const dirty = dirtyRef.current;
+    dirtyRef.current = new Set();
+    setEdges((es) => rerouteEdges(es, nodes, dirty));
+  }, [nodes]);
+  const onEdgesChange = useCallback((c) => setEdges((es) => applyEdgeChanges(c, es)), []);
+  const onNodeClick = useCallback((_, n) => { setSelectedId(n.id); setPanelError(''); }, []);
+  const onPaneClick = useCallback(() => setSelectedId(null), []);
+
+  const post = async (path) => {
+    setBusy(true); setPanelError(''); setStatus('');
+    try {
+      const co = await fetchJson(path, { method: 'POST' });
+      setCoalesced(co);
+      return co;
+    } catch (e) {
+      if (e.status === 409) setPanelError(e.message);
+      else setStatus(`POST ${path}: ${e.message}`);
+      return null;
+    } finally { setBusy(false); }
+  };
+
+  // The server only zooms out one leaf at a time, and that collapses the
+  // leaf's parent. Closing a box whose children are themselves expanded
+  // therefore means collapsing the deepest leaves first, one request each,
+  // until nothing under the box is a leaf any more.
+  const isUnder = (id, boxId) => {
+    for (let p = graph.nodes[id]?.parent; p != null; p = graph.nodes[p].parent) if (p === boxId) return true;
+    return false;
+  };
+  const depthOf = (id) => { let d = 0; for (let p = graph.nodes[id]?.parent; p != null; p = graph.nodes[p].parent) d++; return d; };
+  const collapse = async (boxId) => {
+    let co = coalesced;
+    while (co) {
+      const under = co.leaves.filter((l) => isUnder(l, boxId));
+      if (!under.length) return;
+      const deepest = under.reduce((a, b) => (depthOf(b) > depthOf(a) ? b : a));
+      // The box stays a container until the last step, then becomes a leaf.
+      focusRef.current = [`c${boxId}`, String(boxId)];
+      co = await post(`./coalesced/zoom-out?id=${deepest}`);
+    }
+  };
+  actions.zoomIn = (id) => { focusRef.current = [`c${id}`]; return post(`./coalesced/zoom-in?id=${id}`); };
+  actions.collapse = collapse;
+
+  const selectedNode = selectedId != null ? nodes.find((n) => n.id === selectedId) : null;
+  const selected = selectedNode ? selectedNode.data : null;
+  const isBox = selectedNode?.type === 'container';
+  const nameOf = (id) => graph?.nodes[id]?.name ?? `#${id}`;
+  const rawRefs = view === 'raw' ? graph?.references : coalesced?.edges;
+  // Leaves list their true leaf-level references; a box lists the bundles
+  // drawn to and from it, since those are what the diagram shows for it.
+  const drawnFor = (side) => edges.filter((e) => e.data.ref && e[side] === selectedId)
+    .map((e) => ({ kind: e.data.kind, count: e.data.count, kinds: e.data.kinds, other: e[side === 'source' ? 'target' : 'source'] }));
+  const incoming = !selected ? [] : isBox ? drawnFor('target') : (rawRefs || []).filter((e) => e.to === selected.id).map((e) => ({ kind: e.kind, other: String(e.from) }));
+  const outgoing = !selected ? [] : isBox ? drawnFor('source') : (rawRefs || []).filter((e) => e.from === selected.id).map((e) => ({ kind: e.kind, other: String(e.to) }));
+  const labelOf = (nodeId) => nodes.find((n) => n.id === nodeId)?.data.name ?? nameOf(Number(nodeId));
+  const children = selected && (view === 'raw' || isBox) ? graph.nodes.filter((n) => n.parent === selected.id) : [];
+
+  const edgeList = (list) => list.length
+    ? html`<ul>${list.map((e, i) => html`<li key=${i}>
+        <span class="tag" style=${{ background: edgeColor(e.kind) }}>${e.kind}${e.count > 1 ? ` ×${e.count}` : ''}</span>
+        <button onClick=${() => setSelectedId(e.other)}>${labelOf(e.other)}</button>
+        ${e.kinds && Object.keys(e.kinds).length > 1 && html`<span class="meta">${Object.entries(e.kinds).map(([k, c]) => `${k} ${c}`).join(', ')}</span>`}
+      </li>`)}</ul>`
+    : html`<div class="empty">none</div>`;
+
+  return html`<div class="app">
+    <div class="toolbar">
+      <div class="seg">
+        <button class=${view === 'raw' ? 'on' : ''} onClick=${() => switchView('raw')}>Raw</button>
+        <button class=${view === 'coalesced' ? 'on' : ''} onClick=${() => switchView('coalesced')}>Coalesced</button>
+      </div>
+      <div class="seg">
+        <button class=${dir === 'TB' ? 'on' : ''} onClick=${() => switchDir('TB')}>TB</button>
+        <button class=${dir === 'LR' ? 'on' : ''} onClick=${() => switchDir('LR')}>LR</button>
+      </div>
+      <button class="btn" onClick=${relayout}>Re-layout</button>
+      ${view === 'coalesced' && html`<button class="btn" disabled=${busy} onClick=${reset}>Reset</button>`}
+      <div class="sep"></div>
+      ${view === 'raw' && html`<label class="chk"><input type="checkbox" checked=${showContain} onChange=${(e) => setShowContain(e.target.checked)} /> containment edges</label>`}
+      <label class="chk"><input type="checkbox" checked=${showRefs} onChange=${(e) => setShowRefs(e.target.checked)} /> reference edges</label>
+      ${view === 'coalesced' && html`<label class="chk" title="Draw edges between boxes instead of between the leaves inside them"><input type="checkbox" checked=${bundle} onChange=${(e) => toggleBundle(e.target.checked)} /> bundle across boxes</label>`}
+      <label class="chk" title=${'Keep only the strongest kind between a pair: ' + PRECEDENCE.join(' > ')}><input type="checkbox" checked=${onePerPair} onChange=${(e) => toggleOnePerPair(e.target.checked)} /> one edge per pair</label>
+      <span style=${{ color: 'var(--muted)' }}>${nodes.filter((n) => n.type !== 'container').length} nodes · ${visibleEdges.filter((e) => !e.hidden).length} edges</span>
+      ${status && html`<div class="status" title=${status}>${status}</div>`}
+    </div>
+    <div class="main">
+      <div class="canvas" ref=${canvasRef}>
+        <${ReactFlow}
+          nodes=${nodes} edges=${visibleEdges} nodeTypes=${nodeTypes} edgeTypes=${edgeTypes}
+          onNodesChange=${onNodesChange} onEdgesChange=${onEdgesChange}
+          onNodeClick=${onNodeClick} onPaneClick=${onPaneClick}
+          nodesDraggable=${true} nodesConnectable=${false} elementsSelectable=${true}
+          panOnScroll=${true} panOnScrollMode="free" zoomOnScroll=${false} zoomOnPinch=${true}
+          zoomActivationKeyCode="Control" zoomOnDoubleClick=${false}
+          panOnDrag=${[1, 2]} selectionOnDrag=${true} selectionMode="partial"
+          onlyRenderVisibleElements=${true} minZoom=${0.05} proOptions=${{ hideAttribution: true }}
+        >
+          <${Controls} showInteractive=${false} />
+          <${Background} gap=${20} color="#dcdfe4" />
+        <//>
+      </div>
+      <div class="panel">
+        ${selected ? html`
+          <h2>${selected.name}</h2>
+          <div class="meta">${selected.path}</div>
+          <div class="meta">${selected.kind}${selected.line_end > 0 ? ` · lines ${selected.line_start}–${selected.line_end}` : ''} · id ${selected.id}</div>
+          ${panelError && html`<div class="err">${panelError}</div>`}
+          <h3>Outgoing (${outgoing.length})</h3>${edgeList(outgoing)}
+          <h3>Incoming (${incoming.length})</h3>${edgeList(incoming)}
+          ${(view === 'raw' || isBox) && html`<h3>Children (${children.length})</h3>
+            ${children.length
+              ? html`<ul>${children.map((c) => html`<li key=${c.id}><span class="meta">${c.kind}</span><button onClick=${() => setSelectedId(nodes.some((n) => n.id === `c${c.id}`) ? `c${c.id}` : String(c.id))}>${c.name}</button></li>`)}</ul>`
+              : html`<div class="empty">none</div>`}`}
+        ` : html`<div class="empty">Click a node to inspect it. In the coalesced view, + on a node expands it and − on a box collapses it. Drag on empty canvas to select; middle/right-drag or space+drag to pan; ctrl+wheel to zoom.</div>`}
+        <div class="legend">
+          ${Object.entries(EDGE_COLOR).map(([k, c]) => html`<span key=${k}><i style=${{ background: c }}></i>${k}</span>`)}
+          <span><i style=${{ background: '#b0b4bb' }}></i>contains</span>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+createRoot(document.getElementById('root')).render(html`<${ReactFlowProvider}><${App} /><//>`);
+</script>
+</body>
+</html>

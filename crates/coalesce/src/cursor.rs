@@ -1,4 +1,6 @@
-use crate::graph::entity::{EntityGraph, EntityId, ReferenceId};
+use std::collections::HashSet;
+
+use entity_graph::{EntityGraph, EntityId, ReferenceId, ReferenceKind};
 
 /// A reference tracked within the cursor's context.
 ///
@@ -8,6 +10,7 @@ use crate::graph::entity::{EntityGraph, EntityId, ReferenceId};
 pub struct CursorReference {
     /// ID of the reference in the entity graph.
     pub reference_id: ReferenceId,
+    pub kind: ReferenceKind,
     /// Lineage from root to the source entity.
     pub from_lineage: Vec<EntityId>,
     /// Lineage from root to the target entity.
@@ -16,6 +19,21 @@ pub struct CursorReference {
     pub from_leaf: EntityId,
     /// Which cursor leaf the target entity is under (by EntityId).
     pub to_leaf: EntityId,
+}
+
+/// One reference edge as seen at the current zoom level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoalescedEdge {
+    pub from: EntityId,
+    pub to: EntityId,
+    pub kind: ReferenceKind,
+}
+
+/// Snapshot of what is in view: see [`Cursor::coalesced`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Coalesced {
+    pub leaves: Vec<EntityId>,
+    pub edges: Vec<CoalescedEdge>,
 }
 
 /// Navigation cursor through the entity graph's containment hierarchy.
@@ -70,6 +88,7 @@ impl Cursor {
 
             references.push(CursorReference {
                 reference_id: ReferenceId(idx),
+                kind: reference.kind,
                 from_lineage,
                 to_lineage,
                 from_leaf,
@@ -130,18 +149,6 @@ impl Cursor {
         false
     }
 
-    /// Recursively collect all descendants of an entity.
-    fn collect_all_descendants(entity_id: EntityId, graph: &EntityGraph) -> Vec<EntityId> {
-        let mut descendants = Vec::new();
-        if let Some(entity) = graph.get(entity_id) {
-            for child in &entity.children {
-                descendants.push(*child);
-                descendants.extend(Self::collect_all_descendants(*child, graph));
-            }
-        }
-        descendants
-    }
-
     /// Move a specific leaf up one level in the containment hierarchy.
     ///
     /// Collapses the given leaf to its parent. The leaf is replaced with its parent,
@@ -181,6 +188,38 @@ impl Cursor {
     /// Get the current active leaves.
     pub fn active(&self) -> &[EntityId] {
         &self.leaves
+    }
+
+    /// The view at the current zoom: every active leaf, plus every reference
+    /// projected onto the leaves that contain its endpoints.
+    ///
+    /// References whose endpoints fall under the same leaf collapse into
+    /// self-loops and are dropped; the rest are deduplicated on
+    /// `(from, to, kind)`, first occurrence wins. Needs no `&EntityGraph`
+    /// because the projection was maintained incrementally by `move_down` /
+    /// `move_up`.
+    ///
+    /// Gotcha: a reference whose endpoint *is* an expanded entity (e.g. a
+    /// file-level import once that file is zoomed into) has no child to land
+    /// on, so its leaf pointer stays on the now-inactive entity. Such an edge
+    /// can name an endpoint that is not in `leaves`.
+    pub fn coalesced(&self) -> Coalesced {
+        // A reference whose endpoint *is* an expanded entity (a file-level
+        // import after zooming into that file) has no leaf to live on: the
+        // lineage ends at the old leaf, so split_references_down leaves it
+        // pointing at an inactive entity. Such edges are not drawable and are
+        // dropped here so `edges` is always within `leaves x leaves`.
+        let active: HashSet<EntityId> = self.leaves.iter().copied().collect();
+        let mut seen = HashSet::new();
+        let edges = self
+            .references
+            .iter()
+            .filter(|r| r.from_leaf != r.to_leaf)
+            .filter(|r| active.contains(&r.from_leaf) && active.contains(&r.to_leaf))
+            .map(|r| CoalescedEdge { from: r.from_leaf, to: r.to_leaf, kind: r.kind })
+            .filter(|e| seen.insert((e.from, e.to, e.kind)))
+            .collect();
+        Coalesced { leaves: self.leaves.clone(), edges }
     }
 
     // Reference update helpers

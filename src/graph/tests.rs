@@ -1,23 +1,8 @@
-use std::ops::Range;
-use std::path::PathBuf;
+use entity_graph::test_support::make_entity;
 
-use super::entity::{Entity, EntityGraph, EntityId, EntityKind, Reference, ReferenceKind, ReferenceId};
-use super::cursor::Cursor;
+use super::entity::{EntityGraph, EntityId, EntityKind, Reference, ReferenceKind};
 use super::navigator::Navigator;
 use super::tree::{GraphTree, GraphTreeNodeId, NodeKind};
-
-fn make_entity(id: usize, name: &str, kind: EntityKind, parent: Option<EntityId>) -> Entity {
-    Entity {
-        id: EntityId(id),
-        kind,
-        name: name.to_string(),
-        parent,
-        children: Vec::new(),
-        path: PathBuf::from(format!("{}.rs", name)),
-        byte_range: Range { start: 0, end: 0 },
-        line_range: Range { start: 0, end: 0 },
-    }
-}
 
 #[test]
 fn test_entity_graph_get() {
@@ -34,125 +19,6 @@ fn test_entity_graph_get() {
     assert!(graph.get(EntityId(0)).is_some());
     assert!(graph.get(EntityId(1)).is_some());
     assert!(graph.get(EntityId(999)).is_none());
-}
-
-#[test]
-fn test_cursor_initialization() {
-    let mut graph = EntityGraph {
-        entities: vec![
-            make_entity(0, "root", EntityKind::Folder, None),
-            make_entity(1, "child", EntityKind::Module, Some(EntityId(0))),
-        ],
-        references: Vec::new(),
-    };
-
-    graph.entities[0].children.push(EntityId(1));
-
-    let cursor = Cursor::new(&graph);
-
-    assert_eq!(cursor.active(), &[EntityId(0)]);
-    assert_eq!(cursor.references.len(), 0);
-}
-
-#[test]
-fn test_cursor_with_references() {
-    let mut graph = EntityGraph {
-        entities: vec![
-            make_entity(0, "root", EntityKind::Folder, None),
-            make_entity(1, "module_a", EntityKind::Module, Some(EntityId(0))),
-            make_entity(2, "module_b", EntityKind::Module, Some(EntityId(0))),
-        ],
-        references: vec![Reference {
-            from: EntityId(1),
-            to: EntityId(2),
-            kind: ReferenceKind::Call,
-        }],
-    };
-
-    graph.entities[0].children = vec![EntityId(1), EntityId(2)];
-
-    let cursor = Cursor::new(&graph);
-
-    assert_eq!(cursor.references.len(), 1);
-    assert_eq!(cursor.references[0].reference_id, ReferenceId(0));
-}
-
-#[test]
-fn test_cursor_move_down() {
-    let mut graph = EntityGraph {
-        entities: vec![
-            make_entity(0, "root", EntityKind::Folder, None),
-            make_entity(1, "module", EntityKind::Module, Some(EntityId(0))),
-            make_entity(2, "class_a", EntityKind::Class, Some(EntityId(1))),
-            make_entity(3, "class_b", EntityKind::Class, Some(EntityId(1))),
-        ],
-        references: Vec::new(),
-    };
-
-    graph.entities[0].children = vec![EntityId(1)];
-    graph.entities[1].children = vec![EntityId(2), EntityId(3)];
-
-    let mut cursor = Cursor::new(&graph);
-    let result = cursor.move_down(EntityId(0), &graph);
-
-    assert!(result);
-    assert_eq!(cursor.active().len(), 1);
-    assert_eq!(cursor.active()[0], EntityId(1));
-}
-
-#[test]
-fn test_cursor_move_down_no_children() {
-    let graph = EntityGraph {
-        entities: vec![make_entity(0, "leaf", EntityKind::Function, None)],
-        references: Vec::new(),
-    };
-
-    let mut cursor = Cursor::new(&graph);
-    let result = cursor.move_down(EntityId(0), &graph);
-
-    assert!(!result);
-    assert_eq!(cursor.active(), &[EntityId(0)]);
-}
-
-#[test]
-fn test_cursor_move_up() {
-    let mut graph = EntityGraph {
-        entities: vec![
-            make_entity(0, "root", EntityKind::Folder, None),
-            make_entity(1, "module", EntityKind::Module, Some(EntityId(0))),
-            make_entity(2, "class_a", EntityKind::Class, Some(EntityId(1))),
-            make_entity(3, "class_b", EntityKind::Class, Some(EntityId(1))),
-        ],
-        references: Vec::new(),
-    };
-
-    graph.entities[0].children = vec![EntityId(1)];
-    graph.entities[1].children = vec![EntityId(2), EntityId(3)];
-
-    let mut cursor = Cursor::new(&graph);
-    cursor.move_down(EntityId(0), &graph);
-    cursor.move_down(EntityId(1), &graph);
-
-    assert_eq!(cursor.active().len(), 2);
-
-    let result = cursor.move_up(EntityId(2), &graph);
-
-    assert!(result);
-    assert_eq!(cursor.active(), &[EntityId(1)]);
-}
-
-#[test]
-fn test_cursor_move_up_at_root() {
-    let graph = EntityGraph {
-        entities: vec![make_entity(0, "root", EntityKind::Folder, None)],
-        references: Vec::new(),
-    };
-
-    let mut cursor = Cursor::new(&graph);
-    let result = cursor.move_up(EntityId(0), &graph);
-
-    assert!(!result);
-    assert_eq!(cursor.active(), &[EntityId(0)]);
 }
 
 #[test]

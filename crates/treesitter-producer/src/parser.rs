@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::{Language, Node, Parser};
 
-use crate::app::tree::{CodeTree, NodeKind, ReferenceKind};
+use crate::tree::{CodeTree, NodeKind, ReferenceKind};
 
 /// Supported source languages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1046,7 +1046,7 @@ SELECT id, name FROM users;
             !refs.is_empty(),
             "Expected at least one reference edge in the graph"
         );
-        // Each file still keeps its own constructs (no SymRef mutation).
+        // Each file still keeps its own constructs.
         let all = tree.all_nodes_dfs();
         let fn_count = all.iter().filter(|n| n.kind == NodeKind::Function).count();
         assert!(fn_count >= 2, "Both files should have their own function nodes");

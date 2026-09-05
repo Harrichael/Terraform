@@ -91,18 +91,23 @@ Folder → Module → File → Class/Struct → Function/Method → Block (if/fo
 
 ## Architecture
 
+A Cargo workspace. Producers build an `EntityGraph`; consumers read it and
+never learn which producer built it.
+
 ```
-src/
-├── main.rs          # Entry point, terminal setup, render loop
-├── app/
-│   ├── tree.rs      # CodeNode, CodeTree — data model with granularity + SymRef
-│   └── state.rs     # AppState — cursor, filter, mode, directory/file loading
-├── parser/
-│   └── mod.rs       # Tree-sitter integration, directory walker, SymRef deduplication
-└── ui/
-    ├── mod.rs        # Public UI surface
-    ├── mod_impl.rs   # ratatui rendering (tree panel, Lib section, status bar, help)
-    └── events.rs     # Keyboard event handling
+crates/
+├── entity-graph/         # The contract: Entity, EntityGraph, Reference (+ test_support fixtures)
+├── treesitter-producer/  # Source files → EntityGraph via tree-sitter; one fn: graph_from_path
+├── coalesce/             # Cursor: which entities are in view at this zoom, and the edges between them
+├── scip-producer/        # (in progress) SCIP index → EntityGraph
+└── graph-server/         # (in progress) localhost viewer for an EntityGraph
+src/                      # The TUI (bin `terraform`)
+├── main.rs               # Entry point, terminal setup, render loop
+├── app/state.rs          # AppState — loading, zoom/fold navigation state
+├── graph/
+│   ├── navigator.rs      # Projects the coalesced view into a renderable GraphTree
+│   └── tree.rs           # GraphTree — spanning-forest layout of the reference graph
+└── ui/                   # ratatui rendering and keyboard handling
 ```
 
 ### Node Kinds
@@ -116,7 +121,6 @@ src/
 | `Function` | `fn`, method, `def`, TypeScript method signature |
 | `Block` | `if`/`for`/`while`/`match`/`switch` constructs, SQL statements |
 | `Line` | Individual source lines |
-| `SymRef` | Symbolic reference pointing to a canonical lib definition |
 
 ---
 
