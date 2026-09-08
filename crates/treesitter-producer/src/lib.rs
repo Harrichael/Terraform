@@ -40,7 +40,11 @@ pub fn graph_from_path(path: &Path) -> Result<EntityGraph> {
     } else {
         parser::parse_directory(path)?
     };
-    Ok(builder::code_tree_to_entity_graph(&tree))
+    let mut graph = builder::code_tree_to_entity_graph(&tree);
+    // A single-file load has the file as root, so its relative path is empty.
+    let file_of = |rel: &Path| if path.is_file() { path.to_path_buf() } else { path.join(rel) };
+    entity_graph::test_code::mark(&mut graph, |rel| std::fs::read_to_string(file_of(rel)).ok());
+    Ok(graph)
 }
 
 #[cfg(test)]
@@ -82,10 +86,37 @@ mod tests {
         assert_eq!((r.from, r.to, r.kind), (by_name("main"), by_name("compute"), ReferenceKind::Call));
         assert_eq!(r.sites, vec![Site { line: 1 }, Site { line: 3 }]);
 
+        assert!(graph.entities.iter().all(|e| !e.is_test));
+
         let single = graph_from_path(&project.join("main.rs")).unwrap();
         let root = single.entities.iter().find(|e| e.parent.is_none()).unwrap();
         assert_eq!((root.kind, root.name.as_str()), (EntityKind::File, "main.rs"));
         assert_eq!(root.children.len(), 1);
         assert_eq!(single.file_path(root.id), Some(PathBuf::new()));
+    }
+
+    /// Test marking through the real parser: tree-sitter leaves attributes
+    /// outside the item, so the classifier has to look above the start line;
+    /// an integration-test folder marks everything beneath it.
+    #[test]
+    fn test_code_is_marked_from_attributes_and_paths() {
+        let dir = TempDir::new().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(project.join("tests")).unwrap();
+        std::fs::write(project.join("tests/it.rs"), "fn helper() {}\n").unwrap();
+        std::fs::write(
+            project.join("lib.rs"),
+            "pub fn work() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn checks_work() { work(); }\n}\n",
+        )
+        .unwrap();
+
+        let graph = graph_from_path(&project).unwrap();
+        let mut flagged: Vec<&str> = graph.entities.iter().filter(|e| e.is_test).map(|e| e.name.as_str()).collect();
+        flagged.sort();
+        assert_eq!(flagged, ["checks_work", "helper", "it.rs", "tests", "tests"]);
+        assert!(!graph.entities.iter().any(|e| e.name == "work" && e.is_test));
+
+        let single = graph_from_path(&project.join("lib.rs")).unwrap();
+        assert!(single.entities.iter().any(|e| e.name == "checks_work" && e.is_test));
     }
 }

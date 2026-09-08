@@ -77,7 +77,9 @@
   .ent { position: relative; border: 1.5px solid #999; border-radius: 6px; padding: 5px 10px; background: #fff; min-width: 90px; max-width: 320px; box-shadow: 0 1px 2px rgba(0,0,0,.08); box-sizing: border-box; height: 100%; }
   .zoom { position: absolute; top: -8px; right: -8px; width: 18px; height: 18px; border-radius: 50%; border: 1px solid #b8bcc4; background: #fff; color: var(--text); font: 13px/16px monospace; padding: 0; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.15); }
   .zoom:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .box .zoom { top: 2px; right: 4px; }
+  .box-actions { position: absolute; top: 2px; right: 4px; display: flex; gap: 4px; }
+  .box-actions .zoom { position: static; }
+  .zoom.on { background: var(--text); color: #fff; border-color: var(--text); }
   .edge-count { font: 600 10px sans-serif; text-anchor: middle; dominant-baseline: middle; paint-order: stroke; stroke: #fff; stroke-width: 3px; pointer-events: none; }
   .ent-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .ent-sub { font-size: 10px; color: var(--muted); white-space: nowrap; }
@@ -95,6 +97,9 @@
   .box.kind-class    { background: rgba(126,87,194,.07);  border-color: #7e57c2; }
   .box.kind-function { background: rgba(160,164,171,.07); border-color: #a0a4ab; }
   .react-flow__node.selected .box { box-shadow: 0 0 0 2px var(--accent); }
+  .ent.is-test { background: #f1f5fb; border-style: dotted; }
+  .box.is-test { background: rgba(90, 120, 190, .05); border-style: dotted; }
+  .ent.is-test .ent-sub::after { content: ' · test'; color: #5a78be; }
   .react-flow__handle { opacity: 0; pointer-events: none; }
   .react-flow__node { cursor: grab; }
 </style>
@@ -133,16 +138,18 @@ const changeColor = (s) => CHANGE_COLOR[s] || CHANGE_COLOR.same;
 const fmtChurn = (n) => (n.added || n.removed)
   ? html`<span class="churn">${n.added ? html`<span class="add">+${n.added}</span>` : ''}${n.added && n.removed ? ' ' : ''}${n.removed ? html`<span class="del">−${n.removed}</span>` : ''}</span>`
   : null;
-const statusClass = (n) => (n.status ? ' st-' + n.status : '');
+const statusClass = (n) => (n.status ? ' st-' + n.status : '') + (n.is_test ? ' is-test' : '');
 const NODE_H = 48;
 const estWidth = (name) => Math.min(320, Math.max(120, 8 * name.length + 40));
+// A box must be wide enough for its label and the three action buttons.
+const boxMinWidth = (data) => estWidth(`${data.name}${fmtLoc(data) ? ' · ' + fmtLoc(data) : ''}`) + 90;
 
 // Node components are defined once, outside App, so they reach the current
 // zoom handlers through this mutable slot instead of per-render node data.
-const actions = { zoomIn: () => {}, collapse: () => {} };
+const actions = { zoomIn: () => {}, collapse: () => {}, prune: () => {}, toggleBundle: () => {} };
 
-function ZoomButton({ glyph, title, onClick }) {
-  return html`<button class="zoom nodrag nopan" title=${title}
+function ZoomButton({ glyph, title, onClick, on }) {
+  return html`<button class=${'zoom nodrag nopan' + (on ? ' on' : '')} title=${title}
     onClick=${(e) => { e.stopPropagation(); onClick(); }}>${glyph}</button>`;
 }
 
@@ -165,7 +172,13 @@ function ContainerNode({ data, sourcePosition, targetPosition }) {
   return html`<div class=${'box kind-' + data.kind + statusClass(data)} title=${data.path}>
     <${Handle} type="target" position=${targetPosition} />
     <div class="box-label">${data.name}${churn ? html` <span class="loc">·</span> ${churn}` : fmtLoc(data) && html` <span class="loc">· ${fmtLoc(data)}</span>`}</div>
-    <${ZoomButton} glyph="−" title="Zoom out" onClick=${() => actions.collapse(data.id)} />
+    <div class="box-actions">
+      <${ZoomButton} glyph=${data.unbundled ? '⇶' : '⇉'} on=${data.unbundled}
+        title=${data.unbundled ? 'Edges are drawn to the nodes inside this box; click to bundle them at the box' : 'Edges into this box are bundled at the box; click to draw them to the nodes inside (applies to nested boxes too)'}
+        onClick=${() => actions.toggleBundle(data.id)} />
+      <${ZoomButton} glyph="⤢" title="Show only this box" onClick=${() => actions.prune(data.id)} />
+      <${ZoomButton} glyph="−" title="Zoom out" onClick=${() => actions.collapse(data.id)} />
+    </div>
     <${Handle} type="source" position=${sourcePosition} />
   </div>`;
 }
@@ -325,29 +338,41 @@ function mkContainEdge(parent, child) {
 
 // Raw mode ranks on containment only: ranking on references too makes dagre
 // slow and the tree very wide, so references are drawn but not fed to dagre.
-function buildModel(graph, coalesced, view, dir, bundle, onePerPair, { byChange = false, changesOnly = false } = {}) {
+function buildModel(graph, coalesced, view, dir, onePerPair, { byChange = false, changesOnly = false, hideTests = false, unbundled = new Set(), scopeId = null } = {}) {
   const finish = (refs) => assignOffsets(onePerPair ? collapseByPrecedence(refs) : refs);
   const isDiff = !!graph.diff;
   const unchanged = (n) => isDiff && changesOnly && n.status === 'same';
+  const hidden = (n) => hideTests && n.is_test;
+  // With tests hidden, a node's size is the non-test part of it.
+  const shown = (n) => (hideTests && n.test_loc ? { ...n, loc: n.loc - n.test_loc } : n);
   const refEdge = (e, count) => mkRefEdge(String(e.from), String(e.to), e.kind, count, e.status, byChange);
   if (view === 'raw') {
-    // Every ancestor of a changed entity is itself modified, so dropping the
-    // unchanged nodes never orphans a kept one.
-    const kept = graph.nodes.filter((n) => !unchanged(n));
+    // Every ancestor of a changed entity is itself modified, and every
+    // descendant of a test entity is a test entity, so dropping unchanged or
+    // test nodes never orphans a kept one.
+    const kept = graph.nodes.filter((n) => !unchanged(n) && !hidden(n));
     const keptIds = new Set(kept.map((n) => n.id));
-    const nodes = kept.map((n) => mkNode(n, dir));
+    const nodes = kept.map((n) => mkNode(shown(n), dir));
     const contain = kept.filter((n) => n.parent != null && keptIds.has(n.parent)).map((n) => mkContainEdge(n.parent, n.id));
     const refs = finish(graph.references.filter((e) => keptIds.has(e.from) && keptIds.has(e.to)).map((e) => refEdge(e, 1)));
-    return { nodes, edges: [...contain, ...refs], rankEdges: contain };
+    return { nodes, edges: [...contain, ...refs], rankEdges: contain, hiddenTests: graph.nodes.filter(hidden).length };
   }
-  if (!coalesced) return { nodes: [], edges: [], rankEdges: [] };
+  if (!coalesced) return { nodes: [], edges: [], rankEdges: [], hiddenTests: 0 };
+  const inScope = (id) => {
+    if (scopeId == null) return true;
+    for (let cur = id; cur != null; cur = graph.nodes[cur].parent) if (cur === scopeId) return true;
+    return false;
+  };
   // Every ancestor of a leaf is an entity the user has zoomed into; draw it
-  // as a container around its descendants. Roots are skipped: a box around
-  // the whole diagram says nothing.
+  // as a container around its descendants. That includes the root, whose box
+  // is the only way back to the single-node view. A scope keeps just one
+  // container's subtree.
   const containers = new Map();
-  for (const id of coalesced.leaves) {
-    for (let p = graph.nodes[id]?.parent; p != null; p = graph.nodes[p].parent) {
-      if (graph.nodes[p].parent != null) containers.set(p, graph.nodes[p]);
+  const scopedLeaves = coalesced.leaves.filter((id) => graph.nodes[id] && inScope(id));
+  const shownLeaves = scopedLeaves.filter((id) => !hidden(graph.nodes[id]));
+  for (const id of shownLeaves) {
+    for (let p = graph.nodes[id].parent; p != null && inScope(p); p = graph.nodes[p].parent) {
+      containers.set(p, graph.nodes[p]);
     }
   }
   const boxId = (id) => (containers.has(id) ? `c${id}` : undefined);
@@ -355,39 +380,54 @@ function buildModel(graph, coalesced, view, dir, bundle, onePerPair, { byChange 
   // the leaves builds the map deepest-first, so sort by depth.
   const depth = (n) => { let d = 0; for (let p = n.parent; p != null; p = graph.nodes[p].parent) d++; return d; };
   const boxes = [...containers.values()].sort((a, b) => depth(a) - depth(b)).map((ent) => ({
-    id: `c${ent.id}`, type: 'container', position: { x: 0, y: 0 }, data: ent,
+    id: `c${ent.id}`, type: 'container', position: { x: 0, y: 0 }, data: { ...shown(ent), unbundled: unbundled.has(ent.id) },
     parentId: boxId(ent.parent), width: 200, height: 100, selectable: true,
     className: unchanged(ent) ? 'faded' : undefined,
   }));
-  const hasChildren = new Set(graph.nodes.filter((n) => n.parent != null).map((n) => n.parent));
-  const leaves = coalesced.leaves.map((id) => graph.nodes[id]).filter(Boolean)
+  const hasChildren = new Set(graph.nodes.filter((n) => n.parent != null && !hidden(n)).map((n) => n.parent));
+  const leaves = shownLeaves.map((id) => graph.nodes[id])
     .map((n) => ({
-      ...mkNode(n, dir), parentId: boxId(n.parent),
-      data: { ...n, zoomable: hasChildren.has(n.id) },
+      ...mkNode(shown(n), dir), parentId: boxId(n.parent),
+      data: { ...shown(n), zoomable: hasChildren.has(n.id) },
       // A collapsed leaf is a whole subtree, so it is faded rather than
       // hidden; hiding it would change what its box means.
       className: unchanged(n) ? 'faded' : undefined,
     }));
-  if (!bundle) {
-    const edges = finish(coalesced.edges.map((e) => { const edge = refEdge(e, 1); edge.data.members = [e]; return edge; }));
-    return { nodes: [...boxes, ...leaves], edges, rankEdges: edges };
-  }
   // Lift each leaf-to-leaf edge to the pair of siblings at the level where the
   // two sides meet (a box and a node, or two boxes), then bundle per kind. Every
   // drawn edge then lives inside one layout level, so it can be routed there
-  // instead of crossing whatever lies between two distant leaves.
+  // instead of crossing whatever lies between two distant leaves. A box the
+  // user has unbundled is transparent to this: the endpoint descends into it
+  // (and into further unbundled boxes) toward the actual leaf.
   const chain = (leaf) => {
-    const out = [{ id: String(leaf), parent: boxId(graph.nodes[leaf].parent) ?? null }];
+    const out = [{ id: String(leaf), ent: leaf, parent: boxId(graph.nodes[leaf].parent) ?? null }];
     for (let p = graph.nodes[leaf].parent; p != null && containers.has(p); p = graph.nodes[p].parent) {
-      out.push({ id: `c${p}`, parent: boxId(graph.nodes[p].parent) ?? null });
+      out.push({ id: `c${p}`, ent: p, parent: boxId(graph.nodes[p].parent) ?? null });
     }
     return out;
   };
+  const descend = (ch, i) => { while (i > 0 && unbundled.has(ch[i].ent)) i--; return ch[i].id; };
+  // A coalesced edge between two shown leaves can still be carried partly by
+  // test code inside them (a file's `mod tests` calling another file), so
+  // hiding tests filters the underlying references, not just the endpoints.
+  const isTest = (id) => hidden(graph.nodes[id] || {});
+  const withoutTests = (e) => {
+    if (!hideTests) return e;
+    if (isTest(e.from) || isTest(e.to)) return null;
+    const refs = e.refs.filter((i) => { const r = graph.references[i]; return r && !isTest(r.from) && !isTest(r.to); });
+    return refs.length ? { ...e, refs } : null;
+  };
   const bundles = new Map();
-  for (const e of coalesced.edges) {
+  for (const raw of coalesced.edges) {
+    if (!inScope(raw.from) || !inScope(raw.to)) continue;
+    const e = withoutTests(raw);
+    if (!e) continue;
     const cf = chain(e.from), ct = chain(e.to);
     let pair = null;
-    for (const a of cf) { const b = ct.find((x) => x.parent === a.parent); if (b) { pair = [a.id, b.id]; break; } }
+    for (let ia = 0; ia < cf.length && !pair; ia++) {
+      const ib = ct.findIndex((x) => x.parent === cf[ia].parent);
+      if (ib >= 0) pair = [descend(cf, ia), descend(ct, ib)];
+    }
     if (!pair || pair[0] === pair[1]) continue;
     const key = `${pair[0]}|${pair[1]}|${e.kind}|${e.status || ''}`;
     const b = bundles.get(key) || bundles.set(key, { source: pair[0], target: pair[1], kind: e.kind, status: e.status, members: [] }).get(key);
@@ -398,7 +438,7 @@ function buildModel(graph, coalesced, view, dir, bundle, onePerPair, { byChange 
     edge.data.members = b.members;
     return edge;
   }));
-  return { nodes: [...boxes, ...leaves], edges, rankEdges: edges };
+  return { nodes: [...boxes, ...leaves], edges, rankEdges: edges, hiddenTests: scopedLeaves.length - shownLeaves.length };
 }
 
 // Bottom-up layout: each container's direct children are laid out on their
@@ -474,8 +514,7 @@ function layout(nodes, rankEdges, dir) {
       if (de?.points) routedLocal.set(e.id, { level, points: de.points.map((p) => ({ x: p.x + inset.x, y: p.y + inset.y })) });
     }
     if (level !== null) {
-      const label = estWidth(byId.get(level).data.name) + 30;
-      size.set(level, { w: Math.max(best.w + 2 * PAD, label), h: best.h + 2 * PAD + LABEL_H });
+      size.set(level, { w: Math.max(best.w + 2 * PAD, boxMinWidth(byId.get(level).data)), h: best.h + 2 * PAD + LABEL_H });
     }
   };
   const routedLocal = new Map();
@@ -518,6 +557,124 @@ function withRouting(edges, routed) {
     const r = routed.get(e.id);
     return r ? { ...e, data: { ...e.data, ...r } } : { ...e, data: { ...e.data, points: undefined, at: undefined } };
   });
+}
+
+// Layout that keeps the user's mental map. A fresh dagre run after every zoom
+// reorders and re-ranks whole levels for one changed box, so the diagram
+// yanked around on each click. Here only the inside of a newly opened box is
+// laid out; the box then takes the place of the leaf it replaced, its
+// siblings move only as far as its growth forces them, and every ancestor is
+// refit around its children. Boxes that already existed keep their positions
+// and orientation. The price is that upper levels drift from rank-optimal
+// over many steps; Re-layout is the way back. Returns null when a node
+// appears that has no place to inherit (a new leaf in an old box), which
+// means the change was not a zoom and a full layout is due.
+const PUSH_GAP = 24;
+function incrementalLayout(prevNodes, prevEdges, nodes, rankEdges, edges, dir) {
+  const prev = new Map(prevNodes.map((n) => [n.id, n]));
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const entityOf = (id) => id.replace(/^c/, '');
+  const fresh = nodes.filter((n) => !prev.has(n.id));
+  const newBoxes = fresh.filter((n) => n.type === 'container' && prev.has(entityOf(n.id)));
+  const newBoxIds = new Set(newBoxes.map((n) => n.id));
+  const enclosingNewBox = (n) => { for (let p = n.parentId; p; p = byId.get(p)?.parentId) if (newBoxIds.has(p)) return p; return null; };
+  for (const n of fresh) {
+    if (newBoxIds.has(n.id) || enclosingNewBox(n)) continue;
+    if (n.type !== 'container' && prev.has(`c${n.id}`)) continue;
+    return null;
+  }
+
+  const state = new Map();
+  for (const n of nodes) {
+    const p = prev.get(n.id);
+    if (p) state.set(n.id, { ...n, position: { ...p.position }, width: p.width, height: p.height, sourcePosition: p.sourcePosition, targetPosition: p.targetPosition });
+  }
+  const dirty = new Set();
+  const centered = (n, old) => ({ x: old.position.x + (old.width - n.width) / 2, y: old.position.y + (old.height - n.height) / 2 });
+  // A collapsed box becomes a leaf sitting where the box's centre was.
+  for (const n of fresh) {
+    if (n.type === 'container' || enclosingNewBox(n)) continue;
+    const box = prev.get(`c${n.id}`);
+    state.set(n.id, { ...n, position: centered(n, box), sourcePosition: box.sourcePosition, targetPosition: box.targetPosition });
+    dirty.add(n.id);
+  }
+  // Each outermost new box is laid out on its own, as if it were the whole
+  // graph, then dropped in over the leaf it replaced.
+  const subRouted = [];
+  for (const b of newBoxes.filter((b) => !enclosingNewBox(b))) {
+    const under = (n) => { for (let p = n.parentId; p; p = byId.get(p)?.parentId) if (p === b.id) return true; return false; };
+    const sub = layout([{ ...b, parentId: undefined }, ...nodes.filter(under)], rankEdges, dir);
+    const laidBox = sub.nodes.find((n) => n.id === b.id);
+    const leaf = prev.get(entityOf(b.id));
+    const placed = { ...b, width: laidBox.width, height: laidBox.height, sourcePosition: leaf.sourcePosition, targetPosition: leaf.targetPosition };
+    placed.position = centered(placed, leaf);
+    state.set(b.id, placed);
+    dirty.add(b.id);
+    // The inside is already settled and routed; only the box is a change.
+    for (const n of sub.nodes) if (n.id !== b.id) state.set(n.id, n);
+    subRouted.push({ box: b.id, routed: sub.routed });
+  }
+  if (nodes.some((n) => !state.has(n.id))) return null;
+
+  // Settle, deepest level first: push siblings off anything that changed,
+  // then refit the level's box; a refit box is itself a change one level up.
+  const depthOf = (id) => { let d = 0; for (let p = byId.get(id)?.parentId; p; p = byId.get(p)?.parentId) d++; return d; };
+  const levels = [...new Set(nodes.map((n) => n.parentId ?? null))].sort((a, b) => (b == null ? -1 : depthOf(b)) - (a == null ? -1 : depthOf(a)));
+  const rect = (n) => ({ x: n.position.x, y: n.position.y, r: n.position.x + n.width, b: n.position.y + n.height });
+  for (const level of levels) {
+    const kids = [...state.values()].filter((n) => (n.parentId ?? null) === level);
+    const queue = kids.filter((k) => dirty.has(k.id));
+    let budget = 20 * kids.length;
+    while (queue.length && budget-- > 0) {
+      const a = queue.shift(), ra = rect(a);
+      for (const sib of kids) {
+        if (sib === a) continue;
+        const rs = rect(sib);
+        const ox = Math.min(ra.r, rs.r) - Math.max(ra.x, rs.x) + PUSH_GAP, oy = Math.min(ra.b, rs.b) - Math.max(ra.y, rs.y) + PUSH_GAP;
+        if (ox <= 0 || oy <= 0) continue;
+        // Push along the axis on which the sibling already lies further out,
+        // relative to the two sizes, so rows stay rows and columns columns.
+        const dx = (rs.x + rs.r - ra.x - ra.r) / (a.width + sib.width), dy = (rs.y + rs.b - ra.y - ra.b) / (a.height + sib.height);
+        if (Math.abs(dy) >= Math.abs(dx)) sib.position = { x: sib.position.x, y: sib.position.y + (dy >= 0 ? oy : -oy) };
+        else sib.position = { x: sib.position.x + (dx >= 0 ? ox : -ox), y: sib.position.y };
+        dirty.add(sib.id);
+        queue.push(sib);
+      }
+    }
+    if (level == null || !kids.length) continue;
+    const box = state.get(level);
+    const x0 = Math.min(...kids.map((k) => k.position.x)), y0 = Math.min(...kids.map((k) => k.position.y));
+    const x1 = Math.max(...kids.map((k) => k.position.x + k.width)), y1 = Math.max(...kids.map((k) => k.position.y + k.height));
+    const shift = { x: x0 - PAD, y: y0 - PAD - LABEL_H };
+    const w = Math.max(x1 - x0 + 2 * PAD, boxMinWidth(box.data)), h = y1 - y0 + 2 * PAD + LABEL_H;
+    if (shift.x || shift.y || w !== box.width || h !== box.height) {
+      for (const k of kids) k.position = { x: k.position.x - shift.x, y: k.position.y - shift.y };
+      box.position = { x: box.position.x + shift.x, y: box.position.y + shift.y };
+      box.width = w; box.height = h;
+      dirty.add(level);
+    }
+  }
+
+  // Routes survive when both ends moved together (a level that shifted as a
+  // whole); anything touching or crossing a changed node is re-routed.
+  const finalNodes = nodes.map((n) => state.get(n.id));
+  const absOld = absolutePositions(prevNodes), absNew = absolutePositions(finalNodes);
+  const fromSub = new Map();
+  for (const { box, routed } of subRouted) {
+    const o = absNew(box);
+    for (const [id, r] of routed) fromSub.set(id, { points: r.points.map((p) => ({ x: p.x + o.x, y: p.y + o.y })), at: { s: { x: r.at.s.x + o.x, y: r.at.s.y + o.y }, t: { x: r.at.t.x + o.x, y: r.at.t.y + o.y } } });
+  }
+  const carried = edges.map((e) => {
+    if (fromSub.has(e.id)) return { ...e, data: { ...e.data, ...fromSub.get(e.id) } };
+    const p = prevEdges.find((x) => x.id === e.id);
+    if (!p?.data?.points || !prev.has(e.source) || !prev.has(e.target)) return { ...e, data: { ...e.data, points: undefined, at: undefined } };
+    const ds = { x: absNew(e.source).x - absOld(e.source).x, y: absNew(e.source).y - absOld(e.source).y };
+    const dt = { x: absNew(e.target).x - absOld(e.target).x, y: absNew(e.target).y - absOld(e.target).y };
+    if (Math.abs(ds.x - dt.x) > 0.5 || Math.abs(ds.y - dt.y) > 0.5) return { ...e, data: { ...e.data, points: undefined, at: undefined } };
+    const mv = (q) => ({ x: q.x + ds.x, y: q.y + ds.y });
+    return { ...e, data: { ...e.data, points: p.data.points.map(mv), at: { s: mv(p.data.at.s), t: mv(p.data.at.t) } } };
+  });
+  return { nodes: finalNodes, edges: rerouteEdges(carried, finalNodes, dirty) };
 }
 
 // Drag invariant: a node stays inside its box, and boxes never overlap their
@@ -690,14 +847,21 @@ function routeEdge(edge, nodes, abs) {
 function rerouteEdges(edges, nodes, dirty) {
   const abs = absolutePositions(nodes);
   const byId = new Map(nodes.map((n) => [n.id, n]));
-  const dirtyRects = [...dirty].map((id) => byId.get(id)).filter(Boolean)
-    .map((n) => { const a = abs(n.id); return { x: a.x, y: a.y, r: a.x + n.width, b: a.y + n.height }; });
-  const crosses = (pts) => pts && pts.some((p, i) => i > 0 && dirtyRects.some((o) => {
+  // A changed node is an obstacle only to edges drawn at its own level: the
+  // edges inside a box that grew still fit the box.
+  const dirtyRects = new Map();
+  for (const id of dirty) {
+    const n = byId.get(id);
+    if (!n) continue;
+    const a = abs(n.id), level = n.parentId ?? null;
+    (dirtyRects.get(level) || dirtyRects.set(level, []).get(level)).push({ x: a.x, y: a.y, r: a.x + n.width, b: a.y + n.height });
+  }
+  const crosses = (pts, level) => pts && pts.some((p, i) => i > 0 && (dirtyRects.get(level) || []).some((o) => {
     const q = pts[i - 1];
     return Math.min(p.x, q.x) < o.r && Math.max(p.x, q.x) > o.x && Math.min(p.y, q.y) < o.b && Math.max(p.y, q.y) > o.y;
   }));
   return edges.map((e) => {
-    if (!dirty.has(e.source) && !dirty.has(e.target) && !crosses(e.data.points)) return e;
+    if (!dirty.has(e.source) && !dirty.has(e.target) && !crosses(e.data.points, byId.get(e.source)?.parentId ?? null)) return e;
     const points = routeEdge(e, nodes, abs);
     if (!points) return { ...e, data: { ...e.data, points: undefined, at: undefined } };
     return { ...e, data: { ...e.data, points, at: { s: abs(e.source), t: abs(e.target) } } };
@@ -762,7 +926,7 @@ async function fetchJson(url, init) {
 function App() {
   const { getViewport, setViewport } = useReactFlow();
   const canvasRef = useRef(null);
-  const [view, setView] = useState('raw');
+  const [view, setView] = useState('coalesced');
   const [dir, setDir] = useState('TB');
   const [graph, setGraph] = useState(null);
   const [coalesced, setCoalesced] = useState(null);
@@ -770,7 +934,10 @@ function App() {
   const [edges, setEdges] = useState([]);
   const [showContain, setShowContain] = useState(true);
   const [showRefs, setShowRefs] = useState(true);
-  const [bundle, setBundle] = useState(true);
+  // Boxes whose edges are drawn to the nodes inside rather than to the box.
+  const [unbundled, setUnbundled] = useState(() => new Set());
+  // A container the coalesced view is pruned to, or null for everything.
+  const [scopeId, setScopeId] = useState(null);
   const [onePerPair, setOnePerPair] = useState(true);
   // { type: 'node', id: <rf node id> } | { type: 'edge', id: <rf edge id> } | null
   const [sel, setSel] = useState(null);
@@ -784,6 +951,7 @@ function App() {
   // fade (coalesced) what did not change.
   const [byChange, setByChange] = useState(true);
   const [changesOnly, setChangesOnly] = useState(false);
+  const [showTests, setShowTests] = useState(true);
   const [resizing, setResizing] = useState(false);
   const [status, setStatus] = useState('');
   const [panelError, setPanelError] = useState('');
@@ -796,8 +964,8 @@ function App() {
 
   const isDiff = !!graph?.diff;
   const model = useMemo(
-    () => (graph ? buildModel(graph, coalesced, view, dir, bundle, onePerPair, { byChange, changesOnly }) : null),
-    [graph, coalesced, view, dir, bundle, onePerPair, byChange, changesOnly],
+    () => (graph ? buildModel(graph, coalesced, view, dir, onePerPair, { byChange, changesOnly, hideTests: !showTests, unbundled, scopeId }) : null),
+    [graph, coalesced, view, dir, onePerPair, byChange, changesOnly, showTests, unbundled, scopeId],
   );
 
   // Every layout change is animated: nodes glide from where they were to where
@@ -808,6 +976,9 @@ function App() {
   const nodesRef = useRef(nodes); nodesRef.current = nodes;
   const edgesRef = useRef(edges); edgesRef.current = edges;
   const focusRef = useRef(null);
+  // Set by zoom, collapse and bundle actions: the next layout keeps every
+  // existing node where it is instead of starting over.
+  const keepPlacesRef = useRef(false);
   const animRef = useRef(0);
 
   const transitionTo = (finalNodes, finalEdges, focusIds) => {
@@ -822,9 +993,14 @@ function App() {
     let vp = null;
     if (focus) {
       const a = abs(focus.id);
-      // Never zoom out past what is needed to show the target, and zoom in
-      // no further than 1:1 so a small collapsed node does not fill the screen.
-      vp = getViewportForBounds({ x: a.x, y: a.y, width: focus.width, height: focus.height }, W, H, 0.05, Math.max(getViewport().zoom, 1), 0.3);
+      const cur = getViewport();
+      const seen = { x: -cur.x / cur.zoom, y: -cur.y / cur.zoom, w: W / cur.zoom, h: H / cur.zoom };
+      const inView = a.x >= seen.x && a.y >= seen.y && a.x + focus.width <= seen.x + seen.w && a.y + focus.height <= seen.y + seen.h;
+      // A target already fully on screen is left alone: panning to centre
+      // it would move everything the user was looking at. Otherwise never
+      // zoom out past what is needed to show it, and zoom in no further
+      // than 1:1 so a small collapsed node does not fill the screen.
+      if (!inView) vp = getViewportForBounds({ x: a.x, y: a.y, width: focus.width, height: focus.height }, W, H, 0.05, Math.max(cur.zoom, 1), 0.3);
     } else if (finalNodes.length) {
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
       for (const n of finalNodes) {
@@ -859,12 +1035,20 @@ function App() {
 
   useEffect(() => {
     if (!model) return;
-    const laid = layout(model.nodes, model.rankEdges, dir);
     setPanelError('');
+    const keep = keepPlacesRef.current;
+    keepPlacesRef.current = false;
+    let laid = keep && view === 'coalesced' && nodesRef.current.length
+      ? incrementalLayout(nodesRef.current, edgesRef.current, model.nodes, model.rankEdges, model.edges, dir)
+      : null;
+    if (!laid) {
+      const full = layout(model.nodes, model.rankEdges, dir);
+      laid = { nodes: full.nodes, edges: withRouting(model.edges, full.routed) };
+    }
     // focusRef is not cleared here: with React batching, a follow-up zoom
     // request can set the next focus before this effect has run for the
     // previous one. Actions that want the whole graph clear it themselves.
-    transitionTo(laid.nodes, withRouting(model.edges, laid.routed), focusRef.current);
+    transitionTo(laid.nodes, laid.edges, focusRef.current);
   }, [model, dir]);
 
   useEffect(() => {
@@ -913,7 +1097,6 @@ function App() {
   const switchView = (v) => { focusRef.current = null; setView(v); setStatus(''); };
   const switchDir = (d) => { focusRef.current = null; setDir(d); };
   const reset = () => { focusRef.current = null; return post('./coalesced/reset'); };
-  const toggleBundle = (on) => { focusRef.current = null; setBundle(on); };
   const toggleOnePerPair = (on) => { focusRef.current = null; setOnePerPair(on); };
 
   const relayout = () => {
@@ -993,17 +1176,38 @@ function App() {
       const deepest = under.reduce((a, b) => (depthOf(b) > depthOf(a) ? b : a));
       // The box stays a container until the last step, then becomes a leaf.
       focusRef.current = [`c${boxId}`, String(boxId)];
+      keepPlacesRef.current = true;
       co = await post(`./coalesced/zoom-out?id=${deepest}`);
     }
   };
-  actions.zoomIn = (id) => { focusRef.current = [`c${id}`]; return post(`./coalesced/zoom-in?id=${id}`); };
+  actions.zoomIn = (id) => { focusRef.current = [`c${id}`]; keepPlacesRef.current = true; return post(`./coalesced/zoom-in?id=${id}`); };
   actions.collapse = collapse;
+  actions.prune = (id) => { focusRef.current = [`c${id}`]; setScopeId(id); };
+  const clearScope = () => { focusRef.current = null; setScopeId(null); };
+  // Toggling a box applies to everything beneath it, so a whole subtree
+  // switches at once instead of leaving nested boxes in the previous state.
+  actions.toggleBundle = (id) => {
+    focusRef.current = [`c${id}`];
+    keepPlacesRef.current = true;
+    setUnbundled((prev) => {
+      const next = new Set(prev);
+      const on = !prev.has(id);
+      for (const n of graph.nodes) if (n.id === id || isUnder(n.id, id)) on ? next.add(n.id) : next.delete(n.id);
+      return next;
+    });
+  };
+  // The scope is a container; once it is collapsed back into a leaf there is
+  // nothing to prune to, so the view widens again on its own.
+  useEffect(() => {
+    if (scopeId != null && coalesced && !coalesced.leaves.some((l) => isUnder(l, scopeId))) setScopeId(null);
+  }, [coalesced, scopeId]);
 
   const selectedNode = selectedId != null ? nodes.find((n) => n.id === selectedId) : null;
   const selected = selectedNode ? selectedNode.data : null;
   const isBox = selectedNode?.type === 'container';
   const nameOf = (id) => graph?.nodes[id]?.name ?? `#${id}`;
-  const rawRefs = view === 'raw' ? graph?.references : coalesced?.edges;
+  const hiddenEnt = (id) => !showTests && !!graph?.nodes[id]?.is_test;
+  const rawRefs = (view === 'raw' ? graph?.references : coalesced?.edges)?.filter((e) => !hiddenEnt(e.from) && !hiddenEnt(e.to));
   // Leaves list their true leaf-level references; a box lists the bundles
   // drawn to and from it, since those are what the diagram shows for it.
   const drawnFor = (side) => edges.filter((e) => e.data.ref && e[side] === selectedId)
@@ -1011,7 +1215,7 @@ function App() {
   const incoming = !selected ? [] : isBox ? drawnFor('target') : (rawRefs || []).filter((e) => e.to === selected.id).map((e) => ({ kind: e.kind, other: String(e.from) }));
   const outgoing = !selected ? [] : isBox ? drawnFor('source') : (rawRefs || []).filter((e) => e.from === selected.id).map((e) => ({ kind: e.kind, other: String(e.to) }));
   const labelOf = (nodeId) => nodes.find((n) => n.id === nodeId)?.data.name ?? nameOf(Number(nodeId));
-  const children = selected && (view === 'raw' || isBox) ? graph.nodes.filter((n) => n.parent === selected.id) : [];
+  const children = selected && (view === 'raw' || isBox) ? graph.nodes.filter((n) => n.parent === selected.id && !hiddenEnt(n.id)) : [];
   const locOf = (n) => (n.loc > 0 ? html`<span class="loc">${n.loc.toLocaleString()} loc</span>` : '');
 
   const edgeList = (list) => list.length
@@ -1078,8 +1282,9 @@ function App() {
       <div class="sep"></div>
       ${view === 'raw' && html`<label class="chk"><input type="checkbox" checked=${showContain} onChange=${(e) => setShowContain(e.target.checked)} /> containment edges</label>`}
       <label class="chk"><input type="checkbox" checked=${showRefs} onChange=${(e) => setShowRefs(e.target.checked)} /> reference edges</label>
-      ${view === 'coalesced' && html`<label class="chk" title="Draw edges between boxes instead of between the leaves inside them"><input type="checkbox" checked=${bundle} onChange=${(e) => toggleBundle(e.target.checked)} /> bundle across boxes</label>`}
+      ${view === 'coalesced' && scopeId != null && html`<span>showing <b>${nameOf(scopeId)}</b> <button class="btn" onClick=${clearScope}>show all</button></span>`}
       <label class="chk" title=${'Keep only the strongest kind between a pair: ' + PRECEDENCE.join(' > ')}><input type="checkbox" checked=${onePerPair} onChange=${(e) => toggleOnePerPair(e.target.checked)} /> one edge per pair</label>
+      <label class="chk" title="Test code: #[test] / #[cfg(test)] items, tests/ folders, *_test and *.spec files, and everything inside them. Unchecked hides them and the references they make."><input type="checkbox" checked=${showTests} onChange=${(e) => { focusRef.current = null; setShowTests(e.target.checked); }} /> tests${model?.hiddenTests ? ` (${model.hiddenTests} hidden)` : ''}</label>
       ${isDiff && html`<div class="sep"></div>
         <span title=${graph.diff.base_commit}><b>diff</b> ${graph.diff.base} → working tree</span>
         <label class="chk"><input type="checkbox" checked=${byChange} onChange=${(e) => { focusRef.current = null; setByChange(e.target.checked); }} /> colour edges by change</label>

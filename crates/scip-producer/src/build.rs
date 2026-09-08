@@ -41,10 +41,12 @@ pub fn build(index: &Index, project_root: &Path) -> EntityGraph {
     b.resolve_parents();
     b.finish_paths_and_children();
     let references = b.references();
-    EntityGraph {
+    let mut graph = EntityGraph {
         entities: b.entities,
         references,
-    }
+    };
+    entity_graph::test_code::mark(&mut graph, |rel| std::fs::read_to_string(project_root.join(rel)).ok());
+    graph
 }
 
 fn root_name(project_root: &Path) -> String {
@@ -93,6 +95,7 @@ impl<'a> Builder<'a> {
             path: PathBuf::new(),
             byte_range: 0..0,
             line_range: 0..0,
+            is_test: false,
         });
         id
     }

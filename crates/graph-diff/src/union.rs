@@ -36,6 +36,14 @@ pub(crate) fn build(old: &EntityGraph, new: &EntityGraph, m: &Matching) -> Union
     let Builder { entities, origin, of_new, of_old, .. } = b;
 
     let mut graph = EntityGraph { entities, references: Vec::new() };
+    // Each side's flags are self-consistent, but a removed old child under a
+    // parent that became a test on the new side would not be; ids are
+    // parent-before-child, so one forward pass restores inheritance.
+    for i in 0..graph.entities.len() {
+        if let Some(p) = graph.entities[i].parent {
+            graph.entities[i].is_test |= graph.entities[p.0].is_test;
+        }
+    }
     let reference_status = merge_references(&mut graph, old, new, &of_old, &of_new);
     Union { graph, origin, reference_status }
 }
@@ -64,6 +72,7 @@ impl Builder<'_> {
             path: source.path.clone(),
             byte_range: source.byte_range.clone(),
             line_range: source.line_range.clone(),
+            is_test: source.is_test,
         });
         self.origin.push(origin);
         id

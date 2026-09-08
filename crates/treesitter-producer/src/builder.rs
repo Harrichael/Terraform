@@ -112,6 +112,7 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
                 path,
                 byte_range: node.byte_range.0..node.byte_range.1,
                 line_range: node.line_range.0..node.line_range.1,
+                is_test: false,
             });
         }
     }

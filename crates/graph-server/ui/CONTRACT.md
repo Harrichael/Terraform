@@ -34,6 +34,10 @@ The single-file UI (`ui/index.html`), embedded in the binary.
   applicable.
 - `loc` is `line_end - line_start + 1` for any node with a range; a node
   without one (folders) carries the sum of its children's `loc`.
+- `is_test` (omitted when false) marks test code by the conventions in
+  `entity_graph::test_code`; every descendant of a test node is a test node.
+  `test_loc` (omitted when 0) is the part of `loc` inside test nodes, so a
+  view hiding tests shows `loc - test_loc`.
 - `sites` are the 0-indexed lines, in the `from` entity's file, of every
   occurrence that produced the reference; sorted, no duplicates. Producers
   always record at least one; hand-built graphs may leave it empty.

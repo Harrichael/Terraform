@@ -35,6 +35,10 @@ pub struct NodeDto {
     pub line_end: usize,
     pub parent: Option<usize>,
     pub loc: usize,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_test: bool,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub test_loc: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -140,7 +144,11 @@ pub fn op_dto(op: &LineOp) -> OpDto {
     (tag, op.old_start, op.old_len, op.new_start, op.new_len)
 }
 
-fn node_dto(e: &Entity, loc: usize) -> NodeDto {
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+fn node_dto(e: &Entity, (loc, test_loc): (usize, usize)) -> NodeDto {
     NodeDto {
         id: e.id.0,
         kind: entity_kind(e.kind),
@@ -150,17 +158,21 @@ fn node_dto(e: &Entity, loc: usize) -> NodeDto {
         line_end: e.line_range.end,
         parent: e.parent.map(|p| p.0),
         loc,
+        is_test: e.is_test,
+        test_loc,
         status: None,
         added: None,
         removed: None,
     }
 }
 
-/// Lines of code per entity: the inclusive line range when the entity has
-/// one, otherwise (folders) the sum over its children. Post-order over the
-/// forest so every child is settled before its parent is read.
-fn loc_per_entity(graph: &EntityGraph) -> Vec<usize> {
-    let mut loc = vec![0; graph.entities.len()];
+/// `(loc, test_loc)` per entity. `loc` is the inclusive line range when the
+/// entity has one, otherwise (folders) the sum over its children; `test_loc`
+/// is how much of that is test code, so a view hiding tests can subtract it.
+/// Post-order over the forest so every child is settled before its parent is
+/// read.
+fn loc_per_entity(graph: &EntityGraph) -> Vec<(usize, usize)> {
+    let mut loc = vec![(0, 0); graph.entities.len()];
     let mut stack: Vec<(EntityId, bool)> =
         graph.entities.iter().filter(|e| e.parent.is_none()).map(|e| (e.id, false)).collect();
     while let Some((id, children_done)) = stack.pop() {
@@ -170,11 +182,13 @@ fn loc_per_entity(graph: &EntityGraph) -> Vec<usize> {
             stack.extend(e.children.iter().map(|&c| (c, false)));
             continue;
         }
-        loc[id.0] = if e.line_range != (0..0) {
+        let own = if e.line_range != (0..0) {
             e.line_range.end - e.line_range.start + 1
         } else {
-            e.children.iter().map(|c| loc[c.0]).sum()
+            e.children.iter().map(|c| loc[c.0].0).sum()
         };
+        let test = if e.is_test { own } else { e.children.iter().map(|c| loc[c.0].1).sum() };
+        loc[id.0] = (own, test);
     }
     loc
 }
@@ -257,4 +271,50 @@ pub fn root_name(graph: &EntityGraph) -> &str {
         .find(|e| e.parent.is_none())
         .map(|e| e.name.as_str())
         .unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use entity_graph::test_support::graph_from_parents;
+    use EntityKind::*;
+
+    /// `test_loc` is the part of `loc` inside test entities: a file with an
+    /// inline `mod tests` counts only the module's lines, a test file counts
+    /// itself once however deep its own test children go, and a folder sums
+    /// both without double counting.
+    #[test]
+    fn test_loc_counts_each_test_line_once() {
+        let mut g = graph_from_parents(
+            &[
+                ("proj", Folder, None),
+                ("lib.rs", File, Some(0)),
+                ("work", Function, Some(1)),
+                ("tests", Module, Some(1)),
+                ("check", Function, Some(3)),
+                ("it.rs", File, Some(0)),
+                ("helper", Function, Some(5)),
+            ],
+            &[],
+        );
+        let range = |g: &mut EntityGraph, id: usize, r: std::ops::Range<usize>| g.entities[id].line_range = r;
+        range(&mut g, 1, 0..19);
+        range(&mut g, 2, 0..4);
+        range(&mut g, 3, 10..19);
+        range(&mut g, 4, 12..18);
+        range(&mut g, 5, 0..9);
+        range(&mut g, 6, 1..8);
+        for id in [3, 4, 5, 6] {
+            g.entities[id].is_test = true;
+        }
+
+        let dto = GraphDto::from(&g);
+        let by_name = |n: &str| dto.nodes.iter().find(|x| x.name == n).unwrap();
+        assert_eq!((by_name("lib.rs").loc, by_name("lib.rs").test_loc), (20, 10));
+        assert_eq!((by_name("it.rs").loc, by_name("it.rs").test_loc), (10, 10));
+        assert_eq!((by_name("proj").loc, by_name("proj").test_loc), (30, 20));
+        assert!(by_name("check").is_test && !by_name("work").is_test);
+        let json = serde_json::to_value(by_name("work")).unwrap();
+        assert!(json.get("is_test").is_none() && json.get("test_loc").is_none(), "false/zero are omitted: {json}");
+    }
 }

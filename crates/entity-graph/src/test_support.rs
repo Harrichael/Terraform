@@ -17,6 +17,7 @@ pub fn make_entity(id: usize, name: &str, kind: EntityKind, parent: Option<Entit
         path: PathBuf::from(format!("{name}.rs")),
         byte_range: 0..0,
         line_range: 0..0,
+        is_test: false,
     }
 }
 

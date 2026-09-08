@@ -17,11 +17,14 @@
 //!   directory ([`EntityGraph::file_path`] depends on this);
 //! - references deduplicated on `(from, to, kind)`, self-loops dropped; every
 //!   occurrence that contributed to an edge is recorded in its `sites`;
-//! - `byte_range`/`line_range` are `0..0` when not applicable to the kind.
+//! - `byte_range`/`line_range` are `0..0` when not applicable to the kind;
+//! - `is_test` follows the conventions in [`test_code`], applied by calling
+//!   [`test_code::mark`] on the finished graph.
 //!
 //! Consumers never learn which producer built the graph.
 
 mod model;
+pub mod test_code;
 
 pub use model::*;
 

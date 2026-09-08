@@ -95,6 +95,10 @@ pub struct Entity {
     // !! Ranges are 0, 0 if Not Applicable for EntityKind !!
     pub byte_range: std::ops::Range<usize>,
     pub line_range: std::ops::Range<usize>,
+
+    /// Test code, by the conventions in [`crate::test_code`]. Inherited: every
+    /// descendant of a test entity is a test entity.
+    pub is_test: bool,
 }
 
 /// Graph of code entities and their symbolic references.
@@ -128,10 +132,15 @@ impl EntityGraph {
     /// is itself the file (single-file load). `None` when `id` is unknown or
     /// sits above every File (a Folder).
     pub fn file_path(&self, id: EntityId) -> Option<PathBuf> {
+        Some(self.entities[self.file_of(id)?.0].path.components().skip(1).collect())
+    }
+
+    /// The File containing `id` (or `id` itself); `None` above every File.
+    pub fn file_of(&self, id: EntityId) -> Option<EntityId> {
         let mut cur = self.get(id)?;
         while cur.kind != EntityKind::File {
             cur = self.get(cur.parent?)?;
         }
-        Some(cur.path.components().skip(1).collect())
+        Some(cur.id)
     }
 }

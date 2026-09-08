@@ -19,7 +19,7 @@ use crate::handlers::Server;
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 
 #[derive(Parser)]
-#[command(name = "graph-server", about = "Serve an entity graph to the browser")]
+#[command(name = "terraform-http", about = "Serve an entity graph to the browser")]
 struct Args {
     #[arg(long, default_value_t = 7878)]
     port: u16,

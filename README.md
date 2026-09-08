@@ -35,7 +35,12 @@ cd Terraform
 cargo build --release
 ```
 
-The binary will be at `target/release/terraform`.
+The TUI binary will be at `target/release/terraform`.
+
+To install the browser viewer as a command, run `./install.sh`: it builds
+`terraform-http` (with SCIP support) and copies it to `~/.local/bin`, recording
+what it deployed under `~/.local/state/graph-server`. `./uninstall.sh` reverses
+it.
 
 ---
 
@@ -56,20 +61,27 @@ When opening a directory, the view starts at **File granularity** — only folde
 
 ### Browser viewer
 
+Installed as `terraform-http` (see Installation); from a checkout, substitute
+`cargo run -p graph-server --features scip --` for `terraform-http`.
+
 ```bash
 # Serve the graph at http://127.0.0.1:7878/ (tree-sitter)
-cargo run -p graph-server -- .
+terraform-http .
 
 # Build the graph from a SCIP index instead: generate one (rust-analyzer,
 # scip-typescript or scip-go, picked from the manifest; cached under the
 # system temp dir) or point at an existing one
-cargo run -p graph-server --features scip -- --scip-index .
-cargo run -p graph-server --features scip -- --scip index.scip .
+terraform-http --scip-index .
+terraform-http --scip index.scip .
 
 # Diff view: the union of a git ref and the working tree, tagged by change
-cargo run -p graph-server -- --diff main .
-cargo run -p graph-server --features scip -- --diff main --scip-index .
+terraform-http --diff main .
+terraform-http --diff main --scip-index .
 ```
+
+The toolbar's **tests** checkbox hides test code (`#[cfg(test)]` items,
+`tests/` folders, `*_test`/`*.spec` files, and everything inside them) along
+with the references it makes.
 
 ---
 

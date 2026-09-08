@@ -127,9 +127,13 @@ fn a_doc_comment_edit_modifies_its_function() {
 #[test]
 fn one_sided_files_and_references() {
     let d = diff_of(
-        &[("src/lib.rs", LIB_BASE), ("src/gone.rs", "fn gone() {\n    alpha();\n}\n")],
+        &[("src/lib.rs", LIB_BASE), ("src/gone.rs", "fn gone() {\n    alpha();\n}\n"), ("tests/old.rs", "fn t() {}\n")],
         &[("src/lib.rs", LIB_BASE), ("src/added.rs", "fn fresh() {\n    beta();\n}\n")],
     );
+
+    // Producer-side facts survive the union for entities from either side.
+    assert!(d.graph.entities[id_of(&d.graph, "proj/tests/old.rs/t").0].is_test);
+    assert!(!d.graph.entities[id_of(&d.graph, "proj/src/added.rs/fresh").0].is_test);
 
     assert_eq!(status_of(&d, "proj/src/added.rs"), Status::Added);
     assert_eq!(churn_of(&d, "proj/src/added.rs"), (3, 0));
