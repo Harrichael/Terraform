@@ -46,42 +46,46 @@ pub fn graph_from_path(path: &Path) -> Result<EntityGraph> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use entity_graph::{EntityKind, ReferenceKind};
+    use std::path::PathBuf;
+
+    use entity_graph::{EntityKind, ReferenceKind, Site};
     use tempfile::TempDir;
 
-    /// The root-shape half of the producer contract: a directory load roots at
-    /// a Folder named after the directory with one File per source file, and
-    /// a cross-file call surfaces as a kinded Function → Function edge. A
-    /// single-file load roots at the File itself.
+    /// The producer contract end to end: a directory load roots at a Folder
+    /// named after the directory with one File per source file, File paths
+    /// resolve back to relative filesystem paths, and a function called twice
+    /// from one caller yields a single Function → Function edge carrying both
+    /// occurrence lines. A single-file load roots at the File itself.
     #[test]
     fn graph_from_path_honors_root_and_reference_contract() {
         let dir = TempDir::new().unwrap();
         let project = dir.path().join("proj");
-        std::fs::create_dir(&project).unwrap();
-        std::fs::write(project.join("lib.rs"), "pub fn compute(x: i32) -> i32 { x * 2 }").unwrap();
-        std::fs::write(project.join("main.rs"), "fn main() { let v = compute(1); }").unwrap();
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        std::fs::write(project.join("sub/lib.rs"), "pub fn compute(x: i32) -> i32 { x * 2 }").unwrap();
+        std::fs::write(
+            project.join("main.rs"),
+            "fn main() {\n    let v = compute(1);\n    let w = v;\n    let z = compute(w);\n}\n",
+        )
+        .unwrap();
 
         let graph = graph_from_path(&project).unwrap();
         let root = graph.entities.iter().find(|e| e.parent.is_none()).unwrap();
         assert_eq!((root.kind, root.name.as_str()), (EntityKind::Folder, "proj"));
-        let mut files: Vec<&str> = root
-            .children
-            .iter()
-            .map(|&c| graph.get(c).unwrap())
-            .filter(|e| e.kind == EntityKind::File)
-            .map(|e| e.name.as_str())
-            .collect();
-        files.sort();
-        assert_eq!(files, vec!["lib.rs", "main.rs"]);
-
         let by_name = |name: &str| graph.entities.iter().find(|e| e.name == name).unwrap().id;
+        assert_eq!(graph.file_path(by_name("main.rs")), Some(PathBuf::from("main.rs")));
+        assert_eq!(graph.file_path(by_name("lib.rs")), Some(PathBuf::from("sub/lib.rs")));
+        assert_eq!(graph.file_path(by_name("compute")), Some(PathBuf::from("sub/lib.rs")));
+        assert_eq!(graph.file_path(root.id), None);
+
         assert_eq!(graph.references.len(), 1);
         let r = &graph.references[0];
         assert_eq!((r.from, r.to, r.kind), (by_name("main"), by_name("compute"), ReferenceKind::Call));
+        assert_eq!(r.sites, vec![Site { line: 1 }, Site { line: 3 }]);
 
         let single = graph_from_path(&project.join("main.rs")).unwrap();
         let root = single.entities.iter().find(|e| e.parent.is_none()).unwrap();
         assert_eq!((root.kind, root.name.as_str()), (EntityKind::File, "main.rs"));
         assert_eq!(root.children.len(), 1);
+        assert_eq!(single.file_path(root.id), Some(PathBuf::new()));
     }
 }

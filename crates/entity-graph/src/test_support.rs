@@ -39,7 +39,7 @@ pub fn graph_from_parents(
     }
     let references = references
         .iter()
-        .map(|&(from, to, kind)| Reference { from: EntityId(from), to: EntityId(to), kind })
+        .map(|&(from, to, kind)| Reference { from: EntityId(from), to: EntityId(to), kind, sites: Vec::new() })
         .collect();
     EntityGraph { entities, references }
 }

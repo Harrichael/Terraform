@@ -110,11 +110,13 @@ pub struct Reference {
     pub to: usize,
     /// The kind of relationship this reference represents.
     pub kind: ReferenceKind,
+    /// 0-indexed source line of the occurrence, in `from`'s file.
+    pub line: usize,
 }
 
 impl Reference {
-    pub fn new(from: usize, to: usize, kind: ReferenceKind) -> Self {
-        Reference { from, to, kind }
+    pub fn new(from: usize, to: usize, kind: ReferenceKind, line: usize) -> Self {
+        Reference { from, to, kind, line }
     }
 }
 
@@ -134,9 +136,9 @@ impl ReferenceGraph {
         Self::default()
     }
 
-    /// Add a directed reference edge from `from` to `to`.
-    pub fn add_reference(&mut self, from: usize, to: usize, kind: ReferenceKind) {
-        self.edges.push(Reference::new(from, to, kind));
+    /// Add a directed reference edge from `from` to `to`, occurring at `line`.
+    pub fn add_reference_at(&mut self, from: usize, to: usize, kind: ReferenceKind, line: usize) {
+        self.edges.push(Reference::new(from, to, kind, line));
     }
 
     /// Return all reference edges.
@@ -417,11 +419,17 @@ impl CodeTree {
     // Reference graph helpers
     // -----------------------------------------------------------------------
 
-    /// Add a directed symbolic reference from `from` to `to`.
-    ///
-    /// This records an edge in the [`ReferenceGraph`] embedded in this tree.
+    /// Add a directed symbolic reference from `from` to `to` occurring at
+    /// 0-indexed `line` of `from`'s file.
+    pub fn add_reference_at(&mut self, from: usize, to: usize, kind: ReferenceKind, line: usize) {
+        self.references.add_reference_at(from, to, kind, line);
+    }
+
+    /// [`add_reference_at`](Self::add_reference_at) with no known line; for
+    /// hand-built trees in tests.
+    #[cfg(test)]
     pub fn add_reference(&mut self, from: usize, to: usize, kind: ReferenceKind) {
-        self.references.add_reference(from, to, kind);
+        self.add_reference_at(from, to, kind, 0);
     }
 
     /// Walk the parent chain of `node_id` and return the nearest ancestor

@@ -3,7 +3,7 @@
 //! them to `ui/fixture.json`.
 
 use coalesce::{Coalesced, CoalescedEdge};
-use entity_graph::{Entity, EntityGraph, EntityKind, Reference, ReferenceKind};
+use entity_graph::{Entity, EntityGraph, EntityId, EntityKind, Reference, ReferenceKind};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -22,6 +22,7 @@ pub struct NodeDto {
     pub line_start: usize,
     pub line_end: usize,
     pub parent: Option<usize>,
+    pub loc: usize,
 }
 
 #[derive(Serialize)]
@@ -29,12 +30,20 @@ pub struct ReferenceDto {
     pub from: usize,
     pub to: usize,
     pub kind: &'static str,
+    pub sites: Vec<usize>,
 }
 
 #[derive(Serialize)]
 pub struct CoalescedDto {
     pub leaves: Vec<usize>,
     pub edges: Vec<ReferenceDto>,
+}
+
+#[derive(Serialize)]
+pub struct SourceDto {
+    pub id: usize,
+    pub path: String,
+    pub text: String,
 }
 
 #[derive(Serialize)]
@@ -64,39 +73,69 @@ fn reference_kind(kind: ReferenceKind) -> &'static str {
     }
 }
 
-impl From<&Entity> for NodeDto {
-    fn from(e: &Entity) -> Self {
-        NodeDto {
-            id: e.id.0,
-            kind: entity_kind(e.kind),
-            name: e.name.clone(),
-            path: e.path.to_string_lossy().replace('\\', "/"),
-            line_start: e.line_range.start,
-            line_end: e.line_range.end,
-            parent: e.parent.map(|p| p.0),
-        }
+fn node_dto(e: &Entity, loc: usize) -> NodeDto {
+    NodeDto {
+        id: e.id.0,
+        kind: entity_kind(e.kind),
+        name: e.name.clone(),
+        path: e.path.to_string_lossy().replace('\\', "/"),
+        line_start: e.line_range.start,
+        line_end: e.line_range.end,
+        parent: e.parent.map(|p| p.0),
+        loc,
     }
+}
+
+/// Lines of code per entity: the inclusive line range when the entity has
+/// one, otherwise (folders) the sum over its children. Post-order over the
+/// forest so every child is settled before its parent is read.
+fn loc_per_entity(graph: &EntityGraph) -> Vec<usize> {
+    let mut loc = vec![0; graph.entities.len()];
+    let mut stack: Vec<(EntityId, bool)> =
+        graph.entities.iter().filter(|e| e.parent.is_none()).map(|e| (e.id, false)).collect();
+    while let Some((id, children_done)) = stack.pop() {
+        let e = &graph.entities[id.0];
+        if !children_done {
+            stack.push((id, true));
+            stack.extend(e.children.iter().map(|&c| (c, false)));
+            continue;
+        }
+        loc[id.0] = if e.line_range != (0..0) {
+            e.line_range.end - e.line_range.start + 1
+        } else {
+            e.children.iter().map(|c| loc[c.0]).sum()
+        };
+    }
+    loc
 }
 
 impl From<&Reference> for ReferenceDto {
     fn from(r: &Reference) -> Self {
-        ReferenceDto { from: r.from.0, to: r.to.0, kind: reference_kind(r.kind) }
+        ReferenceDto {
+            from: r.from.0,
+            to: r.to.0,
+            kind: reference_kind(r.kind),
+            sites: r.sites.iter().map(|s| s.line).collect(),
+        }
     }
 }
 
+// Coalesced edges aggregate many raw references; the UI derives sites from
+// `/graph.json` instead, so none are carried here.
 impl From<&CoalescedEdge> for ReferenceDto {
     fn from(e: &CoalescedEdge) -> Self {
-        ReferenceDto { from: e.from.0, to: e.to.0, kind: reference_kind(e.kind) }
+        ReferenceDto { from: e.from.0, to: e.to.0, kind: reference_kind(e.kind), sites: Vec::new() }
     }
 }
 
 impl From<&EntityGraph> for GraphDto {
     fn from(graph: &EntityGraph) -> Self {
+        let loc = loc_per_entity(graph);
         GraphDto {
             root: root_name(graph).to_string(),
             // The arena index is the id, so iterating in order yields the
             // dense, id-sorted `nodes` the contract promises.
-            nodes: graph.entities.iter().map(NodeDto::from).collect(),
+            nodes: graph.entities.iter().zip(&loc).map(|(e, &l)| node_dto(e, l)).collect(),
             references: graph.references.iter().map(ReferenceDto::from).collect(),
         }
     }

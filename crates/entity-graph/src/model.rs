@@ -61,11 +61,22 @@ impl std::fmt::Display for ReferenceKind {
 }
 
 /// A directed symbolic reference edge from one entity to another.
+///
+/// Edges are unique on `(from, to, kind)`; every textual occurrence that
+/// contributed to the edge is kept in `sites`, sorted and deduplicated.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Reference {
     pub from: EntityId,
     pub to: EntityId,
     pub kind: ReferenceKind,
+    pub sites: Vec<Site>,
+}
+
+/// One occurrence of a reference: a 0-indexed line in the source file of the
+/// reference's `from` entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Site {
+    pub line: usize,
 }
 
 /// A single entity (code construct) in the graph.
@@ -108,5 +119,19 @@ impl EntityGraph {
     /// Get an entity by ID.
     pub fn get(&self, id: EntityId) -> Option<&Entity> {
         self.entities.get(id.0)
+    }
+
+    /// Filesystem path of the file containing `id`, relative to the loaded
+    /// project root. Relies on the producer contract: a File's hierarchy path
+    /// is the root name followed by its relative path, so dropping the first
+    /// component yields the relative path. An empty path means the loaded root
+    /// is itself the file (single-file load). `None` when `id` is unknown or
+    /// sits above every File (a Folder).
+    pub fn file_path(&self, id: EntityId) -> Option<PathBuf> {
+        let mut cur = self.get(id)?;
+        while cur.kind != EntityKind::File {
+            cur = self.get(cur.parent?)?;
+        }
+        Some(cur.path.components().skip(1).collect())
     }
 }

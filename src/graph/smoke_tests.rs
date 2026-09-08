@@ -508,6 +508,7 @@ fn test_navigator_reference_visible_after_zoom_in() {
             from: EntityId(1),
             to: EntityId(2),
             kind: ReferenceKind::Call,
+            sites: vec![],
         }],
     };
     graph.entities[0].children = vec![EntityId(1), EntityId(2)];

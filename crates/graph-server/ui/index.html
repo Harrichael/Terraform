@@ -27,7 +27,26 @@
   .status { color: var(--error); font-size: 12px; margin-left: auto; max-width: 50%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .main { display: flex; flex: 1; min-height: 0; }
   .canvas { flex: 1; min-width: 0; position: relative; }
-  .panel { width: 300px; flex: none; background: var(--panel); border-left: 1px solid var(--line); overflow: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+  .panel { flex: none; background: var(--panel); border-left: 1px solid var(--line); overflow: hidden; display: flex; flex-direction: column; min-width: 240px; }
+  .panel-top { overflow: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; flex: 1 1 auto; min-height: 0; }
+  .panel-top.with-code { flex: 0 1 auto; max-height: 45%; }
+  .divider { width: 5px; flex: none; cursor: col-resize; background: var(--line); }
+  .divider:hover, .divider.active { background: var(--accent); }
+  .code { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; border-top: 1px solid var(--line); }
+  .code-head { display: flex; gap: 8px; align-items: baseline; padding: 6px 12px; font-size: 12px; background: var(--bg); border-bottom: 1px solid var(--line); }
+  .code-head b { word-break: break-all; }
+  .code-head .meta { margin-left: auto; white-space: nowrap; }
+  .code-body { overflow: auto; flex: 1 1 auto; font: 12px/18px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .code-body table { border-collapse: collapse; min-width: 100%; }
+  .code-body td { padding: 0 12px 0 0; white-space: pre; vertical-align: top; }
+  .code-body td.ln { color: var(--muted); text-align: right; user-select: none; padding: 0 10px; background: var(--bg); position: sticky; left: 0; }
+  .code-body tr.in { background: #fff8dc; }
+  .code-body tr.hl { background: #ffe9a8; }
+  .code-body tr.hl td.ln { background: #f5d97a; color: var(--text); }
+  .refs li { flex-wrap: wrap; }
+  .refs .site { border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; font: 11px/16px ui-monospace, Menlo, monospace; color: var(--accent); background: var(--bg); }
+  .refs .site:hover { border-color: var(--accent); }
+  .loc { color: var(--muted); font-weight: 400; }
   .panel h2 { margin: 0; font-size: 14px; word-break: break-all; }
   .panel .meta { color: var(--muted); font-size: 12px; word-break: break-all; }
   .panel h3 { margin: 6px 0 2px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
@@ -105,12 +124,16 @@ function ZoomButton({ glyph, title, onClick }) {
     onClick=${(e) => { e.stopPropagation(); onClick(); }}>${glyph}</button>`;
 }
 
+// Only folders and files get a size: for a function the line range already
+// says it, and the label would just be noise.
+const fmtLoc = (n) => (n.loc > 0 && (n.kind === 'folder' || n.kind === 'file') ? `${n.loc.toLocaleString()} loc` : '');
 function EntityNode({ data, sourcePosition, targetPosition }) {
-  const lines = data.line_end > 0 ? ` · ${data.line_start}–${data.line_end}` : '';
+  const lines = data.kind !== 'folder' ? ` · ${data.line_start + 1}–${data.line_end + 1}` : '';
+  const loc = fmtLoc(data);
   return html`<div class=${'ent kind-' + data.kind} title=${data.path}>
     <${Handle} type="target" position=${targetPosition} />
     <div class="ent-name">${data.name}</div>
-    <div class="ent-sub">${data.kind}${lines}</div>
+    <div class="ent-sub">${data.kind}${loc ? ` · ${loc}` : lines}</div>
     <${Handle} type="source" position=${sourcePosition} />
     ${data.zoomable && html`<${ZoomButton} glyph="+" title="Zoom in" onClick=${() => actions.zoomIn(data.id)} />`}
   </div>`;
@@ -118,7 +141,7 @@ function EntityNode({ data, sourcePosition, targetPosition }) {
 function ContainerNode({ data, sourcePosition, targetPosition }) {
   return html`<div class=${'box kind-' + data.kind} title=${data.path}>
     <${Handle} type="target" position=${targetPosition} />
-    <div class="box-label">${data.name}</div>
+    <div class="box-label">${data.name}${fmtLoc(data) && html` <span class="loc">· ${fmtLoc(data)}</span>`}</div>
     <${ZoomButton} glyph="−" title="Zoom out" onClick=${() => actions.collapse(data.id)} />
     <${Handle} type="source" position=${sourcePosition} />
   </div>`;
@@ -146,7 +169,10 @@ const moved = (node, at) => !node || !at || Math.abs(node.internals.positionAbso
 // them, which is what keeps it out of the nodes between its endpoints. The
 // points are only valid while both endpoints sit where the layout put them;
 // after a drag the edge falls back to a plain bezier until the next re-layout.
-function RefEdge({ source, target, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, markerEnd, style, data }) {
+function RefEdge({ source, target, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, markerEnd, style: base, data, selected }) {
+  // React Flow's own `.selected` rule loses to the inline stroke, so selection
+  // is drawn here.
+  const style = selected ? { ...base, strokeWidth: (base.strokeWidth || 1.5) + 2, filter: 'drop-shadow(0 0 2px rgba(0,0,0,.5))' } : base;
   const s = useInternalNode(source), t = useInternalNode(target);
   const routed = data?.points && !moved(s, data.at?.s) && !moved(t, data.at?.t);
   let path, lx, ly;
@@ -165,6 +191,27 @@ function RefEdge({ source, target, sourceX, sourceY, targetX, targetY, sourcePos
   </g>`;
 }
 const edgeTypes = { ref: RefEdge };
+
+// Memoized because a large file is thousands of rows and the App re-renders
+// on every drag frame.
+const CodePane = React.memo(function CodePane({ src, line, range, onClose }) {
+  const bodyRef = useRef(null);
+  useEffect(() => {
+    bodyRef.current?.querySelector('tr.hl')?.scrollIntoView({ block: 'center' });
+  }, [src, line]);
+  const close = html`<button class="btn" title="Close" onClick=${onClose}>×</button>`;
+  if (!src) return html`<div class="code"><div class="code-head"><span class="meta">loading…</span>${close}</div></div>`;
+  if (src.error) return html`<div class="code"><div class="code-head"><span class="err">${src.error}</span>${close}</div></div>`;
+  const lines = src.text.split('\n');
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  const cls = (i) => (i === line ? 'hl' : i >= range[0] && i <= range[1] ? 'in' : '');
+  return html`<div class="code">
+    <div class="code-head"><b>${src.path}</b><span class="meta">${lines.length} lines · at ${line + 1}</span>${close}</div>
+    <div class="code-body" ref=${bodyRef}><table><tbody>
+      ${lines.map((t, i) => html`<tr key=${i} class=${cls(i)}><td class="ln">${i + 1}</td><td>${t}</td></tr>`)}
+    </tbody></table></div>
+  </div>`;
+});
 
 // One edge per node pair, keeping the kind that says most about coupling. An
 // import is a prerequisite of the call or type use it enables, and `generic`
@@ -668,7 +715,15 @@ function App() {
   const [showRefs, setShowRefs] = useState(true);
   const [bundle, setBundle] = useState(true);
   const [onePerPair, setOnePerPair] = useState(true);
-  const [selectedId, setSelectedId] = useState(null);
+  // { type: 'node', id: <rf node id> } | { type: 'edge', id: <rf edge id> } | null
+  const [sel, setSel] = useState(null);
+  const selectedId = sel?.type === 'node' ? sel.id : null;
+  const setSelectedId = useCallback((id) => setSel(id == null ? null : { type: 'node', id }), []);
+  // The code pane: which file is open and which lines to mark.
+  const [code, setCode] = useState(null);
+  const [sources, setSources] = useState(() => new Map());
+  const [panelW, setPanelW] = useState(460);
+  const [resizing, setResizing] = useState(false);
   const [status, setStatus] = useState('');
   const [panelError, setPanelError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -751,8 +806,44 @@ function App() {
   }, [model, dir]);
 
   useEffect(() => {
-    if (selectedId != null && !nodes.some((n) => n.id === selectedId)) setSelectedId(null);
-  }, [nodes, selectedId]);
+    if (!sel) return;
+    const alive = sel.type === 'node' ? nodes.some((n) => n.id === sel.id) : edges.some((e) => e.id === sel.id);
+    if (!alive) setSel(null);
+  }, [nodes, edges, sel]);
+
+  const fileOf = (id) => {
+    for (let n = graph?.nodes[id]; n; n = n.parent != null ? graph.nodes[n.parent] : null) if (n.kind === 'file') return n.id;
+    return null;
+  };
+  const openCode = (entityId, line, range) => {
+    const fileId = fileOf(entityId);
+    if (fileId == null) return;
+    setCode({ fileId, line, range });
+    if (sources.has(fileId)) return;
+    fetchJson(`./source?id=${fileId}`)
+      .then((src) => setSources((m) => new Map(m).set(fileId, src)))
+      .catch((e) => setSources((m) => new Map(m).set(fileId, { error: e.message })));
+  };
+  const closeCode = useCallback(() => setCode(null), []);
+  // Selecting anything inside a file opens it at that entity; selecting a
+  // folder leaves whatever is open alone.
+  useEffect(() => {
+    if (sel?.type !== 'node') return;
+    const ent = nodes.find((n) => n.id === sel.id)?.data;
+    // Tinting a whole file's range would paint every line; only sub-file
+    // entities get their extent marked.
+    if (ent) openCode(ent.id, ent.line_start, ent.kind === 'file' ? [-1, -1] : [ent.line_start, ent.line_end]);
+  }, [sel]);
+
+  const startResize = (e) => {
+    e.preventDefault();
+    const x0 = e.clientX, w0 = panelW;
+    setResizing(true);
+    const move = (ev) => setPanelW(Math.max(240, Math.min(window.innerWidth - 320, w0 + (x0 - ev.clientX))));
+    const up = () => { setResizing(false); window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  };
 
   const switchView = (v) => { focusRef.current = null; setView(v); setStatus(''); };
   const switchDir = (d) => { focusRef.current = null; setDir(d); };
@@ -801,7 +892,8 @@ function App() {
   }, [nodes]);
   const onEdgesChange = useCallback((c) => setEdges((es) => applyEdgeChanges(c, es)), []);
   const onNodeClick = useCallback((_, n) => { setSelectedId(n.id); setPanelError(''); }, []);
-  const onPaneClick = useCallback(() => setSelectedId(null), []);
+  const onEdgeClick = useCallback((_, e) => { if (e.data.ref) { setSel({ type: 'edge', id: e.id }); setPanelError(''); } }, []);
+  const onPaneClick = useCallback(() => setSel(null), []);
 
   const post = async (path) => {
     setBusy(true); setPanelError(''); setStatus('');
@@ -852,6 +944,7 @@ function App() {
   const outgoing = !selected ? [] : isBox ? drawnFor('source') : (rawRefs || []).filter((e) => e.from === selected.id).map((e) => ({ kind: e.kind, other: String(e.to) }));
   const labelOf = (nodeId) => nodes.find((n) => n.id === nodeId)?.data.name ?? nameOf(Number(nodeId));
   const children = selected && (view === 'raw' || isBox) ? graph.nodes.filter((n) => n.parent === selected.id) : [];
+  const locOf = (n) => (n.loc > 0 ? html`<span class="loc">${n.loc.toLocaleString()} loc</span>` : '');
 
   const edgeList = (list) => list.length
     ? html`<ul>${list.map((e, i) => html`<li key=${i}>
@@ -860,6 +953,38 @@ function App() {
         ${e.kinds && Object.keys(e.kinds).length > 1 && html`<span class="meta">${Object.entries(e.kinds).map(([k, c]) => `${k} ${c}`).join(', ')}</span>`}
       </li>`)}</ul>`
     : html`<div class="empty">none</div>`;
+
+  // An edge stands for every raw reference between its two subtrees, of the
+  // kinds it carries. Coalescing drops references whose endpoint is an
+  // expanded entity, so this list can be longer than the edge's count.
+  const selectedEdge = sel?.type === 'edge' ? edges.find((e) => e.id === sel.id) : null;
+  const entityOf = (rfId) => Number(String(rfId).replace(/^c/, ''));
+  const underOrSelf = (id, anc) => id === anc || isUnder(id, anc);
+  const edgeRefs = !selectedEdge ? [] : (() => {
+    const s = entityOf(selectedEdge.source), t = entityOf(selectedEdge.target);
+    const kinds = new Set(selectedEdge.data.kinds ? Object.keys(selectedEdge.data.kinds) : [selectedEdge.data.kind]);
+    return graph.references.filter((r) => kinds.has(r.kind) && underOrSelf(r.from, s) && underOrSelf(r.to, t));
+  })();
+  // The nearest drawn node containing an entity, since in the coalesced view
+  // the entity itself may sit inside a collapsed leaf.
+  const selectEntity = (id) => {
+    for (let cur = id; cur != null; cur = graph.nodes[cur].parent) {
+      const rf = nodes.find((n) => n.id === String(cur) || n.id === `c${cur}`);
+      if (rf) { setSelectedId(rf.id); return; }
+    }
+  };
+  const fileName = (id) => { const f = fileOf(id); return f == null ? '?' : graph.nodes[f].name; };
+  const openAt = (id) => { const e = graph.nodes[id]; openCode(id, e.line_start, [e.line_start, e.line_end]); };
+  const refList = edgeRefs.length
+    ? html`<ul class="refs">${edgeRefs.map((r, i) => html`<li key=${i}>
+        <span class="tag" style=${{ background: edgeColor(r.kind) }}>${r.kind}</span>
+        <button onClick=${() => selectEntity(r.from)}>${nameOf(r.from)}</button><span class="meta">→</span>
+        <button onClick=${() => selectEntity(r.to)}>${nameOf(r.to)}</button>
+        ${(r.sites || []).map((line) => html`<button key=${line} class="site" title="Open the reference site" onClick=${() => openCode(r.from, line, [line, line])}>${fileName(r.from)}:${line + 1}</button>`)}
+        ${!(r.sites || []).length && html`<span class="meta">(no site recorded)</span>`}
+        <button class="site" title="Open the definition" onClick=${() => openAt(r.to)}>def ${fileName(r.to)}:${graph.nodes[r.to].line_start + 1}</button>
+      </li>`)}</ul>`
+    : html`<div class="empty">no references of these kinds between the two</div>`;
 
   return html`<div class="app">
     <div class="toolbar">
@@ -886,7 +1011,7 @@ function App() {
         <${ReactFlow}
           nodes=${nodes} edges=${visibleEdges} nodeTypes=${nodeTypes} edgeTypes=${edgeTypes}
           onNodesChange=${onNodesChange} onEdgesChange=${onEdgesChange}
-          onNodeClick=${onNodeClick} onPaneClick=${onPaneClick}
+          onNodeClick=${onNodeClick} onEdgeClick=${onEdgeClick} onPaneClick=${onPaneClick}
           nodesDraggable=${true} nodesConnectable=${false} elementsSelectable=${true}
           panOnScroll=${true} panOnScrollMode="free" zoomOnScroll=${false} zoomOnPinch=${true}
           zoomActivationKeyCode="Control" zoomOnDoubleClick=${false}
@@ -897,23 +1022,32 @@ function App() {
           <${Background} gap=${20} color="#dcdfe4" />
         <//>
       </div>
-      <div class="panel">
+      <div class=${'divider' + (resizing ? ' active' : '')} onMouseDown=${startResize}></div>
+      <div class="panel" style=${{ width: panelW }}>
+        <div class=${'panel-top' + (code ? ' with-code' : '')}>
         ${selected ? html`
           <h2>${selected.name}</h2>
           <div class="meta">${selected.path}</div>
-          <div class="meta">${selected.kind}${selected.line_end > 0 ? ` · lines ${selected.line_start}–${selected.line_end}` : ''} · id ${selected.id}</div>
+          <div class="meta">${selected.kind}${selected.kind !== 'folder' ? ` · lines ${selected.line_start + 1}–${selected.line_end + 1}` : ''}${selected.loc > 0 ? ` · ${selected.loc.toLocaleString()} loc` : ''} · id ${selected.id}</div>
           ${panelError && html`<div class="err">${panelError}</div>`}
           <h3>Outgoing (${outgoing.length})</h3>${edgeList(outgoing)}
           <h3>Incoming (${incoming.length})</h3>${edgeList(incoming)}
           ${(view === 'raw' || isBox) && html`<h3>Children (${children.length})</h3>
             ${children.length
-              ? html`<ul>${children.map((c) => html`<li key=${c.id}><span class="meta">${c.kind}</span><button onClick=${() => setSelectedId(nodes.some((n) => n.id === `c${c.id}`) ? `c${c.id}` : String(c.id))}>${c.name}</button></li>`)}</ul>`
+              ? html`<ul>${children.map((c) => html`<li key=${c.id}><span class="meta">${c.kind}</span><button onClick=${() => setSelectedId(nodes.some((n) => n.id === `c${c.id}`) ? `c${c.id}` : String(c.id))}>${c.name}</button>${locOf(c)}</li>`)}</ul>`
               : html`<div class="empty">none</div>`}`}
-        ` : html`<div class="empty">Click a node to inspect it. In the coalesced view, + on a node expands it and − on a box collapses it. Drag on empty canvas to select; middle/right-drag or space+drag to pan; ctrl+wheel to zoom.</div>`}
+        ` : selectedEdge ? html`
+          <h2>${labelOf(selectedEdge.source)} <span class="loc">→</span> ${labelOf(selectedEdge.target)}</h2>
+          <div class="row">${Object.entries(selectedEdge.data.kinds || { [selectedEdge.data.kind]: selectedEdge.data.count })
+            .map(([k, c]) => html`<span key=${k} class="tag" style=${{ background: edgeColor(k) }}>${k}${c > 1 ? ` ×${c}` : ''}</span>`)}</div>
+          <h3>References (${edgeRefs.length})</h3>${refList}
+        ` : html`<div class="empty">Click a node or an edge to inspect it. In the coalesced view, + on a node expands it and − on a box collapses it. Drag on empty canvas to select; middle/right-drag or space+drag to pan; ctrl+wheel to zoom.</div>`}
         <div class="legend">
           ${Object.entries(EDGE_COLOR).map(([k, c]) => html`<span key=${k}><i style=${{ background: c }}></i>${k}</span>`)}
           <span><i style=${{ background: '#b0b4bb' }}></i>contains</span>
         </div>
+        </div>
+        ${code && html`<${CodePane} src=${sources.get(code.fileId)} line=${code.line} range=${code.range} onClose=${closeCode} />`}
       </div>
     </div>
   </div>`;

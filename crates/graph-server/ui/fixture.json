@@ -1,30 +1,30 @@
 {
   "root": "demo",
   "nodes": [
-    { "id": 0, "kind": "folder", "name": "demo", "path": "demo", "line_start": 0, "line_end": 0, "parent": null },
-    { "id": 1, "kind": "folder", "name": "src", "path": "demo/src", "line_start": 0, "line_end": 0, "parent": 0 },
-    { "id": 2, "kind": "file", "name": "main.rs", "path": "demo/src/main.rs", "line_start": 0, "line_end": 30, "parent": 1 },
-    { "id": 3, "kind": "function", "name": "main", "path": "demo/src/main.rs/main", "line_start": 2, "line_end": 12, "parent": 2 },
-    { "id": 4, "kind": "function", "name": "helper", "path": "demo/src/main.rs/helper", "line_start": 14, "line_end": 20, "parent": 2 },
-    { "id": 5, "kind": "file", "name": "lib.rs", "path": "demo/src/lib.rs", "line_start": 0, "line_end": 80, "parent": 1 },
-    { "id": 6, "kind": "class", "name": "Point", "path": "demo/src/lib.rs/Point", "line_start": 1, "line_end": 6, "parent": 5 },
-    { "id": 7, "kind": "function", "name": "new", "path": "demo/src/lib.rs/Point/new", "line_start": 8, "line_end": 12, "parent": 6 },
-    { "id": 8, "kind": "function", "name": "distance", "path": "demo/src/lib.rs/Point/distance", "line_start": 13, "line_end": 20, "parent": 6 },
-    { "id": 9, "kind": "module", "name": "geometry", "path": "demo/src/lib.rs/geometry", "line_start": 22, "line_end": 60, "parent": 5 },
-    { "id": 10, "kind": "function", "name": "area", "path": "demo/src/lib.rs/geometry/area", "line_start": 24, "line_end": 40, "parent": 9 },
-    { "id": 11, "kind": "folder", "name": "tests", "path": "demo/tests", "line_start": 0, "line_end": 0, "parent": 0 },
-    { "id": 12, "kind": "file", "name": "smoke.rs", "path": "demo/tests/smoke.rs", "line_start": 0, "line_end": 25, "parent": 11 },
-    { "id": 13, "kind": "function", "name": "test_area", "path": "demo/tests/smoke.rs/test_area", "line_start": 3, "line_end": 15, "parent": 12 }
+    { "id": 0, "kind": "folder", "name": "demo", "path": "demo", "line_start": 0, "line_end": 0, "parent": null, "loc": 138 },
+    { "id": 1, "kind": "folder", "name": "src", "path": "demo/src", "line_start": 0, "line_end": 0, "parent": 0, "loc": 112 },
+    { "id": 2, "kind": "file", "name": "main.rs", "path": "demo/src/main.rs", "line_start": 0, "line_end": 30, "parent": 1, "loc": 31 },
+    { "id": 3, "kind": "function", "name": "main", "path": "demo/src/main.rs/main", "line_start": 2, "line_end": 12, "parent": 2, "loc": 11 },
+    { "id": 4, "kind": "function", "name": "helper", "path": "demo/src/main.rs/helper", "line_start": 14, "line_end": 20, "parent": 2, "loc": 7 },
+    { "id": 5, "kind": "file", "name": "lib.rs", "path": "demo/src/lib.rs", "line_start": 0, "line_end": 80, "parent": 1, "loc": 81 },
+    { "id": 6, "kind": "class", "name": "Point", "path": "demo/src/lib.rs/Point", "line_start": 1, "line_end": 6, "parent": 5, "loc": 6 },
+    { "id": 7, "kind": "function", "name": "new", "path": "demo/src/lib.rs/Point/new", "line_start": 8, "line_end": 12, "parent": 6, "loc": 5 },
+    { "id": 8, "kind": "function", "name": "distance", "path": "demo/src/lib.rs/Point/distance", "line_start": 13, "line_end": 20, "parent": 6, "loc": 8 },
+    { "id": 9, "kind": "module", "name": "geometry", "path": "demo/src/lib.rs/geometry", "line_start": 22, "line_end": 60, "parent": 5, "loc": 39 },
+    { "id": 10, "kind": "function", "name": "area", "path": "demo/src/lib.rs/geometry/area", "line_start": 24, "line_end": 40, "parent": 9, "loc": 17 },
+    { "id": 11, "kind": "folder", "name": "tests", "path": "demo/tests", "line_start": 0, "line_end": 0, "parent": 0, "loc": 26 },
+    { "id": 12, "kind": "file", "name": "smoke.rs", "path": "demo/tests/smoke.rs", "line_start": 0, "line_end": 25, "parent": 11, "loc": 26 },
+    { "id": 13, "kind": "function", "name": "test_area", "path": "demo/tests/smoke.rs/test_area", "line_start": 3, "line_end": 15, "parent": 12, "loc": 13 }
   ],
   "references": [
-    { "from": 2, "to": 6, "kind": "import" },
-    { "from": 3, "to": 7, "kind": "call" },
-    { "from": 3, "to": 4, "kind": "call" },
-    { "from": 4, "to": 8, "kind": "call" },
-    { "from": 10, "to": 8, "kind": "call" },
-    { "from": 10, "to": 6, "kind": "type_ref" },
-    { "from": 12, "to": 9, "kind": "import" },
-    { "from": 13, "to": 10, "kind": "call" },
-    { "from": 8, "to": 6, "kind": "type_ref" }
+    { "from": 2, "to": 6, "kind": "import", "sites": [] },
+    { "from": 3, "to": 7, "kind": "call", "sites": [4, 9] },
+    { "from": 3, "to": 4, "kind": "call", "sites": [] },
+    { "from": 4, "to": 8, "kind": "call", "sites": [] },
+    { "from": 10, "to": 8, "kind": "call", "sites": [] },
+    { "from": 10, "to": 6, "kind": "type_ref", "sites": [] },
+    { "from": 12, "to": 9, "kind": "import", "sites": [0] },
+    { "from": 13, "to": 10, "kind": "call", "sites": [] },
+    { "from": 8, "to": 6, "kind": "type_ref", "sites": [] }
   ]
 }

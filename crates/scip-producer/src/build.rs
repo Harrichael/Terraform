@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use entity_graph::{Entity, EntityGraph, EntityId, EntityKind, Reference, ReferenceKind};
+use entity_graph::{Entity, EntityGraph, EntityId, EntityKind, Reference, ReferenceKind, Site};
 use scip::types::symbol_information::Kind;
 use scip::types::{Document, Index, Occurrence, SymbolRole};
 
@@ -296,8 +296,8 @@ impl<'a> Builder<'a> {
     }
 
     fn references(&mut self) -> Vec<Reference> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
+        let mut index: HashMap<(EntityId, EntityId, ReferenceKind), usize> = HashMap::new();
+        let mut out: Vec<Reference> = Vec::new();
         for d in 0..self.docs.len() {
             for (o, occ) in self.docs[d].occurrences.iter().enumerate() {
                 if self.claimed.contains(&(d, o)) {
@@ -319,10 +319,19 @@ impl<'a> Builder<'a> {
                     continue;
                 }
                 let kind = self.reference_kind(d, occ, span.start, self.entities[to.0].kind);
-                if seen.insert((from, to, kind)) {
-                    out.push(Reference { from, to, kind });
+                let site = Site { line: span.start.line };
+                match index.get(&(from, to, kind)) {
+                    Some(&i) => out[i].sites.push(site),
+                    None => {
+                        index.insert((from, to, kind), out.len());
+                        out.push(Reference { from, to, kind, sites: vec![site] });
+                    }
                 }
             }
+        }
+        for r in &mut out {
+            r.sites.sort();
+            r.sites.dedup();
         }
         out
     }

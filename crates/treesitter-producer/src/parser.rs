@@ -99,10 +99,10 @@ pub fn parse_directory(dir: &Path) -> Result<CodeTree> {
 
     // Phase 3: for each file extract raw references and resolve them to node IDs.
     for (file_id, source, lang) in &file_sources {
-        for (from_id, ref_name, kind) in extract_raw_refs(source, lang, &tree, *file_id) {
+        for (from_id, ref_name, kind, line) in extract_raw_refs(source, lang, &tree, *file_id) {
             if let Some(&to_id) = name_to_id.get(&ref_name) {
                 if from_id != to_id {
-                    tree.add_reference(from_id, to_id, kind);
+                    tree.add_reference_at(from_id, to_id, kind, line);
                 }
             }
         }
@@ -224,15 +224,16 @@ fn build_name_to_id_map(tree: &CodeTree) -> HashMap<String, usize> {
 
 /// Extract raw symbolic references from one file's source.
 ///
-/// Returns `(from_node_id, ref_name, ref_kind)` triples where `from_node_id`
+/// Returns `(from_node_id, ref_name, ref_kind, line)` where `from_node_id`
 /// is the innermost Function/Class/File node that textually contains the
-/// reference site (determined by byte-range containment).
+/// reference site (determined by byte-range containment) and `line` is the
+/// 0-indexed row of the referencing identifier.
 fn extract_raw_refs(
     source: &str,
     lang: &SourceLanguage,
     tree: &CodeTree,
     file_id: usize,
-) -> Vec<(usize, String, ReferenceKind)> {
+) -> Vec<(usize, String, ReferenceKind, usize)> {
     if matches!(lang, SourceLanguage::PlainText | SourceLanguage::Sql) {
         return Vec::new();
     }
@@ -304,7 +305,7 @@ fn collect_ref_edges(
     source: &[u8],
     scope_nodes: &[(usize, (usize, usize))],
     file_id: usize,
-    result: &mut Vec<(usize, String, ReferenceKind)>,
+    result: &mut Vec<(usize, String, ReferenceKind, usize)>,
 ) {
     let kind = node.kind();
 
@@ -314,7 +315,8 @@ fn collect_ref_edges(
         if let Some(fn_node) = node.child_by_field_name("function") {
             if let Some(name) = extract_leaf_ident(fn_node, source) {
                 if !is_trivial_name(&name) {
-                    result.push((from_id, name, ReferenceKind::Call));
+                    let line = fn_node.start_position().row;
+                    result.push((from_id, name, ReferenceKind::Call, line));
                 }
             }
         }
@@ -322,18 +324,18 @@ fn collect_ref_edges(
 
     // Rust `use` declarations → Import from the file node.
     if kind == "use_declaration" {
-        for name in extract_use_leaf_names(node, source) {
+        for (name, line) in extract_use_leaf_names(node, source) {
             if !is_trivial_name(&name) {
-                result.push((file_id, name, ReferenceKind::Import));
+                result.push((file_id, name, ReferenceKind::Import, line));
             }
         }
     }
 
     // Python / JS / TS import statements → Import from the file node.
     if kind == "import_statement" || kind == "import_from_statement" {
-        for name in extract_import_leaf_names(node, source) {
+        for (name, line) in extract_import_leaf_names(node, source) {
             if !is_trivial_name(&name) {
-                result.push((file_id, name, ReferenceKind::Import));
+                result.push((file_id, name, ReferenceKind::Import, line));
             }
         }
     }
@@ -368,17 +370,17 @@ fn extract_leaf_ident(node: Node<'_>, source: &[u8]) -> Option<String> {
     }
 }
 
-/// Extract leaf names from a Rust `use_declaration` node.
-fn extract_use_leaf_names(node: Node<'_>, source: &[u8]) -> Vec<String> {
+/// Extract `(leaf name, row)` pairs from a Rust `use_declaration` node.
+fn extract_use_leaf_names(node: Node<'_>, source: &[u8]) -> Vec<(String, usize)> {
     let mut names = Vec::new();
     collect_use_names(node, source, &mut names);
     names
 }
 
-fn collect_use_names(node: Node<'_>, source: &[u8], names: &mut Vec<String>) {
+fn collect_use_names(node: Node<'_>, source: &[u8], names: &mut Vec<(String, usize)>) {
     match node.kind() {
         "identifier" | "type_identifier" => {
-            names.push(extract_node_text(node, source));
+            names.push((extract_node_text(node, source), node.start_position().row));
         }
         // `use foo as Bar` — extract the original name only.
         "use_as_clause" => {
@@ -397,32 +399,33 @@ fn collect_use_names(node: Node<'_>, source: &[u8], names: &mut Vec<String>) {
     }
 }
 
-/// Extract leaf names from Python/JS/TS import statements.
-fn extract_import_leaf_names(node: Node<'_>, source: &[u8]) -> Vec<String> {
+/// Extract `(leaf name, row)` pairs from Python/JS/TS import statements.
+fn extract_import_leaf_names(node: Node<'_>, source: &[u8]) -> Vec<(String, usize)> {
     let mut names = Vec::new();
     collect_import_names(node, source, &mut names);
     names
 }
 
-fn collect_import_names(node: Node<'_>, source: &[u8], names: &mut Vec<String>) {
+fn collect_import_names(node: Node<'_>, source: &[u8], names: &mut Vec<(String, usize)>) {
+    let row = node.start_position().row;
     match node.kind() {
         "identifier" => {
-            names.push(extract_node_text(node, source));
+            names.push((extract_node_text(node, source), row));
         }
         // Python dotted names (e.g. `os.path`) — take the last segment.
         "dotted_name" | "relative_import" => {
             let text = extract_node_text(node, source);
             let leaf = text.split('.').last().unwrap_or(&text).trim().to_string();
             if !leaf.is_empty() {
-                names.push(leaf);
+                names.push((leaf, row));
             }
         }
         // JS `import_specifier`: `{ A as B }` → extract A.
         "import_specifier" => {
             if let Some(name_node) = node.child_by_field_name("name") {
-                names.push(extract_node_text(name_node, source));
+                names.push((extract_node_text(name_node, source), name_node.start_position().row));
             } else if let Some(first) = node.named_child(0) {
-                names.push(extract_node_text(first, source));
+                names.push((extract_node_text(first, source), first.start_position().row));
             }
         }
         // Skip raw string module paths in JS/TS `from 'module'`.

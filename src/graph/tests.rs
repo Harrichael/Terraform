@@ -259,6 +259,7 @@ fn test_navigator_cross_root_reference() {
             from: EntityId(0),
             to: EntityId(1),
             kind: ReferenceKind::Import,
+            sites: vec![],
         }],
     };
     let nav = Navigator::new(graph);
@@ -367,6 +368,7 @@ fn test_navigator_reference_remaps_through_zoom() {
             from: EntityId(3),
             to: EntityId(4),
             kind: ReferenceKind::Call,
+            sites: vec![],
         }],
     };
     graph.entities[0].children = vec![EntityId(1), EntityId(2)];
@@ -410,8 +412,8 @@ fn test_navigator_mutual_references_no_cycle_nodes() {
             make_entity(2, "mod_b", EntityKind::Module, Some(EntityId(0))),
         ],
         references: vec![
-            Reference { from: EntityId(1), to: EntityId(2), kind: ReferenceKind::Call },
-            Reference { from: EntityId(2), to: EntityId(1), kind: ReferenceKind::Call },
+            Reference { from: EntityId(1), to: EntityId(2), kind: ReferenceKind::Call, sites: vec![] },
+            Reference { from: EntityId(2), to: EntityId(1), kind: ReferenceKind::Call, sites: vec![] },
         ],
     };
     graph.entities[0].children = vec![EntityId(1), EntityId(2)];
@@ -448,9 +450,9 @@ fn test_navigator_three_entity_reference_cycle() {
             make_entity(3, "c",   EntityKind::Module,  Some(EntityId(0))),
         ],
         references: vec![
-            Reference { from: EntityId(1), to: EntityId(2), kind: ReferenceKind::Call },
-            Reference { from: EntityId(2), to: EntityId(3), kind: ReferenceKind::Call },
-            Reference { from: EntityId(3), to: EntityId(1), kind: ReferenceKind::Call },
+            Reference { from: EntityId(1), to: EntityId(2), kind: ReferenceKind::Call, sites: vec![] },
+            Reference { from: EntityId(2), to: EntityId(3), kind: ReferenceKind::Call, sites: vec![] },
+            Reference { from: EntityId(3), to: EntityId(1), kind: ReferenceKind::Call, sites: vec![] },
         ],
     };
     graph.entities[0].children = vec![EntityId(1), EntityId(2), EntityId(3)];
@@ -510,6 +512,7 @@ fn test_navigator_self_loop_reference_suppressed() {
             from: EntityId(0),
             to: EntityId(0),
             kind: ReferenceKind::Call,
+            sites: vec![],
         }],
     };
     let nav = Navigator::new(graph);

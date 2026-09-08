@@ -27,3 +27,4 @@ clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 entity-graph = { workspace = true, features = ["test-support"] }
+tempfile = "3"

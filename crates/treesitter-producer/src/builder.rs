@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use crate::tree::{CodeTree, NodeKind, ReferenceKind};
 use entity_graph::{
     Entity, EntityGraph, EntityId, EntityKind,
-    Reference as GraphReference, ReferenceKind as GraphReferenceKind,
+    Reference as GraphReference, ReferenceKind as GraphReferenceKind, Site,
 };
 
 /// Build an [`EntityGraph`] from a fully-parsed [`CodeTree`].
@@ -144,7 +144,8 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
     // references inside Block/Line nodes still appear at the Function level.
     // Self-loops produced by remapping are discarded, and the remaining edges
     // are deduplicated on (from, to, kind): a Call and an Import between the
-    // same pair are distinct facts a consumer may want to tell apart.
+    // same pair are distinct facts a consumer may want to tell apart. Repeats
+    // of one triple accumulate their occurrence lines onto the single edge.
     //
     // References where the raw `from` or `to` code node is itself a glue
     // node (a glue mod.rs File or one of its declaration-only Module stubs)
@@ -154,7 +155,7 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
     // folder — which causes the folder node to reappear in the view tree
     // even though it has been zoomed past.
     // ------------------------------------------------------------------
-    let mut seen: HashSet<(EntityId, EntityId, GraphReferenceKind)> = HashSet::new();
+    let mut index: HashMap<(EntityId, EntityId, GraphReferenceKind), usize> = HashMap::new();
     let mut references: Vec<GraphReference> = Vec::new();
 
     for r in tree.references.references() {
@@ -180,9 +181,18 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
             ReferenceKind::VarRef => GraphReferenceKind::VarRef,
             ReferenceKind::Generic => GraphReferenceKind::Generic,
         };
-        if seen.insert((from, to, kind)) {
-            references.push(GraphReference { from, to, kind });
+        let site = Site { line: r.line };
+        match index.get(&(from, to, kind)) {
+            Some(&i) => references[i].sites.push(site),
+            None => {
+                index.insert((from, to, kind), references.len());
+                references.push(GraphReference { from, to, kind, sites: vec![site] });
+            }
         }
+    }
+    for r in &mut references {
+        r.sites.sort();
+        r.sites.dedup();
     }
 
     EntityGraph { entities, references }
@@ -362,16 +372,19 @@ mod tests {
 
     /// Edges are deduplicated on the full (from, to, kind) triple: two kinds
     /// between the same pair both survive, while a repeated identical edge
-    /// collapses to one.
+    /// collapses to one whose sites list every distinct occurrence line.
     #[test]
     fn test_references_deduplicated_per_kind() {
         let mut tree = two_file_tree();
-        tree.add_reference(2, 4, ReferenceKind::Call);
-        tree.add_reference(2, 4, ReferenceKind::Import);
-        tree.add_reference(2, 4, ReferenceKind::Call);
+        tree.add_reference_at(2, 4, ReferenceKind::Call, 7);
+        tree.add_reference_at(2, 4, ReferenceKind::Import, 1);
+        tree.add_reference_at(2, 4, ReferenceKind::Call, 3);
+        tree.add_reference_at(2, 4, ReferenceKind::Call, 7);
         let graph = code_tree_to_entity_graph(&tree);
         let kinds: Vec<_> = graph.references.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![GraphReferenceKind::Call, GraphReferenceKind::Import]);
+        assert_eq!(graph.references[0].sites, vec![Site { line: 3 }, Site { line: 7 }]);
+        assert_eq!(graph.references[1].sites, vec![Site { line: 1 }]);
         assert!(graph.references.iter().all(|r| r.from != r.to));
     }
 

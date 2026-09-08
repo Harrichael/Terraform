@@ -12,7 +12,11 @@
 //!
 //! - one root entity, a Folder named after the project directory (or a File
 //!   when a single file was loaded);
-//! - references deduplicated on `(from, to, kind)`, self-loops dropped;
+//! - an entity's `path` is its ancestor names joined by `/`, so a File's path
+//!   is the root name followed by its filesystem path relative to the project
+//!   directory ([`EntityGraph::file_path`] depends on this);
+//! - references deduplicated on `(from, to, kind)`, self-loops dropped; every
+//!   occurrence that contributed to an edge is recorded in its `sites`;
 //! - `byte_range`/`line_range` are `0..0` when not applicable to the kind.
 //!
 //! Consumers never learn which producer built the graph.

@@ -44,7 +44,22 @@ fn check_invariants(graph: &EntityGraph, root_name: &str) {
             seen.insert((r.from, r.to, r.kind)),
             "duplicate reference {r:?}"
         );
+        assert!(!r.sites.is_empty(), "reference without sites {r:?}");
+        assert!(r.sites.windows(2).all(|w| w[0] < w[1]), "sites not sorted/deduped {r:?}");
     }
+}
+
+fn sites(graph: &EntityGraph, from: &str, to: &str, kind: ReferenceKind) -> Vec<usize> {
+    let (from, to) = (id(graph, from), id(graph, to));
+    graph
+        .references
+        .iter()
+        .find(|r| r.from == from && r.to == to && r.kind == kind)
+        .unwrap_or_else(|| panic!("missing edge {from:?} -> {to:?} [{kind}]"))
+        .sites
+        .iter()
+        .map(|s| s.line)
+        .collect()
 }
 
 fn entity_set(graph: &EntityGraph) -> HashSet<(String, EntityKind)> {
@@ -168,6 +183,16 @@ fn rust_fixture_maps_methods_under_their_struct_and_links_across_files() {
         "rust/src/util/mod.rs/greet",
         "rust/src/util/mod.rs/inner/banner",
         Call,
+    );
+
+    // Both `impl Point` headers land on the one file-level TypeRef edge.
+    assert_eq!(
+        sites(&graph, "rust/src/geometry.rs", "rust/src/geometry.rs/Point", TypeRef),
+        vec![5, 15]
+    );
+    assert_eq!(
+        sites(&graph, "rust/src/main.rs/main", "rust/src/geometry.rs/Point/new", Call),
+        vec![6]
     );
 
     let point = &graph.entities[id(&graph, "rust/src/geometry.rs/Point").0];

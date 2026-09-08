@@ -56,7 +56,11 @@ fn load_treesitter(_root: &std::path::Path) -> Result<EntityGraph> {
 fn main() -> Result<()> {
     let args = Args::parse();
     let graph = load_graph(&args)?;
-    let server = Server::new(graph, include_str!("../ui/index.html"));
+    let root = args
+        .path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", args.path.display()))?;
+    let server = Server::new(graph, root, include_str!("../ui/index.html"));
 
     let addr = format!("127.0.0.1:{}", args.port);
     let http = HttpServer::http(&addr).map_err(|e| anyhow::anyhow!("binding {addr}: {e}"))?;

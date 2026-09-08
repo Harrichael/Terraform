@@ -316,6 +316,7 @@ dependencies = [
  "scip-producer",
  "serde",
  "serde_json",
+ "tempfile",
  "tiny_http",
  "treesitter-producer",
 ]
