@@ -17,6 +17,7 @@ scip = ["dep:scip-producer"]
 [dependencies]
 entity-graph = { workspace = true }
 coalesce = { workspace = true }
+graph-diff = { workspace = true }
 treesitter-producer = { workspace = true, optional = true }
 scip-producer = { workspace = true, optional = true }
 anyhow = { workspace = true }
@@ -24,7 +25,10 @@ tiny_http = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 entity-graph = { workspace = true, features = ["test-support"] }
-tempfile = "3"
+# The diff-mode tests build both sides from real trees, so the producer must
+# be there whatever the feature set the binary is built with.
+treesitter-producer = { workspace = true }

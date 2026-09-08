@@ -2,13 +2,16 @@
 //! whole contract is testable without opening a socket. `main.rs` is the only
 //! thing that knows about `tiny_http`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use coalesce::Cursor;
 use entity_graph::{EntityGraph, EntityId};
+use graph_diff::{FileDiff, GraphDiff, Status};
+use tempfile::TempDir;
 
-use crate::dto::{CoalescedDto, ErrorDto, GraphDto, SourceDto};
+use crate::dto::{self, DiffView, ErrorDto, GraphDto, SourceDto};
 
 pub struct Response {
     pub status: u16,
@@ -23,6 +26,21 @@ const HTML: &str = "text/html; charset=utf-8";
 /// file in one `<pre>`, so anything bigger is refused rather than truncated.
 const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Everything diff mode adds: the change tags for the union graph the server
+/// is serving, and both texts of every changed file.
+struct DiffState {
+    base_label: String,
+    base_commit: String,
+    entity_status: Vec<Status>,
+    reference_status: Vec<Status>,
+    churn: Vec<(usize, usize)>,
+    files: HashMap<EntityId, FileDiff>,
+    // The extracted base tree is only read while diffing, but the graph's
+    // paths still name it, so it is kept for the server's lifetime rather
+    // than deleted under a running process. Absent when the caller owns it.
+    _base_tree: Option<TempDir>,
+}
+
 pub struct Server {
     graph: EntityGraph,
     // The graph never changes after load, so its JSON is rendered once; on a
@@ -32,6 +50,7 @@ pub struct Server {
     // The project directory (or single file) the graph was loaded from;
     // `EntityGraph::file_path` results are resolved against it.
     root: PathBuf,
+    diff: Option<DiffState>,
     index_html: &'static str,
 }
 
@@ -40,7 +59,33 @@ impl Server {
         let graph_json = serde_json::to_string(&GraphDto::from(&graph))
             .expect("GraphDto serialization is infallible");
         let cursor = Mutex::new(Cursor::new(&graph));
-        Server { graph, graph_json, cursor, root, index_html }
+        Server { graph, graph_json, cursor, root, diff: None, index_html }
+    }
+
+    /// Serve a diff: the union graph is the graph, the change tags ride along
+    /// as side tables. `base_label` is the ref as the user typed it.
+    pub fn with_diff(
+        diff: GraphDiff,
+        base_label: String,
+        base_commit: String,
+        base_tree: Option<TempDir>,
+        root: PathBuf,
+        index_html: &'static str,
+    ) -> Self {
+        let GraphDiff { graph, entity_status, reference_status, churn, files } = diff;
+        let state = DiffState {
+            base_label,
+            base_commit,
+            entity_status,
+            reference_status,
+            churn,
+            files,
+            _base_tree: base_tree,
+        };
+        let graph_json = serde_json::to_string(&dto::graph_dto_with_diff(&graph, &state.view()))
+            .expect("GraphDto serialization is infallible");
+        let cursor = Mutex::new(Cursor::new(&graph));
+        Server { graph, graph_json, cursor, root, diff: Some(state), index_html }
     }
 
     pub fn graph(&self) -> &EntityGraph {
@@ -92,45 +137,40 @@ impl Server {
             return error(404, &format!("entity {} has no source file", id.0));
         };
         let file_id = file_ancestor(&self.graph, id);
-        let path = self.root.join(&rel);
-
-        // Both sides canonicalized so symlinked roots compare equal; the check
-        // is what stops a hierarchy path containing `..` from escaping the
-        // project (the producer contract forbids it, but the index is data).
-        let (real, real_root) = match (path.canonicalize(), self.root.canonicalize()) {
-            (Ok(p), Ok(r)) => (p, r),
-            (Err(e), _) | (_, Err(e)) => {
-                return error(404, &format!("cannot read {}: {e}", path.display()));
-            }
-        };
-        if !real.starts_with(&real_root) {
-            return error(403, &format!("{} is outside the project root", rel.display()));
+        match self.diff.as_ref().filter(|d| d.files.contains_key(&file_id)) {
+            Some(d) => self.diff_source(file_id, &rel, d),
+            None => match read_source(&self.root, &rel) {
+                Ok(text) => {
+                    let path = wire_path(&rel);
+                    let dto = SourceDto { id: file_id.0, path, text, old_text: None, ops: None };
+                    ok(JSON, serde_json::to_vec(&dto).unwrap())
+                }
+                Err(resp) => resp,
+            },
         }
+    }
 
-        let meta = match std::fs::metadata(&real) {
-            Ok(m) => m,
-            Err(e) => return error(404, &format!("cannot read {}: {e}", path.display())),
+    /// Both sides of a changed file, plus the line ops that interleave them.
+    /// The texts come from the diff computed at load, not from disk: the ops
+    /// only line up with the exact texts they were computed from, and the
+    /// working tree may have moved on since. The side a one-sided file does
+    /// not have is empty rather than an error.
+    fn diff_source(&self, file_id: EntityId, rel: &Path, d: &DiffState) -> Response {
+        let file = &d.files[&file_id];
+        let dto = SourceDto {
+            id: file_id.0,
+            path: wire_path(rel),
+            text: file.new_text.clone().unwrap_or_default(),
+            old_text: Some(file.old_text.clone().unwrap_or_default()),
+            ops: Some(file.ops.iter().map(dto::op_dto).collect()),
         };
-        if meta.len() > MAX_SOURCE_BYTES {
-            return error(
-                413,
-                &format!("{} is {} bytes; limit is {MAX_SOURCE_BYTES}", rel.display(), meta.len()),
-            );
-        }
-        let bytes = match std::fs::read(&real) {
-            Ok(b) => b,
-            Err(e) => return error(404, &format!("cannot read {}: {e}", path.display())),
-        };
-        let Ok(text) = String::from_utf8(bytes) else {
-            return error(415, &format!("{} is not valid UTF-8", rel.display()));
-        };
-        let dto = SourceDto { id: file_id.0, path: wire_path(&rel), text };
         ok(JSON, serde_json::to_vec(&dto).unwrap())
     }
 
     fn coalesced_response(&self) -> Response {
         let coalesced = self.cursor.lock().unwrap().coalesced();
-        ok(JSON, serde_json::to_vec(&CoalescedDto::from(&coalesced)).unwrap())
+        let status = self.diff.as_ref().map(|d| d.reference_status.as_slice());
+        ok(JSON, serde_json::to_vec(&dto::coalesced_dto(&coalesced, status)).unwrap())
     }
 
     // A no-op move is a 409 rather than a 200 with the unchanged payload so the
@@ -161,6 +201,54 @@ impl Server {
             error(409, &format!("entity {} is a root", id.0))
         }
     }
+}
+
+impl DiffState {
+    fn view(&self) -> DiffView<'_> {
+        DiffView {
+            base: &self.base_label,
+            base_commit: &self.base_commit,
+            entity_status: &self.entity_status,
+            reference_status: &self.reference_status,
+            churn: &self.churn,
+        }
+    }
+}
+
+/// Read `rel` under `base`, refusing anything the viewer cannot render. The
+/// error arm is the response to send.
+fn read_source(base: &Path, rel: &Path) -> Result<String, Response> {
+    let path = base.join(rel);
+
+    // Both sides canonicalized so symlinked roots compare equal; the check
+    // is what stops a hierarchy path containing `..` from escaping the
+    // project (the producer contract forbids it, but the index is data).
+    let (real, real_root) = match (path.canonicalize(), base.canonicalize()) {
+        (Ok(p), Ok(r)) => (p, r),
+        (Err(e), _) | (_, Err(e)) => {
+            return Err(error(404, &format!("cannot read {}: {e}", path.display())));
+        }
+    };
+    if !real.starts_with(&real_root) {
+        return Err(error(403, &format!("{} is outside the project root", rel.display())));
+    }
+
+    let meta = match std::fs::metadata(&real) {
+        Ok(m) => m,
+        Err(e) => return Err(error(404, &format!("cannot read {}: {e}", path.display()))),
+    };
+    if meta.len() > MAX_SOURCE_BYTES {
+        return Err(error(
+            413,
+            &format!("{} is {} bytes; limit is {MAX_SOURCE_BYTES}", rel.display(), meta.len()),
+        ));
+    }
+    let bytes = match std::fs::read(&real) {
+        Ok(b) => b,
+        Err(e) => return Err(error(404, &format!("cannot read {}: {e}", path.display()))),
+    };
+    String::from_utf8(bytes)
+        .map_err(|_| error(415, &format!("{} is not valid UTF-8", rel.display())))
 }
 
 fn file_ancestor(graph: &EntityGraph, id: EntityId) -> EntityId {
@@ -365,6 +453,113 @@ mod tests {
         let resp = s.respond("GET", "/source?id=1");
         assert_eq!(resp.status, 200);
         assert_eq!(json(&resp), serde_json::json!({ "id": 0, "path": "", "text": "fn f() {}\n" }));
+    }
+
+    /// Diff mode end to end over two hand-built trees (no git). The union
+    /// graph carries the base labels and per-node status and churn, coalesced
+    /// edges carry their member references plus an aggregated status (`mixed`
+    /// where a bundle holds both an unchanged and an added reference), and
+    /// `/source` serves both sides of a changed file with the ops that
+    /// interleave them — reading a removed file out of the base tree.
+    #[test]
+    fn diff_mode_payloads_carry_change_tags() {
+        const LIB: &str =
+            "/// Doc.\nfn alpha() {\n    let x = 1;\n}\n\nfn beta() {\n    alpha();\n}\n";
+        const LIB_EDITED: &str = "/// Doc.\nfn alpha() {\n    let x = 1;\n    let y = 2;\n}\n\n\
+                                  fn beta() {\n    alpha();\n}\n";
+        const UTIL: &str = "fn one() {\n    alpha();\n}\n\nfn two() {\n    1\n}\n";
+        const UTIL_EDITED: &str = "fn one() {\n    alpha();\n}\n\nfn two() {\n    beta();\n}\n";
+
+        let trees = tempfile::TempDir::new().unwrap();
+        let old_root = trees.path().join("base/proj");
+        let new_root = trees.path().join("work/proj");
+        write_tree(&old_root, &[
+            ("src/lib.rs", LIB),
+            ("src/util.rs", UTIL),
+            ("src/gone.rs", "fn gone() {\n    alpha();\n}\n"),
+        ]);
+        write_tree(&new_root, &[("src/lib.rs", LIB_EDITED), ("src/util.rs", UTIL_EDITED)]);
+        let old = treesitter_producer::graph_from_path(&old_root).unwrap();
+        let new = treesitter_producer::graph_from_path(&new_root).unwrap();
+        let diff = graph_diff::diff(&old, &old_root, &new, &new_root).unwrap();
+        let s = Server::with_diff(
+            diff,
+            "HEAD~1".into(),
+            "0123abcd".into(),
+            None,
+            new_root,
+            INDEX,
+        );
+
+        let graph = json(&s.respond("GET", "/graph.json"));
+        assert_eq!(
+            graph["diff"],
+            serde_json::json!({ "base": "HEAD~1", "base_commit": "0123abcd" })
+        );
+        let node = |path: &str| {
+            graph["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["path"] == path)
+                .unwrap_or_else(|| panic!("no node at {path}"))
+                .clone()
+        };
+        let alpha = node("proj/src/lib.rs/alpha");
+        assert_eq!(alpha["status"], "modified");
+        assert_eq!(alpha["added"], 1);
+        assert_eq!(alpha["removed"], 0);
+        assert_eq!(node("proj/src/lib.rs/beta")["status"], "same");
+        assert_eq!(node("proj/src/gone.rs")["status"], "removed");
+        assert_eq!(node("proj/src/gone.rs")["removed"], 3);
+        assert_eq!(node("proj/src")["status"], "modified");
+
+        // Zoom to the file level: every edge names its member references, and
+        // the util.rs -> lib.rs bundle holds an unchanged and an added call.
+        s.respond("POST", "/coalesced/zoom-in?id=0");
+        let src_id = node("proj/src")["id"].clone();
+        let view = json(&s.respond("POST", &format!("/coalesced/zoom-in?id={src_id}")));
+        let edges = view["edges"].as_array().unwrap();
+        assert!(edges.iter().all(|e| !e["refs"].as_array().unwrap().is_empty()), "{edges:?}");
+        let edge = |from: &str, to: &str| {
+            edges
+                .iter()
+                .find(|e| e["from"] == node(from)["id"] && e["to"] == node(to)["id"])
+                .unwrap_or_else(|| panic!("no edge {from} -> {to} in {edges:?}"))
+        };
+        assert_eq!(edge("proj/src/util.rs", "proj/src/lib.rs")["status"], "mixed");
+        assert_eq!(edge("proj/src/gone.rs", "proj/src/lib.rs")["status"], "removed");
+
+        let lib_id = node("proj/src/lib.rs")["id"].as_u64().unwrap();
+        let source = json(&s.respond("GET", &format!("/source?id={lib_id}")));
+        assert_eq!(source["text"], LIB_EDITED);
+        assert_eq!(source["old_text"], LIB);
+        assert_eq!(
+            source["ops"],
+            serde_json::json!([["=", 0, 3, 0, 3], ["+", 3, 0, 3, 1], ["=", 3, 5, 4, 5]])
+        );
+
+        // The removed file only exists in the base tree.
+        let gone_id = node("proj/src/gone.rs")["id"].as_u64().unwrap();
+        let removed = json(&s.respond("GET", &format!("/source?id={gone_id}")));
+        assert_eq!(removed["text"], "");
+        assert_eq!(removed["old_text"], "fn gone() {\n    alpha();\n}\n");
+        assert_eq!(removed["ops"], serde_json::json!([["-", 0, 3, 0, 0]]));
+
+        // An unchanged file keeps the plain shape, so the UI reads absent ops
+        // as "nothing to interleave".
+        let util_id = node("proj/src/util.rs")["id"].clone();
+        let util = json(&s.respond("GET", &format!("/source?id={util_id}")));
+        assert!(util.get("ops").is_some(), "util.rs did change");
+        assert_eq!(util["old_text"], UTIL);
+    }
+
+    fn write_tree(root: &std::path::Path, files: &[(&str, &str)]) {
+        for (rel, body) in files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
     }
 
     #[test]

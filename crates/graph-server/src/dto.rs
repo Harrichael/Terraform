@@ -1,16 +1,28 @@
 //! JSON shapes for the HTTP contract in `ui/CONTRACT.md`. Field names and
 //! kind strings are the wire format; the fixture test in `handlers.rs` pins
 //! them to `ui/fixture.json`.
+//!
+//! Diff-mode fields are `Option` + `skip_serializing_if`, so a plain load
+//! serializes byte-identically to before diffing existed.
 
 use coalesce::{Coalesced, CoalescedEdge};
 use entity_graph::{Entity, EntityGraph, EntityId, EntityKind, Reference, ReferenceKind};
+use graph_diff::{LineOp, Status, Tag};
 use serde::Serialize;
 
 #[derive(Serialize)]
 pub struct GraphDto {
     pub root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DiffDto>,
     pub nodes: Vec<NodeDto>,
     pub references: Vec<ReferenceDto>,
+}
+
+#[derive(Serialize)]
+pub struct DiffDto {
+    pub base: String,
+    pub base_commit: String,
 }
 
 #[derive(Serialize)]
@@ -23,6 +35,12 @@ pub struct NodeDto {
     pub line_end: usize,
     pub parent: Option<usize>,
     pub loc: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -31,24 +49,55 @@ pub struct ReferenceDto {
     pub to: usize,
     pub kind: &'static str,
     pub sites: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
+}
+
+/// A coalesced edge stands for many raw references; `refs` are their indices
+/// into `graph.references`, so the UI can join back for sites and status.
+#[derive(Serialize)]
+pub struct EdgeDto {
+    pub from: usize,
+    pub to: usize,
+    pub kind: &'static str,
+    pub sites: Vec<usize>,
+    pub refs: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
 }
 
 #[derive(Serialize)]
 pub struct CoalescedDto {
     pub leaves: Vec<usize>,
-    pub edges: Vec<ReferenceDto>,
+    pub edges: Vec<EdgeDto>,
 }
+
+/// `[tag, old_start, old_len, new_start, new_len]`, tag one of `= - +`.
+pub type OpDto = (&'static str, usize, usize, usize, usize);
 
 #[derive(Serialize)]
 pub struct SourceDto {
     pub id: usize,
     pub path: String,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ops: Option<Vec<OpDto>>,
 }
 
 #[derive(Serialize)]
 pub struct ErrorDto {
     pub error: String,
+}
+
+/// The diff side tables a payload needs, borrowed from wherever they live.
+pub struct DiffView<'a> {
+    pub base: &'a str,
+    pub base_commit: &'a str,
+    pub entity_status: &'a [Status],
+    pub reference_status: &'a [Status],
+    pub churn: &'a [(usize, usize)],
 }
 
 // `EntityKind`'s Display is for humans ("class/struct"); the wire format is
@@ -73,6 +122,24 @@ fn reference_kind(kind: ReferenceKind) -> &'static str {
     }
 }
 
+fn status(status: Status) -> &'static str {
+    match status {
+        Status::Same => "same",
+        Status::Added => "added",
+        Status::Removed => "removed",
+        Status::Modified => "modified",
+    }
+}
+
+pub fn op_dto(op: &LineOp) -> OpDto {
+    let tag = match op.tag {
+        Tag::Equal => "=",
+        Tag::Delete => "-",
+        Tag::Insert => "+",
+    };
+    (tag, op.old_start, op.old_len, op.new_start, op.new_len)
+}
+
 fn node_dto(e: &Entity, loc: usize) -> NodeDto {
     NodeDto {
         id: e.id.0,
@@ -83,6 +150,9 @@ fn node_dto(e: &Entity, loc: usize) -> NodeDto {
         line_end: e.line_range.end,
         parent: e.parent.map(|p| p.0),
         loc,
+        status: None,
+        added: None,
+        removed: None,
     }
 }
 
@@ -116,15 +186,8 @@ impl From<&Reference> for ReferenceDto {
             to: r.to.0,
             kind: reference_kind(r.kind),
             sites: r.sites.iter().map(|s| s.line).collect(),
+            status: None,
         }
-    }
-}
-
-// Coalesced edges aggregate many raw references; the UI derives sites from
-// `/graph.json` instead, so none are carried here.
-impl From<&CoalescedEdge> for ReferenceDto {
-    fn from(e: &CoalescedEdge) -> Self {
-        ReferenceDto { from: e.from.0, to: e.to.0, kind: reference_kind(e.kind), sites: Vec::new() }
     }
 }
 
@@ -133,6 +196,7 @@ impl From<&EntityGraph> for GraphDto {
         let loc = loc_per_entity(graph);
         GraphDto {
             root: root_name(graph).to_string(),
+            diff: None,
             // The arena index is the id, so iterating in order yields the
             // dense, id-sorted `nodes` the contract promises.
             nodes: graph.entities.iter().zip(&loc).map(|(e, &l)| node_dto(e, l)).collect(),
@@ -141,13 +205,49 @@ impl From<&EntityGraph> for GraphDto {
     }
 }
 
-impl From<&Coalesced> for CoalescedDto {
-    fn from(c: &Coalesced) -> Self {
-        CoalescedDto {
-            leaves: c.leaves.iter().map(|id| id.0).collect(),
-            edges: c.edges.iter().map(ReferenceDto::from).collect(),
-        }
+/// The union graph plus the change tags every node and reference carries in
+/// diff mode.
+pub fn graph_dto_with_diff(graph: &EntityGraph, view: &DiffView<'_>) -> GraphDto {
+    let mut dto = GraphDto::from(graph);
+    dto.diff =
+        Some(DiffDto { base: view.base.to_string(), base_commit: view.base_commit.to_string() });
+    for node in &mut dto.nodes {
+        let (added, removed) = view.churn[node.id];
+        node.status = Some(status(view.entity_status[node.id]));
+        node.added = Some(added);
+        node.removed = Some(removed);
     }
+    for (reference, &st) in dto.references.iter_mut().zip(view.reference_status) {
+        reference.status = Some(status(st));
+    }
+    dto
+}
+
+pub fn coalesced_dto(c: &Coalesced, reference_status: Option<&[Status]>) -> CoalescedDto {
+    CoalescedDto {
+        leaves: c.leaves.iter().map(|id| id.0).collect(),
+        edges: c.edges.iter().map(|e| edge_dto(e, reference_status)).collect(),
+    }
+}
+
+fn edge_dto(e: &CoalescedEdge, reference_status: Option<&[Status]>) -> EdgeDto {
+    EdgeDto {
+        from: e.from.0,
+        to: e.to.0,
+        kind: reference_kind(e.kind),
+        // The UI derives an edge's sites from `/graph.json` via `refs`.
+        sites: Vec::new(),
+        refs: e.refs.iter().map(|r| r.0).collect(),
+        status: reference_status.map(|all| edge_status(e, all)),
+    }
+}
+
+/// One tag for a bundle of references: the members' status when they agree,
+/// `mixed` when they do not.
+fn edge_status(e: &CoalescedEdge, reference_status: &[Status]) -> &'static str {
+    let mut members = e.refs.iter().filter_map(|r| reference_status.get(r.0));
+    let Some(&first) = members.next() else { return status(Status::Same) };
+    if members.all(|&s| s == first) { status(first) } else { "mixed" }
 }
 
 pub fn root_name(graph: &EntityGraph) -> &str {

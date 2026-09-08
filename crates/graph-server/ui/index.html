@@ -47,6 +47,20 @@
   .refs .site { border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; font: 11px/16px ui-monospace, Menlo, monospace; color: var(--accent); background: var(--bg); }
   .refs .site:hover { border-color: var(--accent); }
   .loc { color: var(--muted); font-weight: 400; }
+  .ent.st-added, .box.st-added { border-color: #1a9c4a; border-width: 2px; border-style: solid; }
+  .ent.st-modified, .box.st-modified { border-color: #e0a100; border-width: 2px; border-style: solid; }
+  .ent.st-removed, .box.st-removed { border-color: #d64545; border-style: dashed; opacity: .55; }
+  .react-flow__node.faded { opacity: .3; }
+  .churn { font-weight: 600; }
+  .churn .add { color: #1a9c4a; }
+  .churn .del { color: #d64545; }
+  .pill { display: inline-block; font-size: 11px; padding: 0 7px; border-radius: 9px; color: #fff; line-height: 16px; margin-left: 6px; vertical-align: middle; }
+  .code-body tr.del { background: #ffe5e5; }
+  .code-body tr.ins { background: #e3f6e6; }
+  .code-body tr.del td.ln { background: #f7cccc; }
+  .code-body tr.ins td.ln { background: #c9ead0; }
+  .code-body tr.hl.del, .code-body tr.hl.ins { background: #ffe9a8; }
+  .code-body table.diff td.ln { position: static; }
   .panel h2 { margin: 0; font-size: 14px; word-break: break-all; }
   .panel .meta { color: var(--muted); font-size: 12px; word-break: break-all; }
   .panel h3 { margin: 6px 0 2px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
@@ -112,6 +126,14 @@ const html = htm.bind(React.createElement);
 
 const EDGE_COLOR = { call: '#2f80ed', import: '#27ae60', type_ref: '#9b51e0', var_ref: '#f2994a', generic: '#8a8f98' };
 const edgeColor = (kind) => EDGE_COLOR[kind] || EDGE_COLOR.generic;
+// Diff mode: how an entity or reference differs between the base tree and
+// the working tree. `mixed` only occurs on coalesced edges.
+const CHANGE_COLOR = { same: '#b0b4bb', added: '#1a9c4a', removed: '#d64545', modified: '#e0a100', mixed: '#8a6fd1' };
+const changeColor = (s) => CHANGE_COLOR[s] || CHANGE_COLOR.same;
+const fmtChurn = (n) => (n.added || n.removed)
+  ? html`<span class="churn">${n.added ? html`<span class="add">+${n.added}</span>` : ''}${n.added && n.removed ? ' ' : ''}${n.removed ? html`<span class="del">−${n.removed}</span>` : ''}</span>`
+  : null;
+const statusClass = (n) => (n.status ? ' st-' + n.status : '');
 const NODE_H = 48;
 const estWidth = (name) => Math.min(320, Math.max(120, 8 * name.length + 40));
 
@@ -129,19 +151,20 @@ function ZoomButton({ glyph, title, onClick }) {
 const fmtLoc = (n) => (n.loc > 0 && (n.kind === 'folder' || n.kind === 'file') ? `${n.loc.toLocaleString()} loc` : '');
 function EntityNode({ data, sourcePosition, targetPosition }) {
   const lines = data.kind !== 'folder' ? ` · ${data.line_start + 1}–${data.line_end + 1}` : '';
-  const loc = fmtLoc(data);
-  return html`<div class=${'ent kind-' + data.kind} title=${data.path}>
+  const loc = fmtLoc(data), churn = fmtChurn(data);
+  return html`<div class=${'ent kind-' + data.kind + statusClass(data)} title=${data.path}>
     <${Handle} type="target" position=${targetPosition} />
     <div class="ent-name">${data.name}</div>
-    <div class="ent-sub">${data.kind}${loc ? ` · ${loc}` : lines}</div>
+    <div class="ent-sub">${data.kind}${churn ? html` · ${churn}` : loc ? ` · ${loc}` : lines}</div>
     <${Handle} type="source" position=${sourcePosition} />
     ${data.zoomable && html`<${ZoomButton} glyph="+" title="Zoom in" onClick=${() => actions.zoomIn(data.id)} />`}
   </div>`;
 }
 function ContainerNode({ data, sourcePosition, targetPosition }) {
-  return html`<div class=${'box kind-' + data.kind} title=${data.path}>
+  const churn = fmtChurn(data);
+  return html`<div class=${'box kind-' + data.kind + statusClass(data)} title=${data.path}>
     <${Handle} type="target" position=${targetPosition} />
-    <div class="box-label">${data.name}${fmtLoc(data) && html` <span class="loc">· ${fmtLoc(data)}</span>`}</div>
+    <div class="box-label">${data.name}${churn ? html` <span class="loc">·</span> ${churn}` : fmtLoc(data) && html` <span class="loc">· ${fmtLoc(data)}</span>`}</div>
     <${ZoomButton} glyph="−" title="Zoom out" onClick=${() => actions.collapse(data.id)} />
     <${Handle} type="source" position=${sourcePosition} />
   </div>`;
@@ -194,21 +217,41 @@ const edgeTypes = { ref: RefEdge };
 
 // Memoized because a large file is thousands of rows and the App re-renders
 // on every drag frame.
-const CodePane = React.memo(function CodePane({ src, line, range, onClose }) {
+// A row is { o, n, t, k }: old and new line index (null on the side the row
+// does not exist), text, and the row kind ('', 'del', 'ins'). Without a diff
+// every row exists only on the new side.
+const splitLines = (text) => { const l = text.split('\n'); if (l.length > 1 && l[l.length - 1] === '') l.pop(); return l; };
+function codeRows(src) {
+  const newL = splitLines(src.text);
+  if (!src.ops) return newL.map((t, i) => ({ o: null, n: i, t, k: '' }));
+  const oldL = splitLines(src.old_text || '');
+  const rows = [];
+  for (const [tag, os, ol, ns, nl] of src.ops) {
+    if (tag === '=') for (let i = 0; i < ol; i++) rows.push({ o: os + i, n: ns + i, t: newL[ns + i] ?? '', k: '' });
+    else if (tag === '-') for (let i = 0; i < ol; i++) rows.push({ o: os + i, n: null, t: oldL[os + i] ?? '', k: 'del' });
+    else for (let i = 0; i < nl; i++) rows.push({ o: null, n: ns + i, t: newL[ns + i] ?? '', k: 'ins' });
+  }
+  return rows;
+}
+const CodePane = React.memo(function CodePane({ src, line, range, side, onClose }) {
   const bodyRef = useRef(null);
   useEffect(() => {
     bodyRef.current?.querySelector('tr.hl')?.scrollIntoView({ block: 'center' });
-  }, [src, line]);
+  }, [src, line, side]);
   const close = html`<button class="btn" title="Close" onClick=${onClose}>×</button>`;
   if (!src) return html`<div class="code"><div class="code-head"><span class="meta">loading…</span>${close}</div></div>`;
   if (src.error) return html`<div class="code"><div class="code-head"><span class="err">${src.error}</span>${close}</div></div>`;
-  const lines = src.text.split('\n');
-  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
-  const cls = (i) => (i === line ? 'hl' : i >= range[0] && i <= range[1] ? 'in' : '');
+  const rows = codeRows(src), diff = !!src.ops;
+  const at = (r) => (side === 'old' ? r.o : r.n);
+  const cls = (r) => { const i = at(r); const h = i == null ? '' : i === line ? ' hl' : i >= range[0] && i <= range[1] ? ' in' : ''; return r.k + h; };
+  const ins = rows.filter((r) => r.k === 'ins').length, del = rows.filter((r) => r.k === 'del').length;
+  const ln = (i) => (i == null ? '' : i + 1);
   return html`<div class="code">
-    <div class="code-head"><b>${src.path}</b><span class="meta">${lines.length} lines · at ${line + 1}</span>${close}</div>
-    <div class="code-body" ref=${bodyRef}><table><tbody>
-      ${lines.map((t, i) => html`<tr key=${i} class=${cls(i)}><td class="ln">${i + 1}</td><td>${t}</td></tr>`)}
+    <div class="code-head"><b>${src.path}</b>
+      ${diff && html`<span class="churn"><span class="add">+${ins}</span> <span class="del">−${del}</span></span>`}
+      <span class="meta">${diff ? `${rows.length} rows` : `${rows.length} lines`} · at ${side === 'old' ? 'old ' : ''}${line + 1}</span>${close}</div>
+    <div class="code-body" ref=${bodyRef}><table class=${diff ? 'diff' : ''}><tbody>
+      ${rows.map((r, i) => html`<tr key=${i} class=${cls(r)}>${diff && html`<td class="ln o">${ln(r.o)}</td>`}<td class="ln">${ln(r.n)}</td><td>${r.t}</td></tr>`)}
     </tbody></table></div>
   </div>`;
 });
@@ -222,7 +265,7 @@ const rank = (kind) => { const i = PRECEDENCE.indexOf(kind); return i < 0 ? PREC
 function collapseByPrecedence(edges) {
   const byPair = new Map();
   for (const e of edges) {
-    const key = `${e.source}>${e.target}`;
+    const key = `${e.source}>${e.target}|${e.data.status || ''}`;
     const cur = byPair.get(key);
     if (!cur) { byPair.set(key, { ...e, data: { ...e.data, kinds: { [e.data.kind]: e.data.count }, members: e.data.members ? [...e.data.members] : undefined } }); continue; }
     cur.data.kinds[e.data.kind] = (cur.data.kinds[e.data.kind] || 0) + e.data.count;
@@ -261,12 +304,15 @@ function mkNode(ent, dir) {
     targetPosition: dir === 'LR' ? Position.Left : Position.Top,
   };
 }
-function mkRefEdge(source, target, kind, count = 1) {
-  const color = edgeColor(kind);
+// `status` is only set in diff mode; it is part of the id because an added
+// and a removed reference between one pair are two distinct edges.
+function mkRefEdge(source, target, kind, count = 1, status = null, byChange = false) {
+  const color = byChange && status ? changeColor(status) : edgeColor(kind);
+  const dash = byChange && status === 'removed' ? { strokeDasharray: '6 4' } : {};
   return {
-    id: `r-${source}-${target}-${kind}`, source, target, type: 'ref',
-    data: { kind, ref: true, offset: 0, count },
-    style: { stroke: color, strokeWidth: 1.5 + Math.min(count, 12) * 0.25 },
+    id: `r-${source}-${target}-${kind}${status ? '-' + status : ''}`, source, target, type: 'ref',
+    data: { kind, status, ref: true, offset: 0, count },
+    style: { stroke: color, strokeWidth: 1.5 + Math.min(count, 12) * 0.25, ...dash },
     markerEnd: { type: MarkerType.ArrowClosed, color, width: 16, height: 16 },
   };
 }
@@ -279,12 +325,19 @@ function mkContainEdge(parent, child) {
 
 // Raw mode ranks on containment only: ranking on references too makes dagre
 // slow and the tree very wide, so references are drawn but not fed to dagre.
-function buildModel(graph, coalesced, view, dir, bundle, onePerPair) {
+function buildModel(graph, coalesced, view, dir, bundle, onePerPair, { byChange = false, changesOnly = false } = {}) {
   const finish = (refs) => assignOffsets(onePerPair ? collapseByPrecedence(refs) : refs);
+  const isDiff = !!graph.diff;
+  const unchanged = (n) => isDiff && changesOnly && n.status === 'same';
+  const refEdge = (e, count) => mkRefEdge(String(e.from), String(e.to), e.kind, count, e.status, byChange);
   if (view === 'raw') {
-    const nodes = graph.nodes.map((n) => mkNode(n, dir));
-    const contain = graph.nodes.filter((n) => n.parent != null).map((n) => mkContainEdge(n.parent, n.id));
-    const refs = finish(graph.references.map((e) => mkRefEdge(String(e.from), String(e.to), e.kind)));
+    // Every ancestor of a changed entity is itself modified, so dropping the
+    // unchanged nodes never orphans a kept one.
+    const kept = graph.nodes.filter((n) => !unchanged(n));
+    const keptIds = new Set(kept.map((n) => n.id));
+    const nodes = kept.map((n) => mkNode(n, dir));
+    const contain = kept.filter((n) => n.parent != null && keptIds.has(n.parent)).map((n) => mkContainEdge(n.parent, n.id));
+    const refs = finish(graph.references.filter((e) => keptIds.has(e.from) && keptIds.has(e.to)).map((e) => refEdge(e, 1)));
     return { nodes, edges: [...contain, ...refs], rankEdges: contain };
   }
   if (!coalesced) return { nodes: [], edges: [], rankEdges: [] };
@@ -304,15 +357,19 @@ function buildModel(graph, coalesced, view, dir, bundle, onePerPair) {
   const boxes = [...containers.values()].sort((a, b) => depth(a) - depth(b)).map((ent) => ({
     id: `c${ent.id}`, type: 'container', position: { x: 0, y: 0 }, data: ent,
     parentId: boxId(ent.parent), width: 200, height: 100, selectable: true,
+    className: unchanged(ent) ? 'faded' : undefined,
   }));
   const hasChildren = new Set(graph.nodes.filter((n) => n.parent != null).map((n) => n.parent));
   const leaves = coalesced.leaves.map((id) => graph.nodes[id]).filter(Boolean)
     .map((n) => ({
       ...mkNode(n, dir), parentId: boxId(n.parent),
       data: { ...n, zoomable: hasChildren.has(n.id) },
+      // A collapsed leaf is a whole subtree, so it is faded rather than
+      // hidden; hiding it would change what its box means.
+      className: unchanged(n) ? 'faded' : undefined,
     }));
   if (!bundle) {
-    const edges = finish(coalesced.edges.map((e) => mkRefEdge(String(e.from), String(e.to), e.kind)));
+    const edges = finish(coalesced.edges.map((e) => { const edge = refEdge(e, 1); edge.data.members = [e]; return edge; }));
     return { nodes: [...boxes, ...leaves], edges, rankEdges: edges };
   }
   // Lift each leaf-to-leaf edge to the pair of siblings at the level where the
@@ -332,12 +389,12 @@ function buildModel(graph, coalesced, view, dir, bundle, onePerPair) {
     let pair = null;
     for (const a of cf) { const b = ct.find((x) => x.parent === a.parent); if (b) { pair = [a.id, b.id]; break; } }
     if (!pair || pair[0] === pair[1]) continue;
-    const key = `${pair[0]}|${pair[1]}|${e.kind}`;
-    const b = bundles.get(key) || bundles.set(key, { source: pair[0], target: pair[1], kind: e.kind, members: [] }).get(key);
+    const key = `${pair[0]}|${pair[1]}|${e.kind}|${e.status || ''}`;
+    const b = bundles.get(key) || bundles.set(key, { source: pair[0], target: pair[1], kind: e.kind, status: e.status, members: [] }).get(key);
     b.members.push(e);
   }
   const edges = finish([...bundles.values()].map((b) => {
-    const edge = mkRefEdge(b.source, b.target, b.kind, b.members.length);
+    const edge = mkRefEdge(b.source, b.target, b.kind, b.members.length, b.status, byChange);
     edge.data.members = b.members;
     return edge;
   }));
@@ -723,6 +780,10 @@ function App() {
   const [code, setCode] = useState(null);
   const [sources, setSources] = useState(() => new Map());
   const [panelW, setPanelW] = useState(460);
+  // Diff mode only: colour edges by change instead of kind; hide (raw) or
+  // fade (coalesced) what did not change.
+  const [byChange, setByChange] = useState(true);
+  const [changesOnly, setChangesOnly] = useState(false);
   const [resizing, setResizing] = useState(false);
   const [status, setStatus] = useState('');
   const [panelError, setPanelError] = useState('');
@@ -733,9 +794,10 @@ function App() {
     fetchJson('./coalesced.json').then(setCoalesced).catch((e) => setStatus(`coalesced.json: ${e.message}`));
   }, []);
 
+  const isDiff = !!graph?.diff;
   const model = useMemo(
-    () => (graph ? buildModel(graph, coalesced, view, dir, bundle, onePerPair) : null),
-    [graph, coalesced, view, dir, bundle, onePerPair],
+    () => (graph ? buildModel(graph, coalesced, view, dir, bundle, onePerPair, { byChange, changesOnly }) : null),
+    [graph, coalesced, view, dir, bundle, onePerPair, byChange, changesOnly],
   );
 
   // Every layout change is animated: nodes glide from where they were to where
@@ -815,10 +877,13 @@ function App() {
     for (let n = graph?.nodes[id]; n; n = n.parent != null ? graph.nodes[n.parent] : null) if (n.kind === 'file') return n.id;
     return null;
   };
-  const openCode = (entityId, line, range) => {
+  // `side` is which file the line numbers address in diff mode: removed
+  // entities and references only exist in the old tree.
+  const sideOf = (entityId) => (graph?.nodes[entityId]?.status === 'removed' ? 'old' : 'new');
+  const openCode = (entityId, line, range, side = sideOf(entityId)) => {
     const fileId = fileOf(entityId);
     if (fileId == null) return;
-    setCode({ fileId, line, range });
+    setCode({ fileId, line, range, side });
     if (sources.has(fileId)) return;
     fetchJson(`./source?id=${fileId}`)
       .then((src) => setSources((m) => new Map(m).set(fileId, src)))
@@ -858,8 +923,11 @@ function App() {
   };
 
   const visibleEdges = useMemo(
-    () => edges.map((e) => ({ ...e, hidden: e.data.ref ? !showRefs : !showContain })),
-    [edges, showContain, showRefs],
+    () => edges.map((e) => {
+      const fade = isDiff && changesOnly && view === 'coalesced' && e.data.status === 'same';
+      return { ...e, hidden: e.data.ref ? !showRefs : !showContain, style: fade ? { ...e.style, opacity: 0.25 } : e.style };
+    }),
+    [edges, showContain, showRefs, isDiff, changesOnly, view],
   );
 
   // Position changes go through the drag resolver instead of straight into
@@ -961,9 +1029,17 @@ function App() {
   const entityOf = (rfId) => Number(String(rfId).replace(/^c/, ''));
   const underOrSelf = (id, anc) => id === anc || isUnder(id, anc);
   const edgeRefs = !selectedEdge ? [] : (() => {
+    // Coalesced edges name the raw references they stand for, which is exact;
+    // the subtree derivation below is the fallback for raw-view edges.
+    const members = selectedEdge.data.members;
+    if (members && members.every((m) => m.refs)) {
+      const idx = [...new Set(members.flatMap((m) => m.refs))].sort((a, b) => a - b);
+      return idx.map((i) => graph.references[i]).filter(Boolean);
+    }
     const s = entityOf(selectedEdge.source), t = entityOf(selectedEdge.target);
     const kinds = new Set(selectedEdge.data.kinds ? Object.keys(selectedEdge.data.kinds) : [selectedEdge.data.kind]);
-    return graph.references.filter((r) => kinds.has(r.kind) && underOrSelf(r.from, s) && underOrSelf(r.to, t));
+    const st = selectedEdge.data.status;
+    return graph.references.filter((r) => kinds.has(r.kind) && (!st || r.status === st) && underOrSelf(r.from, s) && underOrSelf(r.to, t));
   })();
   // The nearest drawn node containing an entity, since in the coalesced view
   // the entity itself may sit inside a collapsed leaf.
@@ -978,9 +1054,10 @@ function App() {
   const refList = edgeRefs.length
     ? html`<ul class="refs">${edgeRefs.map((r, i) => html`<li key=${i}>
         <span class="tag" style=${{ background: edgeColor(r.kind) }}>${r.kind}</span>
+        ${r.status && r.status !== 'same' && html`<span class="tag" style=${{ background: changeColor(r.status) }}>${r.status}</span>`}
         <button onClick=${() => selectEntity(r.from)}>${nameOf(r.from)}</button><span class="meta">→</span>
         <button onClick=${() => selectEntity(r.to)}>${nameOf(r.to)}</button>
-        ${(r.sites || []).map((line) => html`<button key=${line} class="site" title="Open the reference site" onClick=${() => openCode(r.from, line, [line, line])}>${fileName(r.from)}:${line + 1}</button>`)}
+        ${(r.sites || []).map((line) => html`<button key=${line} class="site" title="Open the reference site" onClick=${() => openCode(r.from, line, [line, line], r.status === 'removed' ? 'old' : sideOf(r.from))}>${fileName(r.from)}:${line + 1}</button>`)}
         ${!(r.sites || []).length && html`<span class="meta">(no site recorded)</span>`}
         <button class="site" title="Open the definition" onClick=${() => openAt(r.to)}>def ${fileName(r.to)}:${graph.nodes[r.to].line_start + 1}</button>
       </li>`)}</ul>`
@@ -1003,6 +1080,10 @@ function App() {
       <label class="chk"><input type="checkbox" checked=${showRefs} onChange=${(e) => setShowRefs(e.target.checked)} /> reference edges</label>
       ${view === 'coalesced' && html`<label class="chk" title="Draw edges between boxes instead of between the leaves inside them"><input type="checkbox" checked=${bundle} onChange=${(e) => toggleBundle(e.target.checked)} /> bundle across boxes</label>`}
       <label class="chk" title=${'Keep only the strongest kind between a pair: ' + PRECEDENCE.join(' > ')}><input type="checkbox" checked=${onePerPair} onChange=${(e) => toggleOnePerPair(e.target.checked)} /> one edge per pair</label>
+      ${isDiff && html`<div class="sep"></div>
+        <span title=${graph.diff.base_commit}><b>diff</b> ${graph.diff.base} → working tree</span>
+        <label class="chk"><input type="checkbox" checked=${byChange} onChange=${(e) => { focusRef.current = null; setByChange(e.target.checked); }} /> colour edges by change</label>
+        <label class="chk" title="Raw view hides unchanged entities; coalesced view fades them"><input type="checkbox" checked=${changesOnly} onChange=${(e) => { focusRef.current = null; setChangesOnly(e.target.checked); }} /> changes only</label>`}
       <span style=${{ color: 'var(--muted)' }}>${nodes.filter((n) => n.type !== 'container').length} nodes · ${visibleEdges.filter((e) => !e.hidden).length} edges</span>
       ${status && html`<div class="status" title=${status}>${status}</div>`}
     </div>
@@ -1026,9 +1107,10 @@ function App() {
       <div class="panel" style=${{ width: panelW }}>
         <div class=${'panel-top' + (code ? ' with-code' : '')}>
         ${selected ? html`
-          <h2>${selected.name}</h2>
+          <h2>${selected.name}${selected.status && html`<span class="pill" style=${{ background: changeColor(selected.status) }}>${selected.status}</span>`}</h2>
           <div class="meta">${selected.path}</div>
           <div class="meta">${selected.kind}${selected.kind !== 'folder' ? ` · lines ${selected.line_start + 1}–${selected.line_end + 1}` : ''}${selected.loc > 0 ? ` · ${selected.loc.toLocaleString()} loc` : ''} · id ${selected.id}</div>
+          ${fmtChurn(selected) && html`<div class="meta">changed lines: ${fmtChurn(selected)}</div>`}
           ${panelError && html`<div class="err">${panelError}</div>`}
           <h3>Outgoing (${outgoing.length})</h3>${edgeList(outgoing)}
           <h3>Incoming (${incoming.length})</h3>${edgeList(incoming)}
@@ -1039,15 +1121,16 @@ function App() {
         ` : selectedEdge ? html`
           <h2>${labelOf(selectedEdge.source)} <span class="loc">→</span> ${labelOf(selectedEdge.target)}</h2>
           <div class="row">${Object.entries(selectedEdge.data.kinds || { [selectedEdge.data.kind]: selectedEdge.data.count })
-            .map(([k, c]) => html`<span key=${k} class="tag" style=${{ background: edgeColor(k) }}>${k}${c > 1 ? ` ×${c}` : ''}</span>`)}</div>
+            .map(([k, c]) => html`<span key=${k} class="tag" style=${{ background: edgeColor(k) }}>${k}${c > 1 ? ` ×${c}` : ''}</span>`)}
+            ${selectedEdge.data.status && html`<span class="tag" style=${{ background: changeColor(selectedEdge.data.status) }}>${selectedEdge.data.status}</span>`}</div>
           <h3>References (${edgeRefs.length})</h3>${refList}
         ` : html`<div class="empty">Click a node or an edge to inspect it. In the coalesced view, + on a node expands it and − on a box collapses it. Drag on empty canvas to select; middle/right-drag or space+drag to pan; ctrl+wheel to zoom.</div>`}
         <div class="legend">
-          ${Object.entries(EDGE_COLOR).map(([k, c]) => html`<span key=${k}><i style=${{ background: c }}></i>${k}</span>`)}
-          <span><i style=${{ background: '#b0b4bb' }}></i>contains</span>
+          ${Object.entries(isDiff && byChange ? CHANGE_COLOR : EDGE_COLOR).map(([k, c]) => html`<span key=${k}><i style=${{ background: c }}></i>${k}</span>`)}
+          ${!(isDiff && byChange) && html`<span><i style=${{ background: '#b0b4bb' }}></i>contains</span>`}
         </div>
         </div>
-        ${code && html`<${CodePane} src=${sources.get(code.fileId)} line=${code.line} range=${code.range} onClose=${closeCode} />`}
+        ${code && html`<${CodePane} src=${sources.get(code.fileId)} line=${code.line} range=${code.range} side=${code.side} onClose=${closeCode} />`}
       </div>
     </div>
   </div>`;

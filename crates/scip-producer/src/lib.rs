@@ -9,8 +9,12 @@
 //! Source files are read from `project_root` (never from the index's own
 //! `metadata.project_root`, which is an absolute URI from the indexing
 //! machine) to convert line/column positions into byte offsets.
+//!
+//! [`indexer`] runs the external indexer for a project so callers do not
+//! have to know which tool produces the index for which language.
 
 mod build;
+pub mod indexer;
 mod source;
 mod symbols;
 

@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Regenerate a SCIP index for a project so scip-producer can consume it.
+# `graph-server --scip-index` does the same thing automatically (into the
+# system temp dir); this script is for fixtures and for keeping an index in
+# a place of your choosing.
 #
 #   scripts/scip-index.sh <rust|ts|go> <project-dir> [out]
 #

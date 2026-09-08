@@ -95,8 +95,9 @@ fn test_cursor_move_up_at_root() {
     assert_eq!(cursor.active(), &[EntityId(0)]);
 }
 
-fn edge(from: usize, to: usize, kind: ReferenceKind) -> CoalescedEdge {
-    CoalescedEdge { from: EntityId(from), to: EntityId(to), kind }
+fn edge(from: usize, to: usize, kind: ReferenceKind, refs: &[usize]) -> CoalescedEdge {
+    let refs = refs.iter().copied().map(ReferenceId).collect();
+    CoalescedEdge { from: EntityId(from), to: EntityId(to), kind, refs }
 }
 
 fn ids(ids: &[usize]) -> Vec<EntityId> {
@@ -112,8 +113,9 @@ fn ids(ids: &[usize]) -> Vec<EntityId> {
 /// ```
 ///
 /// At the root everything is a self-loop. At file level the intra-file call
-/// vanishes, two calls a→b fold into one, and the Call and Import between the
-/// same files both survive because kind is part of the edge identity.
+/// vanishes, two calls a→b fold into one edge that keeps both references in
+/// `refs`, and the Call and Import between the same files both survive
+/// because kind is part of the edge identity.
 /// Zooming into one file yields mixed-depth edges; zooming into both restores
 /// the raw references.
 #[test]
@@ -145,7 +147,11 @@ fn test_coalesced_through_zoom_levels() {
         cursor.coalesced(),
         Coalesced {
             leaves: ids(&[1, 2]),
-            edges: vec![edge(1, 2, Call), edge(1, 2, Import), edge(2, 1, TypeRef)],
+            edges: vec![
+                edge(1, 2, Call, &[0, 3]),
+                edge(1, 2, Import, &[1]),
+                edge(2, 1, TypeRef, &[4]),
+            ],
         }
     );
 
@@ -155,11 +161,11 @@ fn test_coalesced_through_zoom_levels() {
         Coalesced {
             leaves: ids(&[2, 3, 4]),
             edges: vec![
-                edge(3, 2, Call),
-                edge(4, 2, Import),
-                edge(3, 4, Call),
-                edge(4, 2, Call),
-                edge(2, 3, TypeRef),
+                edge(3, 2, Call, &[0]),
+                edge(4, 2, Import, &[1]),
+                edge(3, 4, Call, &[2]),
+                edge(4, 2, Call, &[3]),
+                edge(2, 3, TypeRef, &[4]),
             ],
         }
     );
@@ -170,11 +176,11 @@ fn test_coalesced_through_zoom_levels() {
         Coalesced {
             leaves: ids(&[3, 4, 5, 6]),
             edges: vec![
-                edge(3, 5, Call),
-                edge(4, 6, Import),
-                edge(3, 4, Call),
-                edge(4, 5, Call),
-                edge(6, 3, TypeRef),
+                edge(3, 5, Call, &[0]),
+                edge(4, 6, Import, &[1]),
+                edge(3, 4, Call, &[2]),
+                edge(4, 5, Call, &[3]),
+                edge(6, 3, TypeRef, &[4]),
             ],
         }
     );
@@ -201,10 +207,7 @@ fn test_coalesced_drops_edges_to_expanded_endpoints() {
         cursor.coalesced(),
         Coalesced {
             leaves: vec![EntityId(1), EntityId(2)],
-            edges: vec![
-                CoalescedEdge { from: EntityId(1), to: EntityId(2), kind: Import },
-                CoalescedEdge { from: EntityId(1), to: EntityId(2), kind: Call },
-            ],
+            edges: vec![edge(1, 2, Import, &[0]), edge(1, 2, Call, &[1])],
         }
     );
 
@@ -215,7 +218,7 @@ fn test_coalesced_drops_edges_to_expanded_endpoints() {
         cursor.coalesced(),
         Coalesced {
             leaves: vec![EntityId(2), EntityId(3)],
-            edges: vec![CoalescedEdge { from: EntityId(3), to: EntityId(2), kind: Call }],
+            edges: vec![edge(3, 2, Call, &[1])],
         }
     );
 }

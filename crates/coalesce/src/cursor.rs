@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use entity_graph::{EntityGraph, EntityId, ReferenceId, ReferenceKind};
 
@@ -27,6 +27,10 @@ pub struct CoalescedEdge {
     pub from: EntityId,
     pub to: EntityId,
     pub kind: ReferenceKind,
+    /// Every raw reference this edge stands for, in graph order. Consumers
+    /// that need per-reference detail (sites, diff status) join these back
+    /// against `graph.references` instead of re-deriving the projection.
+    pub refs: Vec<ReferenceId>,
 }
 
 /// Snapshot of what is in view: see [`Cursor::coalesced`].
@@ -195,7 +199,8 @@ impl Cursor {
     ///
     /// References whose endpoints fall under the same leaf collapse into
     /// self-loops and are dropped; the rest are deduplicated on
-    /// `(from, to, kind)`, first occurrence wins. Needs no `&EntityGraph`
+    /// `(from, to, kind)`, each surviving edge keeping every reference that
+    /// projected onto it in `refs`. Needs no `&EntityGraph`
     /// because the projection was maintained incrementally by `move_down` /
     /// `move_up`.
     ///
@@ -210,15 +215,26 @@ impl Cursor {
         // pointing at an inactive entity. Such edges are not drawable and are
         // dropped here so `edges` is always within `leaves x leaves`.
         let active: HashSet<EntityId> = self.leaves.iter().copied().collect();
-        let mut seen = HashSet::new();
-        let edges = self
+        let mut slot_of: HashMap<(EntityId, EntityId, ReferenceKind), usize> = HashMap::new();
+        let mut edges: Vec<CoalescedEdge> = Vec::new();
+        for r in self
             .references
             .iter()
             .filter(|r| r.from_leaf != r.to_leaf)
             .filter(|r| active.contains(&r.from_leaf) && active.contains(&r.to_leaf))
-            .map(|r| CoalescedEdge { from: r.from_leaf, to: r.to_leaf, kind: r.kind })
-            .filter(|e| seen.insert((e.from, e.to, e.kind)))
-            .collect();
+        {
+            let slot = *slot_of.entry((r.from_leaf, r.to_leaf, r.kind)).or_insert_with(|| {
+                let edge = CoalescedEdge {
+                    from: r.from_leaf,
+                    to: r.to_leaf,
+                    kind: r.kind,
+                    refs: Vec::new(),
+                };
+                edges.push(edge);
+                edges.len() - 1
+            });
+            edges[slot].refs.push(r.reference_id);
+        }
         Coalesced { leaves: self.leaves.clone(), edges }
     }
 

@@ -54,6 +54,23 @@ terraform path/to/file.rs
 
 When opening a directory, the view starts at **File granularity** — only folders and files are shown. Use `l`/`Right` on a file to drill into its code constructs.
 
+### Browser viewer
+
+```bash
+# Serve the graph at http://127.0.0.1:7878/ (tree-sitter)
+cargo run -p graph-server -- .
+
+# Build the graph from a SCIP index instead: generate one (rust-analyzer,
+# scip-typescript or scip-go, picked from the manifest; cached under the
+# system temp dir) or point at an existing one
+cargo run -p graph-server --features scip -- --scip-index .
+cargo run -p graph-server --features scip -- --scip index.scip .
+
+# Diff view: the union of a git ref and the working tree, tagged by change
+cargo run -p graph-server -- --diff main .
+cargo run -p graph-server --features scip -- --diff main --scip-index .
+```
+
 ---
 
 ## Keyboard Shortcuts
@@ -99,8 +116,9 @@ crates/
 ├── entity-graph/         # The contract: Entity, EntityGraph, Reference (+ test_support fixtures)
 ├── treesitter-producer/  # Source files → EntityGraph via tree-sitter; one fn: graph_from_path
 ├── coalesce/             # Cursor: which entities are in view at this zoom, and the edges between them
-├── scip-producer/        # (in progress) SCIP index → EntityGraph
-└── graph-server/         # (in progress) localhost viewer for an EntityGraph
+├── graph-diff/           # Two EntityGraphs of one project → one union graph tagged by change
+├── scip-producer/        # SCIP index → EntityGraph, plus `indexer` to run rust-analyzer/scip-typescript/scip-go
+└── graph-server/         # localhost viewer: raw/coalesced graph, inspector, git diff view
 src/                      # The TUI (bin `terraform`)
 ├── main.rs               # Entry point, terminal setup, render loop
 ├── app/state.rs          # AppState — loading, zoom/fold navigation state
@@ -109,6 +127,16 @@ src/                      # The TUI (bin `terraform`)
 │   └── tree.rs           # GraphTree — spanning-forest layout of the reference graph
 └── ui/                   # ratatui rendering and keyboard handling
 ```
+
+`graph-diff` is the odd one out: it consumes two graphs and produces one. Its
+whole point is that a diff is not a new kind of thing — it returns the
+**union** of a base tree and a working tree as an ordinary `EntityGraph` (one
+root, dense ids, everything from either side present exactly once), so
+coalescing, layout and the viewer keep working on it untouched. What changed
+rides alongside in side tables indexed by union id: a status per entity and
+per reference, `(+lines, -lines)` churn, and per-file line ops for showing
+old and new together. Entities are matched top-down by (parent, name, kind,
+ordinal), which is why a rename reads as a removal plus an addition.
 
 ### Node Kinds
 

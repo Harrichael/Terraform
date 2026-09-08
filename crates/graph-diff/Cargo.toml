@@ -1,0 +1,16 @@
+[package]
+name = "graph-diff"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Diffs two EntityGraphs into one union graph with per-entity, per-reference and per-line change status."
+
+[dependencies]
+entity-graph = { workspace = true }
+anyhow = { workspace = true }
+similar = "3.2"
+
+[dev-dependencies]
+treesitter-producer = { workspace = true }
+coalesce = { workspace = true }
+tempfile = { workspace = true }
