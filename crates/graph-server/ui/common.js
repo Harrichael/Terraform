@@ -25,7 +25,7 @@ export const boxMinWidth = (data) => estWidth(`${data.name}${fmtLoc(data) ? ' ·
 // zoom handlers through this mutable slot instead of per-render node data.
 export const actions = {
   zoomIn: () => {}, collapse: () => {}, prune: () => {}, hide: () => {},
-  togglePopover: () => {}, closePopover: () => {}, setPopoverScope: () => {}, setBundling: () => {}, resetBundling: () => {},
+  togglePopover: () => {}, closePopover: () => {}, setBundling: () => {}, resetBundling: () => {},
 };
 
 // Only folders and files get a size: for a function the line range already

@@ -25,14 +25,13 @@ function App() {
   const [edges, setEdges] = useState([]);
   const [showContain, setShowContain] = useState(true);
   const [showRefs, setShowRefs] = useState(true);
-  // Per-box edge bundling: entityId -> { in, out }. Absent means bundled at
-  // the box on both sides (today's default).
+  // Per-box edge bundling: entityId -> { in, out, inward }, each 0 | 1 | 2
+  // (see buildModel). Absent means everything bundles at the box.
   const [bundling, setBundling] = useState(() => new Map());
   // Entities the user hid, client-side only; hiding a box hides its subtree.
   const [hiddenIds, setHiddenIds] = useState(() => new Set());
-  // The one bundle popover open at a time, and its currently selected scope.
+  // The one bundle popover open at a time.
   const [openPopoverId, setOpenPopoverId] = useState(null);
-  const [popoverScope, setPopoverScope] = useState('nested');
   // A container the coalesced view is pruned to, or null for everything.
   const [scopeId, setScopeId] = useState(null);
   const [onePerPair, setOnePerPair] = useState(true);
@@ -65,11 +64,6 @@ function App() {
   }, []);
 
   const isDiff = !!graph?.diff;
-  const kidsOf = useMemo(() => {
-    const m = new Map();
-    for (const n of graph?.nodes || []) if (n.parent != null) (m.get(n.parent) || m.set(n.parent, []).get(n.parent)).push(n.id);
-    return m;
-  }, [graph]);
   const model = useMemo(
     () => (graph ? buildModel(graph, coalesced, view, dir, onePerPair, { byChange, changesOnly, hideTests: !showTests, bundling, scopeId, hiddenIds }) : null),
     [graph, coalesced, view, dir, onePerPair, byChange, changesOnly, showTests, bundling, scopeId, hiddenIds],
@@ -406,38 +400,16 @@ function App() {
     }
   };
 
-  // Scope resets to the whole subtree on every open, which is what the old
-  // one-click toggle always did.
-  actions.togglePopover = (id) => {
-    setPopoverScope('nested');
-    setOpenPopoverId((cur) => (cur === id ? null : id));
-  };
+  actions.togglePopover = (id) => setOpenPopoverId((cur) => (cur === id ? null : id));
   actions.closePopover = () => setOpenPopoverId(null);
-  actions.setPopoverScope = setPopoverScope;
 
-  // "direct sub boxes" / "all nested boxes" only ever means entities that
-  // could themselves be drawn as a box (they have children); a leaf child
-  // has nothing to bundle.
-  const childrenOf = (id) => kidsOf.get(id) || [];
-  const hasKids = (id) => kidsOf.has(id);
-  const bundleScopeIds = (boxId, scope) => {
-    if (scope === 'self') return [boxId];
-    const direct = childrenOf(boxId).filter(hasKids);
-    if (scope === 'direct') return [boxId, ...direct];
-    const acc = [boxId], stack = [...direct];
-    while (stack.length) {
-      const id = stack.pop();
-      acc.push(id);
-      for (const c of childrenOf(id)) if (hasKids(c)) stack.push(c);
-    }
-    return acc;
-  };
-  actions.setBundling = (boxId, patch, scope) => {
+  actions.setBundling = (boxId, key, lvl) => {
     focusRef.current = [`c${boxId}`];
     keepPlacesRef.current = true;
     setBundling((prev) => {
       const next = new Map(prev);
-      for (const id of bundleScopeIds(boxId, scope)) next.set(id, { ...(next.get(id) || { in: false, out: false }), ...patch });
+      const cur = { ...(prev.get(boxId) || {}), [key]: lvl };
+      if (cur.in || cur.out || cur.inward) next.set(boxId, cur); else next.delete(boxId);
       return next;
     });
   };
@@ -501,7 +473,7 @@ function App() {
           <${Background} gap=${20} color="#dcdfe4" />
           ${openBox && openBoxPos && html`<${ViewportPortal}>
             <div style=${{ position: 'absolute', transform: `translate(${openBoxPos.x}px, ${openBoxPos.y}px)`, width: `${openBox.width}px`, height: `${openBox.height}px` }}>
-              <${BundlePopover} data=${{ ...openBox.data, popoverScope }} />
+              <${BundlePopover} id=${openPopoverId} levels=${bundling.get(openPopoverId) || {}} />
             </div>
           <//>`}
         <//>

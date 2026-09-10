@@ -2,8 +2,8 @@ import { useEffect, useRef } from 'react';
 import { Handle, BaseEdge, getBezierPath, useInternalNode } from '@xyflow/react';
 import { html, actions, fmtChurn, fmtLoc, statusClass } from './common.js';
 
-export function ZoomButton({ glyph, title, onClick, on }) {
-  return html`<button class=${'zoom nodrag nopan' + (on ? ' on' : '')} title=${title}
+export function ZoomButton({ glyph, title, onClick, on, cls = '' }) {
+  return html`<button class=${'zoom nodrag nopan ' + cls + (on ? ' on' : '')} title=${title}
     onClick=${(e) => { e.stopPropagation(); onClick(); }}>${glyph}</button>`;
 }
 
@@ -22,44 +22,49 @@ export function EntityNode({ data, sourcePosition, targetPosition }) {
   </div>`;
 }
 
-// The bundle popover: incoming/outgoing checkboxes plus an apply-to scope.
-// Closes itself on an outside click or Escape. Rendered by App through a
-// ViewportPortal rather than as a normal child of the box: React Flow gives
-// every child of a group node a z-index above the group's own, so a popover
-// nested inside the box div can never draw over the box's own contents.
-export function BundlePopover({ data }) {
+// The bundle popover: one three-way level per dimension (see buildModel for
+// what the levels mean). Closes itself on an outside click or Escape.
+// Rendered by App through a ViewportPortal rather than as a normal child of
+// the box: React Flow gives every child of a group node a z-index above the
+// group's own, so a popover nested inside the box div can never draw over
+// the box's own contents.
+const LEVELS = [[0, 'Off'], [1, 'On'], [2, 'Recursive']];
+const DIMS = [
+  ['in', 'Incoming', 'Edges arriving from outside this box'],
+  ['out', 'Outgoing', 'Edges leaving this box'],
+  ['inward', 'Inward', 'Edges that end at a sub box of this box'],
+];
+export function BundlePopover({ id, levels }) {
   const ref = useRef(null);
   useEffect(() => {
-    const onDown = (e) => { if (ref.current && !ref.current.contains(e.target)) actions.closePopover(); };
+    // The toggle button is excluded: closing on its mousedown would let its
+    // click reopen the popover, so the button could never close it.
+    const onDown = (e) => { if (ref.current && !ref.current.contains(e.target) && !e.target.closest('.bundle-toggle')) actions.closePopover(); };
     const onKey = (e) => { if (e.key === 'Escape') actions.closePopover(); };
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
     return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey); };
   }, []);
-  const scope = data.popoverScope;
-  const bundling = data.bundling || {};
-  const scopes = [['self', 'this box'], ['direct', '+ direct sub boxes'], ['nested', '+ all nested boxes']];
   return html`<div class="bundle-pop nodrag nopan" ref=${ref}>
-    <label class="chk"><input type="checkbox" checked=${!!bundling.in}
-      onChange=${(e) => actions.setBundling(data.id, { in: e.target.checked }, scope)} /> Incoming edges drawn to contents</label>
-    <label class="chk"><input type="checkbox" checked=${!!bundling.out}
-      onChange=${(e) => actions.setBundling(data.id, { out: e.target.checked }, scope)} /> Outgoing edges drawn to contents</label>
-    <div class="bundle-scope">
-      <span>Apply to:</span>
-      ${scopes.map(([s, label]) => html`<button key=${s} class=${scope === s ? 'on' : ''} onClick=${() => actions.setPopoverScope(s)}>${label}</button>`)}
-    </div>
-    <button class="bundle-reset" onClick=${() => actions.resetBundling(data.id)}>Bundle everything</button>
+    <div class="bundle-hint">Where an edge ends: at the box (Off), one level inside it (On), or at the leaf (Recursive).</div>
+    ${DIMS.map(([key, label, title]) => html`<div key=${key} class="bundle-row" title=${title}>
+      <span class="bundle-dim">${label}</span>
+      <div class="bundle-seg">${LEVELS.map(([lvl, name]) => html`<button key=${lvl} class=${(levels[key] || 0) === lvl ? 'on' : ''}
+        onClick=${() => actions.setBundling(id, key, lvl)}>${name}</button>`)}</div>
+    </div>`)}
+    <button class="bundle-reset" onClick=${() => actions.resetBundling(id)}>Reset this box and everything inside</button>
   </div>`;
 }
 
 export function ContainerNode({ data, sourcePosition, targetPosition }) {
   const churn = fmtChurn(data);
-  const bundlingOn = !!(data.bundling && (data.bundling.in || data.bundling.out));
+  const b = data.bundling;
+  const bundlingOn = !!(b && (b.in || b.out || b.inward));
   return html`<div class=${'box kind-' + data.kind + statusClass(data)} title=${data.path}>
     <${Handle} type="target" position=${targetPosition} />
     <div class="box-label">${data.name}${churn ? html` <span class="loc">·</span> ${churn}` : fmtLoc(data) && html` <span class="loc">· ${fmtLoc(data)}</span>`}</div>
     <div class="box-actions">
-      <${ZoomButton} glyph=${bundlingOn ? '⇶' : '⇉'} on=${bundlingOn}
+      <${ZoomButton} glyph=${bundlingOn ? '⇶' : '⇉'} on=${bundlingOn} cls="bundle-toggle"
         title=${bundlingOn ? 'Some edges are drawn to the nodes inside this box; click to change' : 'Edges into and out of this box are bundled at the box; click to change'}
         onClick=${() => actions.togglePopover(data.id)} />
       <${ZoomButton} glyph="⤢" title="Show only this box" onClick=${() => actions.prune(data.id)} />
