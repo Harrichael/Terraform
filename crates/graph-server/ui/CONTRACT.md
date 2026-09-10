@@ -113,6 +113,55 @@ for many raw references, listed in `refs` as indices into `/graph.json`'s
 In diff mode an edge also carries `status` ∈ `same | added | removed |
 mixed`, the status its members agree on, or `mixed` when they do not.
 
+## GET /search?q=...  — substring search over files
+```json
+{ "query": "main", "kind": null,
+  "hits": [
+    { "kind": "file",    "id": 2, "path": "src/main.rs", "text": "main.rs",     "start": 0, "end": 4 },
+    { "kind": "path",    "id": 9, "path": "src/domain/x.rs", "text": "src/domain/x.rs", "start": 4, "end": 8 },
+    { "kind": "content", "id": 2, "path": "src/main.rs", "line": 0, "text": "fn main() {", "start": 3, "end": 7 }
+  ],
+  "more": { "file": 0, "path": 0, "content": 12 } }
+```
+Substring search, case-insensitive, over three kinds built from every File
+entity in the graph at load: `file` (the entity's name), `path` (its wire
+path, `/`-separated), `content` (its lines, one document per line). Only
+files the server can read text for are indexed — same texts `/source` would
+serve, so a file that fails to read (unreadable, non-UTF-8, too big, or, in
+diff mode, absent from both sides) is simply not searchable; a removed file
+is indexed from its old text, an edited file from its new text.
+
+- `q` is percent-encoded (`+` or `%20` for space). Missing `q` is `400`
+  `` missing query parameter `q` ``; `q` that percent-decodes to invalid UTF-8
+  is `400`; an empty needle (`q=`) is `200` with no hits. Any other method is
+  `405`.
+- **Prefix syntax.** A query starting (case-insensitively) with `file:`,
+  `path:` or `content:` restricts the search to that kind; `kind` in the
+  response is then that string, and `query` is the needle with the prefix and
+  any leading space after it stripped. Otherwise `kind` is `null` and all
+  three kinds are searched, and `query` is the trimmed query as typed —
+  including a colon that isn't one of the three exact prefixes (`foo:bar`,
+  `C:\x`), which are plain needles. To search for text that itself starts
+  with a prefix token, name the kind explicitly:
+  `content:path: PathBuf` searches lines for the literal `path: PathBuf`.
+- A hit's `kind` is which of the three kinds matched — not an entity kind,
+  even though `"file"` happens to also be one. `path` is always the file's
+  wire path, regardless of which kind matched; `text`/`start`/`end` are the
+  thing the needle was found in (name / path / line) and the match's span
+  within it. `line` (0-indexed, omitted on file/path hits) is present only on
+  content hits.
+- `start`/`end` are **UTF-16 code units** into `text`, not chars or bytes,
+  because the UI slices JS strings with them.
+- **Ordering.** File hits sort by (name length, path), path hits by (path
+  length, path), content hits by (path, line); output is all file hits, then
+  all path hits, then all content hits. When the search is unrestricted, a
+  path hit whose match falls inside the trailing filename segment of the
+  path is dropped — it is the same occurrence the file hit for that file
+  already shows — but a match in a directory segment (`main/` in
+  `main/src/main.rs` for `main`) is kept as its own hit.
+- **Limits.** Each kind is capped (`file` 30, `path` 30, `content` 100); the
+  count past the cap for a kind is `more.<kind>`, `0` when nothing was cut.
+
 ## POST /coalesced/zoom-in?id=N
 Replace leaf `N` with its children. `200` + the new coalesced payload on
 change; `409` + `{"error": "..."}` if `N` is not a leaf or has no children.

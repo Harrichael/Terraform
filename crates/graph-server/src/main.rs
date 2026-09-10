@@ -4,6 +4,7 @@ mod dto;
 mod handlers;
 #[cfg(feature = "scip")]
 mod index;
+mod text_index;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

@@ -12,6 +12,7 @@ use graph_diff::{FileDiff, GraphDiff, Status};
 use tempfile::TempDir;
 
 use crate::dto::{self, DiffView, ErrorDto, GraphDto, SourceDto};
+use crate::text_index::{Limits, TextIndex};
 
 pub struct Response {
     pub status: u16,
@@ -40,6 +41,9 @@ const UI_MODULES: &[(&str, &str)] = &[
 /// file in one `<pre>`, so anything bigger is refused rather than truncated.
 const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 
+/// `/search` result caps, one per kind.
+const SEARCH_LIMITS: Limits = Limits { file: 30, path: 30, content: 100 };
+
 /// Everything diff mode adds: the change tags for the union graph the server
 /// is serving, and both texts of every changed file.
 struct DiffState {
@@ -65,6 +69,7 @@ pub struct Server {
     // `EntityGraph::file_path` results are resolved against it.
     root: PathBuf,
     diff: Option<DiffState>,
+    index: TextIndex,
     index_html: &'static str,
 }
 
@@ -73,7 +78,8 @@ impl Server {
         let graph_json = serde_json::to_string(&GraphDto::from(&graph))
             .expect("GraphDto serialization is infallible");
         let cursor = Mutex::new(Cursor::new(&graph));
-        Server { graph, graph_json, cursor, root, diff: None, index_html }
+        let index = build_text_index(&graph, &root, None);
+        Server { graph, graph_json, cursor, root, diff: None, index, index_html }
     }
 
     /// Serve a diff: the union graph is the graph, the change tags ride along
@@ -87,6 +93,7 @@ impl Server {
         index_html: &'static str,
     ) -> Self {
         let GraphDiff { graph, entity_status, reference_status, churn, files } = diff;
+        let index = build_text_index(&graph, &root, Some(&files));
         let state = DiffState {
             base_label,
             base_commit,
@@ -99,7 +106,7 @@ impl Server {
         let graph_json = serde_json::to_string(&dto::graph_dto_with_diff(&graph, &state.view()))
             .expect("GraphDto serialization is infallible");
         let cursor = Mutex::new(Cursor::new(&graph));
-        Server { graph, graph_json, cursor, root, diff: Some(state), index_html }
+        Server { graph, graph_json, cursor, root, diff: Some(state), index, index_html }
     }
 
     pub fn graph(&self) -> &EntityGraph {
@@ -113,7 +120,7 @@ impl Server {
         };
 
         match path {
-            "/" | "/graph.json" | "/coalesced.json" | "/source" if method != "GET" => {
+            "/" | "/graph.json" | "/coalesced.json" | "/source" | "/search" if method != "GET" => {
                 error(405, "method not allowed; use GET")
             }
             "/" => ok(HTML, self.index_html.as_bytes().to_vec()),
@@ -123,6 +130,7 @@ impl Server {
                 Ok(id) => self.source(id),
                 Err(msg) => error(400, msg),
             },
+            "/search" => self.search(query),
             p if p.starts_with("/ui/") && method != "GET" => {
                 error(405, "method not allowed; use GET")
             }
@@ -183,6 +191,20 @@ impl Server {
             ops: Some(file.ops.iter().map(dto::op_dto).collect()),
         };
         ok(JSON, serde_json::to_vec(&dto).unwrap())
+    }
+
+    /// `q` is percent-encoded, as query values are; a missing or non-UTF-8
+    /// `q` is the only way this 400s, since an empty needle is a valid (if
+    /// empty) search.
+    fn search(&self, query: Option<&str>) -> Response {
+        let raw = query.unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("q="));
+        let Some(raw) = raw else { return error(400, "missing query parameter `q`") };
+        let q = match percent_decode(raw) {
+            Ok(q) => q,
+            Err(()) => return error(400, "query parameter `q` is not valid UTF-8"),
+        };
+        let result = self.index.search(&q, SEARCH_LIMITS);
+        ok(JSON, serde_json::to_vec(&dto::search_dto(&result)).unwrap())
     }
 
     fn coalesced_response(&self) -> Response {
@@ -269,6 +291,26 @@ fn read_source(base: &Path, rel: &Path) -> Result<String, Response> {
         .map_err(|_| error(415, &format!("{} is not valid UTF-8", rel.display())))
 }
 
+/// Reads each File entity the same way `/source` would, so `/search` finds
+/// exactly the text the code pane can open: in diff mode, a changed file's
+/// new side, or the old side for a file that only exists on the base tree
+/// (its line numbers are then old-side line numbers, matching where the code
+/// pane opens a removed entity).
+fn build_text_index(
+    graph: &EntityGraph,
+    root: &Path,
+    diff_files: Option<&HashMap<EntityId, FileDiff>>,
+) -> TextIndex {
+    TextIndex::build(graph, |id| {
+        let rel = graph.file_path(id)?;
+        let text = match diff_files.and_then(|files| files.get(&id)) {
+            Some(diff) => diff.new_text.clone().or_else(|| diff.old_text.clone())?,
+            None => read_source(root, &rel).ok()?,
+        };
+        Some((wire_path(&rel), text))
+    })
+}
+
 fn file_ancestor(graph: &EntityGraph, id: EntityId) -> EntityId {
     let mut cur = graph.get(id).expect("file_path succeeded, so the id exists");
     while cur.kind != entity_graph::EntityKind::File {
@@ -282,6 +324,45 @@ fn wire_path(rel: &Path) -> String {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// `+` decodes to space and `%XX` (either hex case) to its byte; a `%` not
+/// followed by two hex digits, including at the end of the string, is kept
+/// literally rather than treated as an error.
+fn percent_decode(s: &str) -> Result<String, ()> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                // `from_str_radix` alone would also accept a sign (`%+f`).
+                let hex = bytes
+                    .get(i + 1..i + 3)
+                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+                    .and_then(|h| std::str::from_utf8(h).ok());
+                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| ())
 }
 
 fn parse_id(query: Option<&str>) -> Result<EntityId, &'static str> {
@@ -481,6 +562,96 @@ mod tests {
         assert_eq!(json(&resp), serde_json::json!({ "id": 0, "path": "", "text": "fn f() {}\n" }));
     }
 
+    /// `/search` end to end over a temp tree matching `fixture_graph()`'s
+    /// file paths (`tests/smoke.rs` is deliberately left off disk, so its
+    /// entity contributes no documents): unrestricted search, the `kind:`
+    /// prefix syntax, percent-decoding, case folding, a needle under 3 chars,
+    /// the content limit and its `more` count, and the file/path dedupe rule
+    /// in both directions.
+    #[test]
+    fn search_finds_files_paths_and_content() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("demo");
+
+        // 106 lines, 103 of which contain "main" — enough to trip the
+        // content limit (100) and prove `more` counts the rest.
+        let mut main_rs = String::from("fn main() {\n    helper();\n}\nfn helper() {}\n");
+        for i in 0..102 {
+            main_rs.push_str(&format!("// main line {i}\n"));
+        }
+        write_tree(&root, &[
+            ("src/main.rs", &main_rs),
+            ("src/lib.rs", "// calls main eventually\nfn lib_fn() {}\n"),
+        ]);
+        let s = Server::new(fixture_graph(), root, INDEX);
+
+        // Unrestricted "main": the file hit for main.rs leads, with offsets
+        // matching the contract example exactly; its path hit is suppressed
+        // (the match sits in the filename tail, the same occurrence the file
+        // hit already shows); content hits are ordered by path then line and
+        // truncated to the limit.
+        let main = json(&s.respond("GET", "/search?q=main"));
+        assert_eq!(main["kind"], Value::Null);
+        assert_eq!(main["query"], "main");
+        let hits = main["hits"].as_array().unwrap();
+        assert_eq!(
+            hits[0],
+            serde_json::json!(
+                { "kind": "file", "id": 2, "path": "src/main.rs", "text": "main.rs", "start": 0, "end": 4 }
+            )
+        );
+        assert!(hits.iter().all(|h| h["kind"] != "path"), "main.rs's path hit must be suppressed: {hits:?}");
+        let content: Vec<_> = hits.iter().filter(|h| h["kind"] == "content").collect();
+        assert_eq!(content.len(), 100);
+        assert_eq!((content[0]["path"].as_str(), content[0]["line"].as_i64()), (Some("src/lib.rs"), Some(0)));
+        assert_eq!((content[1]["path"].as_str(), content[1]["line"].as_i64()), (Some("src/main.rs"), Some(0)));
+        assert_eq!(main["more"], serde_json::json!({ "file": 0, "path": 0, "content": 4 }));
+
+        // A match confined to a directory segment ("src") is a different
+        // occurrence from any filename tail and is kept, unlike above.
+        let src = json(&s.respond("GET", "/search?q=src"));
+        let src_hits = src["hits"].as_array().unwrap();
+        assert!(src_hits.iter().all(|h| h["kind"] == "path"), "{src_hits:?}");
+        assert_eq!(src_hits.len(), 2);
+
+        // Restricted by prefix: only path hits, shortest path first.
+        let path_only = json(&s.respond("GET", "/search?q=path:src"));
+        assert_eq!(path_only["kind"], "path");
+        assert_eq!(path_only["query"], "src");
+        let hits = path_only["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0]["path"], "src/lib.rs");
+        assert_eq!(hits[1]["path"], "src/main.rs");
+
+        // `content:` prefix + case folding: "FN" finds a lowercase "fn" line.
+        let fn_hits = json(&s.respond("GET", "/search?q=content:FN"));
+        assert_eq!(fn_hits["kind"], "content");
+        let lib_fn =
+            fn_hits["hits"].as_array().unwrap().iter().find(|h| h["text"] == "fn lib_fn() {}").unwrap();
+        assert_eq!((lib_fn["start"].as_i64(), lib_fn["end"].as_i64()), (Some(0), Some(2)));
+
+        // A 2-char needle bypasses the postings (linear scan); "rs" matches
+        // both file names, but its only path occurrence in each is the same
+        // filename tail, so both path hits are suppressed too.
+        let rs = json(&s.respond("GET", "/search?q=rs"));
+        let rs_hits = rs["hits"].as_array().unwrap();
+        let file_paths: Vec<_> =
+            rs_hits.iter().filter(|h| h["kind"] == "file").map(|h| h["path"].as_str().unwrap()).collect();
+        assert_eq!(file_paths, vec!["src/lib.rs", "src/main.rs"]);
+        assert!(rs_hits.iter().all(|h| h["kind"] != "path"), "{rs_hits:?}");
+
+        // Percent-decoding: "+" is a space.
+        let decoded = json(&s.respond("GET", "/search?q=fn+main"));
+        assert_eq!(decoded["query"], "fn main");
+        assert!(decoded["hits"].as_array().unwrap().iter().any(|h| h["text"] == "fn main() {"));
+
+        assert_eq!(s.respond("GET", "/search").status, 400);
+        assert_eq!(s.respond("POST", "/search?q=main").status, 405);
+        assert_eq!(json(&s.respond("GET", "/search?q=")), serde_json::json!({
+            "query": "", "kind": null, "hits": [], "more": { "file": 0, "path": 0, "content": 0 }
+        }));
+    }
+
     /// Diff mode end to end over two hand-built trees (no git). The union
     /// graph carries the base labels and per-node status and churn, coalesced
     /// edges carry their member references plus an aggregated status (`mixed`
@@ -578,6 +749,36 @@ mod tests {
         let util = json(&s.respond("GET", &format!("/source?id={util_id}")));
         assert!(util.get("ops").is_some(), "util.rs did change");
         assert_eq!(util["old_text"], UTIL);
+    }
+
+    /// `/search` indexes the same diff-aware text `/source` does: a removed
+    /// file only from its old side, a changed file from its new side.
+    #[test]
+    fn search_indexes_diff_aware_text() {
+        const LIB: &str = "fn alpha() {\n    let x = 1;\n}\n";
+        const LIB_EDITED: &str = "fn alpha() {\n    let x = 1;\n    let y = 2;\n}\n";
+        const GONE: &str = "fn gone() {\n    alpha();\n}\n";
+
+        let trees = tempfile::TempDir::new().unwrap();
+        let old_root = trees.path().join("base/proj");
+        let new_root = trees.path().join("work/proj");
+        write_tree(&old_root, &[("src/lib.rs", LIB), ("src/gone.rs", GONE)]);
+        write_tree(&new_root, &[("src/lib.rs", LIB_EDITED)]);
+        let old = treesitter_producer::graph_from_path(&old_root).unwrap();
+        let new = treesitter_producer::graph_from_path(&new_root).unwrap();
+        let diff = graph_diff::diff(&old, &old_root, &new, &new_root).unwrap();
+        let s = Server::with_diff(diff, "HEAD~1".into(), "0123abcd".into(), None, new_root, INDEX);
+
+        let gone = json(&s.respond("GET", "/search?q=content:gone"));
+        let texts: Vec<_> =
+            gone["hits"].as_array().unwrap().iter().map(|h| h["text"].as_str().unwrap()).collect();
+        assert!(texts.iter().any(|t| t.contains("fn gone()")), "{texts:?}");
+
+        // "let y = 2;" only exists on the new side.
+        let edited = json(&s.respond("GET", "/search?q=content:y+%3D+2"));
+        let texts: Vec<_> =
+            edited["hits"].as_array().unwrap().iter().map(|h| h["text"].as_str().unwrap()).collect();
+        assert!(texts.iter().any(|t| t.contains("let y = 2;")), "{texts:?}");
     }
 
     fn write_tree(root: &std::path::Path, files: &[(&str, &str)]) {

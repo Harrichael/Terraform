@@ -1,43 +1,40 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
-import { html } from './common.js';
+import { html, fetchJson } from './common.js';
 
-const MAX_ROWS = 50;
+const DEBOUNCE_MS = 120;
+const GROUP_LABEL = { file: 'Files', path: 'Paths', content: 'Lines' };
+const MORE_LABEL = { file: 'files', path: 'paths', content: 'lines' };
+const KIND_ORDER = ['file', 'path', 'content'];
 
-// The path minus the root component, which every entity shares.
-const relPath = (n) => n.path.split('/').slice(1).join('/');
+// Hidden ids and the test filter are client-only state the server has no
+// notion of; apply them to each hit's file id the same way the diagram does.
+const isHidden = (graph, id, hiddenIds, showTests) => {
+  const node = graph.nodes[id];
+  if (!node) return true;
+  if (!showTests && node.is_test) return true;
+  for (let cur = id; cur != null; cur = graph.nodes[cur].parent) if (hiddenIds.has(cur)) return true;
+  return false;
+};
 
-// Case-insensitive substring search over names and paths. Files whose name
-// matches come first: a search is usually for a file, and symbols with the
-// same name would otherwise bury it. Path-only hits come last.
-export function search(graph, query, { showTests = true, hiddenIds = new Set() } = {}) {
-  const q = query.trim().toLowerCase();
-  if (!q || !graph) return { rows: [], more: 0 };
-  const hidden = (n) => {
-    if (!showTests && n.is_test) return true;
-    for (let cur = n.id; cur != null; cur = graph.nodes[cur].parent) if (hiddenIds.has(cur)) return true;
-    return false;
-  };
-  const hits = [];
-  for (const n of graph.nodes) {
-    if (n.parent == null) continue;
-    const name = n.name.toLowerCase();
-    const at = name.indexOf(q);
-    const path = relPath(n);
-    if (at < 0 && !path.toLowerCase().includes(q)) continue;
-    if (hidden(n)) continue;
-    const rank = at >= 0 ? (n.kind === 'file' ? 0 : 1) : 2;
-    hits.push({ id: n.id, kind: n.kind, name: n.name, path, at, rank });
-  }
-  hits.sort((a, b) => a.rank - b.rank || a.name.length - b.name.length || a.path.localeCompare(b.path));
-  return { rows: hits.slice(0, MAX_ROWS), more: Math.max(0, hits.length - MAX_ROWS) };
-}
+// start/end are UTF-16 offsets, same units as JS string indices, so slicing
+// needs no conversion. Only the leading-whitespace trim shifts them, and a
+// naive shift can go negative, which slice() would read as "from the end".
+const trimLead = (text, start, end) => {
+  const cut = /^\s*/.exec(text)[0].length;
+  const s = Math.max(0, start - cut);
+  return { text: text.slice(cut), start: s, end: Math.max(s, end - cut) };
+};
+
+const mark = (text, start, end) => html`${text.slice(0, start)}<b>${text.slice(start, end)}</b>${text.slice(end)}`;
 
 export function Search({ graph, showTests, hiddenIds, onPick }) {
   const [q, setQ] = useState('');
   const [open, setOpen] = useState(false);
   const [cursor, setCursor] = useState(0);
+  const [result, setResult] = useState({ hits: [], more: {}, error: null });
   const inputRef = useRef(null);
   const listRef = useRef(null);
+  const reqRef = useRef(0);
 
   useEffect(() => {
     const onKey = (e) => {
@@ -48,29 +45,67 @@ export function Search({ graph, showTests, hiddenIds, onPick }) {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  const { rows, more } = useMemo(() => search(graph, q, { showTests, hiddenIds }), [graph, q, showTests, hiddenIds]);
+  // Debounced, request-id-guarded fetch. The previous result is left in state
+  // until a newer request resolves, so the list never flickers to "no match"
+  // while a query is in flight.
+  useEffect(() => {
+    const needle = q.trim();
+    const id = ++reqRef.current;
+    if (!needle) { setResult({ hits: [], more: {}, error: null }); return; }
+    const t = setTimeout(() => {
+      fetchJson(`./search?q=${encodeURIComponent(needle)}`)
+        .then((res) => { if (reqRef.current === id) setResult({ hits: res.hits, more: res.more, error: null }); })
+        .catch((e) => { if (reqRef.current === id) setResult({ hits: [], more: {}, error: e.message }); });
+    }, DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [q]);
+
+  const rows = useMemo(
+    () => (graph ? result.hits.filter((h) => !isHidden(graph, h.id, hiddenIds, showTests)) : []),
+    [graph, result.hits, hiddenIds, showTests],
+  );
+
   useEffect(() => { setCursor(0); }, [q]);
   useEffect(() => { listRef.current?.querySelector('.on')?.scrollIntoView({ block: 'nearest' }); }, [cursor]);
 
-  const pick = (row) => { setOpen(false); onPick(row.id); };
+  const pick = (r) => { setOpen(false); onPick(r.id, r.kind === 'content' ? r.line : undefined); };
   const onKeyDown = (e) => {
     if (e.key === 'ArrowDown') { e.preventDefault(); setOpen(true); setCursor((c) => Math.min(rows.length - 1, c + 1)); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); setCursor((c) => Math.max(0, c - 1)); }
     else if (e.key === 'Enter') { if (rows[cursor]) pick(rows[cursor]); }
     else if (e.key === 'Escape') { setQ(''); setOpen(false); e.currentTarget.blur(); }
   };
-  const mark = (r) => (r.at < 0 ? r.name : html`${r.name.slice(0, r.at)}<b>${r.name.slice(r.at, r.at + q.trim().length)}</b>${r.name.slice(r.at + q.trim().length)}`);
+
+  const rowBody = (r) => {
+    if (r.kind === 'content') {
+      const t = trimLead(r.text, r.start, r.end);
+      return html`<span class="where">${r.path}:${r.line + 1}</span><span class="text">${mark(t.text, t.start, t.end)}</span>`;
+    }
+    if (r.kind === 'file') return html`<span class="name">${mark(r.text, r.start, r.end)}</span><span class="path">${r.path}</span>`;
+    return html`<span class="name">${mark(r.text, r.start, r.end)}</span>`;
+  };
+
+  // Group headers live between rows, not in `rows`, so the cursor (indexed
+  // into `rows`) always lands on a real hit.
+  let prevKind = null;
+  const items = [];
+  rows.forEach((r, i) => {
+    if (r.kind !== prevKind) { items.push(html`<div key=${`head-${r.kind}`} class="search-head">${GROUP_LABEL[r.kind]}</div>`); prevKind = r.kind; }
+    items.push(html`<div key=${`${r.kind}:${r.id}:${r.line ?? ''}:${r.start}`} class=${'search-row' + (i === cursor ? ' on' : '')}
+      onMouseEnter=${() => setCursor(i)} onClick=${() => pick(r)}>
+      <span class="kind">${r.kind}</span>${rowBody(r)}
+    </div>`);
+  });
 
   return html`<div class="search">
-    <input ref=${inputRef} type="search" placeholder="search files and symbols  /" value=${q}
+    <input ref=${inputRef} type="search" placeholder="search files, paths, content  /" value=${q}
       onInput=${(e) => { setQ(e.target.value); setOpen(true); }} onFocus=${() => setOpen(true)}
       onBlur=${() => setOpen(false)} onKeyDown=${onKeyDown} />
     ${open && q.trim() && html`<div class="search-list" ref=${listRef} onMouseDown=${(e) => e.preventDefault()}>
-      ${rows.map((r, i) => html`<div key=${r.id} class=${'search-row' + (i === cursor ? ' on' : '')} onMouseEnter=${() => setCursor(i)} onClick=${() => pick(r)}>
-        <span class="kind">${r.kind}</span><span class="name">${mark(r)}</span><span class="path">${r.path}</span>
-      </div>`)}
-      ${!rows.length && html`<div class="search-empty">no match</div>`}
-      ${more > 0 && html`<div class="search-empty">${more} more…</div>`}
+      ${result.error && html`<div class="search-empty">${result.error}</div>`}
+      ${!result.error && items}
+      ${!result.error && !rows.length && html`<div class="search-empty">no match</div>`}
+      ${!result.error && KIND_ORDER.map((k) => result.more?.[k] > 0 && html`<div key=${`more-${k}`} class="search-empty">${result.more[k]} more ${MORE_LABEL[k]}…</div>`)}
     </div>`}
   </div>`;
 }

@@ -10,6 +10,8 @@ use entity_graph::{Entity, EntityGraph, EntityId, EntityKind, Reference, Referen
 use graph_diff::{LineOp, Status, Tag};
 use serde::Serialize;
 
+use crate::text_index::SearchResult;
+
 #[derive(Serialize)]
 pub struct GraphDto {
     pub root: String,
@@ -93,6 +95,54 @@ pub struct SourceDto {
 #[derive(Serialize)]
 pub struct ErrorDto {
     pub error: String,
+}
+
+#[derive(Serialize)]
+pub struct SearchDto {
+    pub query: String,
+    pub kind: Option<&'static str>,
+    pub hits: Vec<HitDto>,
+    pub more: MoreDto,
+}
+
+#[derive(Serialize)]
+pub struct HitDto {
+    pub kind: &'static str,
+    pub id: usize,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    pub text: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Serialize)]
+pub struct MoreDto {
+    pub file: usize,
+    pub path: usize,
+    pub content: usize,
+}
+
+pub fn search_dto(r: &SearchResult) -> SearchDto {
+    SearchDto {
+        query: r.needle.clone(),
+        kind: r.kind.map(|k| k.as_str()),
+        hits: r
+            .hits
+            .iter()
+            .map(|h| HitDto {
+                kind: h.kind.as_str(),
+                id: h.file.0,
+                path: h.path.clone(),
+                line: h.line,
+                text: h.text.clone(),
+                start: h.start,
+                end: h.end,
+            })
+            .collect(),
+        more: MoreDto { file: r.more.file, path: r.more.path, content: r.more.content },
+    }
 }
 
 /// The diff side tables a payload needs, borrowed from wherever they live.

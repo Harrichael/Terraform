@@ -81,6 +81,8 @@ function App() {
   // existing node where it is instead of starting over.
   const keepPlacesRef = useRef(false);
   const pendingSelectRef = useRef(null);
+  // A content search hit's line, consumed by the selection effect below.
+  const pendingLineRef = useRef(null);
   const animRef = useRef(0);
 
   // focusRef may also hold STAY: the layout changes but the camera does not
@@ -207,9 +209,19 @@ function App() {
   useEffect(() => {
     if (sel?.type !== 'node') return;
     const ent = nodes.find((n) => n.id === sel.id)?.data;
+    if (!ent) return;
+    // A search hit on a specific line is consumed here rather than acted on
+    // where it was picked, because this effect runs after that tick and would
+    // otherwise reopen the file at line_start and clobber it.
+    if (pendingLineRef.current && fileOf(ent.id) === pendingLineRef.current.id) {
+      const { line } = pendingLineRef.current;
+      pendingLineRef.current = null;
+      openCode(ent.id, line, [-1, -1], undefined, { show: true });
+      return;
+    }
     // Tinting a whole file's range would paint every line; only sub-file
     // entities get their extent marked.
-    if (ent) openCode(ent.id, ent.line_start, ent.kind === 'file' ? [-1, -1] : [ent.line_start, ent.line_end], undefined, { show: false });
+    openCode(ent.id, ent.line_start, ent.kind === 'file' ? [-1, -1] : [ent.line_start, ent.line_end], undefined, { show: false });
   }, [sel]);
 
   // Two wheel gestures React Flow gets wrong on macOS are handled before
@@ -375,7 +387,8 @@ function App() {
   // zooming into every ancestor that is still a leaf, one request each; the
   // selection waits for the final layout (pendingSelectRef). Anything that
   // would keep the entity out of the picture (a hide, a scope) is undone.
-  const revealEntity = async (id) => {
+  const revealEntity = async (id, line) => {
+    pendingLineRef.current = line != null ? { id, line } : null;
     const rf = [String(id), `c${id}`];
     for (let c = id; c != null; c = graph.nodes[c].parent) if (hiddenIds.has(c)) setHiddenIds((prev) => { const next = new Set(prev); next.delete(c); return next; });
     if (scopeId != null && id !== scopeId && !isUnder(id, scopeId)) setScopeId(null);
