@@ -100,7 +100,6 @@ pub struct ErrorDto {
 #[derive(Serialize)]
 pub struct SearchDto {
     pub query: String,
-    pub kind: Option<&'static str>,
     pub hits: Vec<HitDto>,
     pub more: MoreDto,
 }
@@ -126,8 +125,7 @@ pub struct MoreDto {
 
 pub fn search_dto(r: &SearchResult) -> SearchDto {
     SearchDto {
-        query: r.needle.clone(),
-        kind: r.kind.map(|k| k.as_str()),
+        query: r.query.clone(),
         hits: r
             .hits
             .iter()

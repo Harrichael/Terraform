@@ -591,7 +591,6 @@ mod tests {
         // hit already shows); content hits are ordered by path then line and
         // truncated to the limit.
         let main = json(&s.respond("GET", "/search?q=main"));
-        assert_eq!(main["kind"], Value::Null);
         assert_eq!(main["query"], "main");
         let hits = main["hits"].as_array().unwrap();
         assert_eq!(
@@ -616,8 +615,7 @@ mod tests {
 
         // Restricted by prefix: only path hits, shortest path first.
         let path_only = json(&s.respond("GET", "/search?q=path:src"));
-        assert_eq!(path_only["kind"], "path");
-        assert_eq!(path_only["query"], "src");
+        assert_eq!(path_only["query"], "path:src");
         let hits = path_only["hits"].as_array().unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0]["path"], "src/lib.rs");
@@ -625,7 +623,6 @@ mod tests {
 
         // `content:` prefix + case folding: "FN" finds a lowercase "fn" line.
         let fn_hits = json(&s.respond("GET", "/search?q=content:FN"));
-        assert_eq!(fn_hits["kind"], "content");
         let lib_fn =
             fn_hits["hits"].as_array().unwrap().iter().find(|h| h["text"] == "fn lib_fn() {}").unwrap();
         assert_eq!((lib_fn["start"].as_i64(), lib_fn["end"].as_i64()), (Some(0), Some(2)));
@@ -640,15 +637,31 @@ mod tests {
         assert_eq!(file_paths, vec!["src/lib.rs", "src/main.rs"]);
         assert!(rs_hits.iter().all(|h| h["kind"] != "path"), "{rs_hits:?}");
 
-        // Percent-decoding: "+" is a space.
+        // Percent-decoding: "+" is a space, which splits terms; both must be
+        // on the line, in any order, unless quoted into one phrase.
         let decoded = json(&s.respond("GET", "/search?q=fn+main"));
         assert_eq!(decoded["query"], "fn main");
         assert!(decoded["hits"].as_array().unwrap().iter().any(|h| h["text"] == "fn main() {"));
+        assert!(json(&s.respond("GET", "/search?q=main+fn"))["hits"].as_array().unwrap().iter().any(|h| h["text"] == "fn main() {"));
+        assert!(json(&s.respond("GET", "/search?q=%22main+fn%22"))["hits"].as_array().unwrap().is_empty());
+
+        // Mixed terms: a tag on another kind filters by file. "main" lines in
+        // files named "lib": one content hit and nothing else, since lib.rs's
+        // own name and path do not contain "main".
+        let mixed = json(&s.respond("GET", "/search?q=main+file:lib"));
+        let mixed_hits = mixed["hits"].as_array().unwrap();
+        assert_eq!(mixed_hits.len(), 1, "{mixed_hits:?}");
+        assert_eq!((mixed_hits[0]["kind"].as_str(), mixed_hits[0]["path"].as_str(), mixed_hits[0]["line"].as_i64()), (Some("content"), Some("src/lib.rs"), Some(0)));
+        // The other way round: files named "lib" that contain "main" is a
+        // file hit (marked on the name) plus the same line hit.
+        let both = json(&s.respond("GET", "/search?q=file:lib+content:main"));
+        let kinds: Vec<_> = both["hits"].as_array().unwrap().iter().map(|h| h["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["file", "content"]);
 
         assert_eq!(s.respond("GET", "/search").status, 400);
         assert_eq!(s.respond("POST", "/search?q=main").status, 405);
         assert_eq!(json(&s.respond("GET", "/search?q=")), serde_json::json!({
-            "query": "", "kind": null, "hits": [], "more": { "file": 0, "path": 0, "content": 0 }
+            "query": "", "hits": [], "more": { "file": 0, "path": 0, "content": 0 }
         }));
     }
 

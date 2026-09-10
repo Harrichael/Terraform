@@ -99,6 +99,7 @@ export function Search({ graph, showTests, hiddenIds, onPick }) {
 
   return html`<div class="search">
     <input ref=${inputRef} type="search" placeholder="search files, paths, content  /" value=${q}
+      title=${'Terms separated by spaces must all match. Tag a term with file:, path: or content: to pin it to one kind, e.g. class file:resolver. "Quote a phrase" to keep its spaces.'}
       onInput=${(e) => { setQ(e.target.value); setOpen(true); }} onFocus=${() => setOpen(true)}
       onBlur=${() => setOpen(false)} onKeyDown=${onKeyDown} />
     ${open && q.trim() && html`<div class="search-list" ref=${listRef} onMouseDown=${(e) => e.preventDefault()}>

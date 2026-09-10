@@ -4,10 +4,10 @@
 //! queries it. See `ui/CONTRACT.md` for the wire shape this feeds.
 //!
 //! Three kinds share one mechanism: a doc list plus a trigram postings map
-//! (`Postings`), one per kind. A query either names a kind with a
-//! `file:`/`path:`/`content:` prefix or searches all three.
+//! (`Postings`), one per kind. A query is a list of terms that must all hold;
+//! a `file:`/`path:`/`content:` tag pins a term to one kind (see `search`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use entity_graph::{EntityGraph, EntityId, EntityKind};
 
@@ -57,8 +57,7 @@ pub struct More {
 }
 
 pub struct SearchResult {
-    pub kind: Option<Kind>,
-    pub needle: String,
+    pub query: String,
     pub hits: Vec<Hit>,
     pub more: More,
 }
@@ -137,7 +136,7 @@ impl Postings {
             if candidates.is_empty() {
                 break;
             }
-            candidates = intersect_sorted(&candidates, l);
+            candidates = intersect_sorted(&candidates, l, |&d| d);
         }
 
         // Trigram co-occurrence only means the needle's 3-grams are all
@@ -153,11 +152,13 @@ impl Postings {
     }
 }
 
-fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+/// Merge-intersection of two lists ascending in `key`; on a tie the entry
+/// from `a` is kept.
+fn intersect_sorted<T: Copy>(a: &[T], b: &[T], key: impl Fn(&T) -> u32) -> Vec<T> {
     let mut out = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
+        match key(&a[i]).cmp(&key(&b[j])) {
             std::cmp::Ordering::Less => i += 1,
             std::cmp::Ordering::Greater => j += 1,
             std::cmp::Ordering::Equal => {
@@ -200,14 +201,55 @@ fn split_lines(text: &str) -> impl Iterator<Item = &str> {
     lines.into_iter().map(|l| l.strip_suffix('\r').unwrap_or(l))
 }
 
-fn parse_query(q: &str) -> (Option<Kind>, &str) {
-    for (prefix, kind) in [("file:", Kind::File), ("path:", Kind::Path), ("content:", Kind::Content)]
-    {
-        if let Some(rest) = strip_prefix_ci(q, prefix) {
-            return (Some(kind), rest.trim_start());
+/// One query term. `tag` is the kind the term was written for; a bare term
+/// has none and is about whatever text a hit is itself made of.
+struct Term {
+    tag: Option<Kind>,
+    needle: String,
+    folded: String,
+}
+
+/// Whitespace-separated terms; double quotes keep a phrase together (and the
+/// quotes themselves out), so `content:"fn respond"` is one term. A tag only
+/// counts when written outside the quotes: `"file:x"` is a literal. A tag
+/// with nothing after it is dropped.
+fn tokenize(q: &str) -> Vec<Term> {
+    let mut terms = Vec::new();
+    let mut chars = q.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let quoted_start = c == '"';
+        let mut raw = String::new();
+        let mut in_quote = false;
+        while let Some(&c) = chars.peek() {
+            if c == '"' {
+                in_quote = !in_quote;
+            } else if c.is_whitespace() && !in_quote {
+                break;
+            } else {
+                raw.push(c);
+            }
+            chars.next();
+        }
+        let (tag, needle) = if quoted_start { (None, raw.as_str()) } else { split_tag(&raw) };
+        if !needle.is_empty() {
+            terms.push(Term { tag, needle: needle.to_string(), folded: fold(needle) });
         }
     }
-    (None, q)
+    terms
+}
+
+fn split_tag(raw: &str) -> (Option<Kind>, &str) {
+    for (prefix, kind) in [("file:", Kind::File), ("path:", Kind::Path), ("content:", Kind::Content)]
+    {
+        if let Some(rest) = strip_prefix_ci(raw, prefix) {
+            return (Some(kind), rest);
+        }
+    }
+    (None, raw)
 }
 
 // The three prefixes are ASCII, so a byte-wise ASCII-case-insensitive
@@ -280,28 +322,70 @@ impl TextIndex {
         }
     }
 
+    /// Every term must hold for a hit. A term holds against the hit's own
+    /// text (a bare term, or one tagged with the hit's kind) or, tagged with
+    /// another kind, against the hit's file: `file:` its name, `path:` its
+    /// path, `content:` any one of its lines. A kind only yields hits when at
+    /// least one term is about its own text, so `file:x` alone never lists
+    /// every line of the matching files. The span marked on a hit is the
+    /// first own-text term's.
     pub fn search(&self, query: &str, limits: Limits) -> SearchResult {
         let query = query.trim();
-        let (kind, needle) = parse_query(query);
-        if needle.is_empty() {
-            return SearchResult {
-                kind,
-                needle: needle.to_string(),
-                hits: Vec::new(),
-                more: More::default(),
-            };
+        let terms = tokenize(query);
+        let mut result = SearchResult { query: query.to_string(), hits: Vec::new(), more: More::default() };
+        if terms.is_empty() {
+            return result;
         }
 
-        let folded = fold(needle);
-        let needle_len = needle.chars().count();
-        let want = |k: Kind| kind.is_none() || kind == Some(k);
+        let postings = |k: Kind| match k {
+            Kind::File => &self.file_postings,
+            Kind::Path => &self.path_postings,
+            Kind::Content => &self.content_postings,
+        };
+        // The files a tagged term admits when it acts as a filter on another
+        // kind's hits, as ascending file indices. Line docs are in file order,
+        // so mapping them to files needs only a dedup.
+        let filter_sets: Vec<Option<Vec<u32>>> = terms
+            .iter()
+            .map(|t| {
+                let kind = t.tag?;
+                let docs = postings(kind).find(&t.folded);
+                let mut files: Vec<u32> = match kind {
+                    Kind::Content => docs.iter().map(|&(d, _)| self.lines[d as usize].file_idx).collect(),
+                    _ => docs.iter().map(|&(d, _)| d).collect(),
+                };
+                files.dedup();
+                Some(files)
+            })
+            .collect();
 
-        let mut file_matches =
-            if want(Kind::File) { self.file_postings.find(&folded) } else { Vec::new() };
-        let mut path_matches =
-            if want(Kind::Path) { self.path_postings.find(&folded) } else { Vec::new() };
-        let mut content_matches =
-            if want(Kind::Content) { self.content_postings.find(&folded) } else { Vec::new() };
+        // `(doc, start_char)` per hit of `kind`, plus the char length of the
+        // marked term.
+        let matches = |kind: Kind| -> (Vec<(u32, usize)>, usize) {
+            let own: Vec<usize> =
+                (0..terms.len()).filter(|&i| terms[i].tag.is_none() || terms[i].tag == Some(kind)).collect();
+            let Some(&first) = own.first() else { return (Vec::new(), 0) };
+            let p = postings(kind);
+            let mut cands = p.find(&terms[first].folded);
+            for &i in &own[1..] {
+                if cands.is_empty() {
+                    break;
+                }
+                cands = intersect_sorted(&cands, &p.find(&terms[i].folded), |m| m.0);
+            }
+            let file_of = |doc: u32| if kind == Kind::Content { self.lines[doc as usize].file_idx } else { doc };
+            for (i, set) in filter_sets.iter().enumerate() {
+                let Some(set) = set else { continue };
+                if own.contains(&i) {
+                    continue;
+                }
+                cands.retain(|&(doc, _)| set.binary_search(&file_of(doc)).is_ok());
+            }
+            (cands, terms[first].needle.chars().count())
+        };
+        let (mut file_matches, file_len) = matches(Kind::File);
+        let (mut path_matches, path_len) = matches(Kind::Path);
+        let (mut content_matches, content_len) = matches(Kind::Content);
 
         file_matches.sort_by(|a, b| {
             let (fa, fb) = (&self.files[a.0 as usize], &self.files[b.0 as usize]);
@@ -317,40 +401,36 @@ impl TextIndex {
             fa.path.cmp(&fb.path).then_with(|| la.line.cmp(&lb.line))
         });
 
-        if kind.is_none() {
-            // A path hit inside the trailing filename segment of the path is
-            // the same occurrence the file hit already shows; drop it. A hit
-            // in a directory segment (e.g. "main/" in "main/src/main.rs" for
-            // "main") is a different occurrence and is kept.
-            path_matches.retain(|&(doc, start_chars)| {
-                let f = &self.files[doc as usize];
-                let name_chars = f.name.chars().count();
-                let path_chars = f.path.chars().count();
-                start_chars < path_chars.saturating_sub(name_chars)
-            });
-        }
+        // A path hit marked inside the trailing filename segment, for a file
+        // that is also a file hit, shows the same occurrence twice; drop it.
+        // A mark in a directory segment ("main/" in "main/src/main.rs" for
+        // "main") is a different occurrence and stays.
+        let file_hit_docs: HashSet<u32> = file_matches.iter().map(|m| m.0).collect();
+        path_matches.retain(|&(doc, start_chars)| {
+            let f = &self.files[doc as usize];
+            !file_hit_docs.contains(&doc)
+                || start_chars < f.path.chars().count().saturating_sub(f.name.chars().count())
+        });
 
         let (file_matches, file_more) = truncate(file_matches, limits.file);
         let (path_matches, path_more) = truncate(path_matches, limits.path);
         let (content_matches, content_more) = truncate(content_matches, limits.content);
 
-        let mut hits = Vec::with_capacity(
-            file_matches.len() + path_matches.len() + content_matches.len(),
-        );
+        let hits = &mut result.hits;
         hits.extend(file_matches.into_iter().map(|(doc, start)| {
             let f = &self.files[doc as usize];
-            let (start, end) = utf16_span(&f.name, start, needle_len);
+            let (start, end) = utf16_span(&f.name, start, file_len);
             Hit { kind: Kind::File, file: f.id, path: f.path.clone(), line: None, text: f.name.clone(), start, end }
         }));
         hits.extend(path_matches.into_iter().map(|(doc, start)| {
             let f = &self.files[doc as usize];
-            let (start, end) = utf16_span(&f.path, start, needle_len);
+            let (start, end) = utf16_span(&f.path, start, path_len);
             Hit { kind: Kind::Path, file: f.id, path: f.path.clone(), line: None, text: f.path.clone(), start, end }
         }));
         hits.extend(content_matches.into_iter().map(|(doc, start)| {
             let l = &self.lines[doc as usize];
             let f = &self.files[l.file_idx as usize];
-            let (start, end) = utf16_span(&l.text, start, needle_len);
+            let (start, end) = utf16_span(&l.text, start, content_len);
             Hit {
                 kind: Kind::Content,
                 file: f.id,
@@ -361,13 +441,8 @@ impl TextIndex {
                 end,
             }
         }));
-
-        SearchResult {
-            kind,
-            needle: needle.to_string(),
-            hits,
-            more: More { file: file_more, path: path_more, content: content_more },
-        }
+        result.more = More { file: file_more, path: path_more, content: content_more };
+        result
     }
 }
 
@@ -405,5 +480,22 @@ mod tests {
         // must account for.
         assert_eq!(p.find(&fold("foo")), vec![(4, 2)]);
         assert_eq!(utf16_span("😀 Foo", 2, 3), (3, 6));
+    }
+
+    /// The query grammar: whitespace splits terms, a tag binds only outside
+    /// quotes, quotes join a phrase, a dangling tag is dropped.
+    #[test]
+    fn tokenize_terms() {
+        let terms = tokenize(r#"class FILE:resolver content:"fn respond" "file:x" path:"#);
+        let seen: Vec<(Option<Kind>, &str)> = terms.iter().map(|t| (t.tag, t.needle.as_str())).collect();
+        assert_eq!(
+            seen,
+            vec![
+                (None, "class"),
+                (Some(Kind::File), "resolver"),
+                (Some(Kind::Content), "fn respond"),
+                (None, "file:x"),
+            ]
+        );
     }
 }

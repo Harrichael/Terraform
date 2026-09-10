@@ -115,7 +115,7 @@ mixed`, the status its members agree on, or `mixed` when they do not.
 
 ## GET /search?q=...  — substring search over files
 ```json
-{ "query": "main", "kind": null,
+{ "query": "main file:lib",
   "hits": [
     { "kind": "file",    "id": 2, "path": "src/main.rs", "text": "main.rs",     "start": 0, "end": 4 },
     { "kind": "path",    "id": 9, "path": "src/domain/x.rs", "text": "src/domain/x.rs", "start": 4, "end": 8 },
@@ -133,32 +133,37 @@ is indexed from its old text, an edited file from its new text.
 
 - `q` is percent-encoded (`+` or `%20` for space). Missing `q` is `400`
   `` missing query parameter `q` ``; `q` that percent-decodes to invalid UTF-8
-  is `400`; an empty needle (`q=`) is `200` with no hits. Any other method is
-  `405`.
-- **Prefix syntax.** A query starting (case-insensitively) with `file:`,
-  `path:` or `content:` restricts the search to that kind; `kind` in the
-  response is then that string, and `query` is the needle with the prefix and
-  any leading space after it stripped. Otherwise `kind` is `null` and all
-  three kinds are searched, and `query` is the trimmed query as typed —
-  including a colon that isn't one of the three exact prefixes (`foo:bar`,
-  `C:\x`), which are plain needles. To search for text that itself starts
-  with a prefix token, name the kind explicitly:
-  `content:path: PathBuf` searches lines for the literal `path: PathBuf`.
+  is `400`; a query with no terms (`q=`) is `200` with no hits. Any other
+  method is `405`. `query` echoes the trimmed query as typed.
+- **Terms.** The query is split on whitespace into terms that must *all*
+  hold. Double quotes join a phrase into one term and are removed
+  (`"fn respond"`). A term may carry a tag, `file:`, `path:` or `content:`
+  (case-insensitive, written outside any quotes); anything else with a colon
+  (`foo:bar`, `C:\x`) is a plain term, and `"file:x"` in quotes is too. A tag
+  with nothing after it is ignored.
+- **How a term holds.** For a hit of kind K, a bare term or a term tagged K
+  must occur in the hit's own text (the name, the path, or the line). A term
+  tagged with another kind is a filter on the hit's file: `file:` on its
+  name, `path:` on its path, `content:` on any one of its lines. A kind only
+  produces hits when at least one term is about its own text, so `file:x`
+  alone lists files, not every line inside them. Hence `class file:resolver`
+  is "lines containing `class` in files whose name contains `resolver`", and
+  `file:resolver content:class` additionally lists those files themselves.
+  A hit's `start`/`end` mark the first own-text term.
 - A hit's `kind` is which of the three kinds matched — not an entity kind,
   even though `"file"` happens to also be one. `path` is always the file's
-  wire path, regardless of which kind matched; `text`/`start`/`end` are the
-  thing the needle was found in (name / path / line) and the match's span
-  within it. `line` (0-indexed, omitted on file/path hits) is present only on
+  wire path, regardless of which kind matched; `text` is the thing the term
+  was found in (name / path / line) and `start`/`end` the marked span within
+  it. `line` (0-indexed, omitted on file/path hits) is present only on
   content hits.
 - `start`/`end` are **UTF-16 code units** into `text`, not chars or bytes,
   because the UI slices JS strings with them.
 - **Ordering.** File hits sort by (name length, path), path hits by (path
   length, path), content hits by (path, line); output is all file hits, then
-  all path hits, then all content hits. When the search is unrestricted, a
-  path hit whose match falls inside the trailing filename segment of the
-  path is dropped — it is the same occurrence the file hit for that file
-  already shows — but a match in a directory segment (`main/` in
-  `main/src/main.rs` for `main`) is kept as its own hit.
+  all path hits, then all content hits. A path hit whose mark falls inside
+  the trailing filename segment, for a file that is also a file hit, is
+  dropped — it is the same occurrence — but a mark in a directory segment
+  (`main/` in `main/src/main.rs` for `main`) is kept as its own hit.
 - **Limits.** Each kind is capped (`file` 30, `path` 30, `content` 100); the
   count past the cap for a kind is `more.<kind>`, `0` when nothing was cut.
 
