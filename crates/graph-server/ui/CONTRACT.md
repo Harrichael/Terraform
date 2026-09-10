@@ -11,7 +11,9 @@ UI detects the mode, and an absent `status` always means "unchanged". A
 rename is a removed entity plus an added one, never a modified one.
 
 ## GET /
-The single-file UI (`ui/index.html`), embedded in the binary.
+The UI shell (`ui/index.html`), embedded in the binary. It loads its logic as
+ES modules from `/ui/*.js` (`common.js`, `nodes.js`, `model.js`, `layout.js`,
+`code.js`, `panel.js`, `search.js`, `app.js`), also embedded in the binary.
 
 ## GET /graph.json  — the raw entity graph
 ```json

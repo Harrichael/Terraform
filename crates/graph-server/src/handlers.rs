@@ -21,6 +21,20 @@ pub struct Response {
 
 const JSON: &str = "application/json";
 const HTML: &str = "text/html; charset=utf-8";
+const JS: &str = "application/javascript; charset=utf-8";
+
+/// The ES modules `index.html` imports, served at `/ui/<name>` and embedded
+/// in the binary the same way `index_html` is.
+const UI_MODULES: &[(&str, &str)] = &[
+    ("common.js", include_str!("../ui/common.js")),
+    ("nodes.js", include_str!("../ui/nodes.js")),
+    ("model.js", include_str!("../ui/model.js")),
+    ("layout.js", include_str!("../ui/layout.js")),
+    ("code.js", include_str!("../ui/code.js")),
+    ("panel.js", include_str!("../ui/panel.js")),
+    ("search.js", include_str!("../ui/search.js")),
+    ("app.js", include_str!("../ui/app.js")),
+];
 
 /// Largest source file `/source` will serve; the viewer renders the whole
 /// file in one `<pre>`, so anything bigger is refused rather than truncated.
@@ -109,6 +123,10 @@ impl Server {
                 Ok(id) => self.source(id),
                 Err(msg) => error(400, msg),
             },
+            p if p.starts_with("/ui/") && method != "GET" => {
+                error(405, "method not allowed; use GET")
+            }
+            p if p.starts_with("/ui/") => ui_module(p),
 
             "/coalesced/zoom-in" | "/coalesced/zoom-out" | "/coalesced/reset"
                 if method != "POST" =>
@@ -277,6 +295,14 @@ fn parse_id(query: Option<&str>) -> Result<EntityId, &'static str> {
 
 fn ok(content_type: &'static str, body: Vec<u8>) -> Response {
     Response { status: 200, content_type, body }
+}
+
+fn ui_module(path: &str) -> Response {
+    let name = path.trim_start_matches("/ui/");
+    match UI_MODULES.iter().find(|(n, _)| *n == name) {
+        Some((_, src)) => ok(JS, src.as_bytes().to_vec()),
+        None => error(404, &format!("no route for GET {path}")),
+    }
 }
 
 fn error(status: u16, message: &str) -> Response {
@@ -575,5 +601,16 @@ mod tests {
         assert_eq!(graph.status, 200);
         assert_eq!(graph.content_type, JSON);
         assert_eq!(json(&graph)["root"], "demo");
+
+        let module = s.respond("GET", "/ui/app.js");
+        assert_eq!(module.status, 200);
+        assert_eq!(module.content_type, JS);
+        assert!(!module.body.is_empty());
+
+        let missing = s.respond("GET", "/ui/nope.js");
+        assert_eq!(missing.status, 404);
+
+        let wrong_method = s.respond("POST", "/ui/app.js");
+        assert_eq!(wrong_method.status, 405);
     }
 }
