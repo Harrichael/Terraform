@@ -15,6 +15,9 @@ export const fmtChurn = (n) => (n.added || n.removed)
 export const statusClass = (n) => (n.status ? ' st-' + n.status : '') + (n.is_test ? ' is-test' : '');
 export const NODE_H = 48;
 export const estWidth = (name) => Math.min(320, Math.max(120, 8 * name.length + 40));
+// Room on a leaf's right for its action buttons (+ and ×), so the name never
+// runs under them; the CSS padding-right on .ent must match.
+export const LEAF_ACTIONS_W = 34;
 // A box must be wide enough for its label and the three action buttons.
 export const boxMinWidth = (data) => estWidth(`${data.name}${fmtLoc(data) ? ' · ' + fmtLoc(data) : ''}`) + 90;
 

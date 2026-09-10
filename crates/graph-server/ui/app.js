@@ -12,6 +12,8 @@ import { CodePane } from './code.js';
 import { Inspector } from './panel.js';
 import { Search } from './search.js';
 
+const MIN_ZOOM = 0.05, MAX_ZOOM = 2;
+
 function App() {
   const { getViewport, setViewport } = useReactFlow();
   const canvasRef = useRef(null);
@@ -36,7 +38,13 @@ function App() {
   const [onePerPair, setOnePerPair] = useState(true);
   // { type: 'node', id: <rf node id> } | { type: 'edge', id: <rf edge id> } | null
   const [sel, setSel] = useState(null);
-  const setSelectedId = useCallback((id) => setSel(id == null ? null : { type: 'node', id }), []);
+  // The diagram's own selection (the outline React Flow draws) follows the
+  // inspector's, so a node reached through search or a panel link is
+  // highlighted like a clicked one.
+  const setSelectedId = useCallback((id) => {
+    setSel(id == null ? null : { type: 'node', id });
+    setNodes((ns) => ns.map((n) => (n.selected === (n.id === id) ? n : { ...n, selected: n.id === id })));
+  }, []);
   // The code pane: which file is open and which lines to mark.
   const [code, setCode] = useState(null);
   const [sources, setSources] = useState(() => new Map());
@@ -187,13 +195,19 @@ function App() {
       .catch((e) => setSources((m) => new Map(m).set(fileId, { error: e.message })))
       .finally(() => loadingRef.current.delete(fileId));
   }, [sources]);
-  const openCode = (entityId, line, range, side = sideOf(entityId)) => {
+  // The right pane is two tabs. Opening code from the inspector (a site or
+  // definition link) is a request to read it, so the Code tab comes forward;
+  // selecting a node only refreshes what the Code tab would show and leaves
+  // the user on whichever tab they are reading.
+  const [tab, setTab] = useState('inspect');
+  const openCode = (entityId, line, range, side = sideOf(entityId), { show = true } = {}) => {
     const fileId = fileOf(entityId);
     if (fileId == null) return;
     setCode({ fileId, line, range, side });
+    if (show) setTab('code');
     loadSource(fileId);
   };
-  const closeCode = useCallback(() => setCode(null), []);
+  const closeCode = useCallback(() => { setCode(null); setTab('inspect'); }, []);
   // Selecting anything inside a file opens it at that entity; selecting a
   // folder leaves whatever is open alone.
   useEffect(() => {
@@ -201,8 +215,43 @@ function App() {
     const ent = nodes.find((n) => n.id === sel.id)?.data;
     // Tinting a whole file's range would paint every line; only sub-file
     // entities get their extent marked.
-    if (ent) openCode(ent.id, ent.line_start, ent.kind === 'file' ? [-1, -1] : [ent.line_start, ent.line_end]);
+    if (ent) openCode(ent.id, ent.line_start, ent.kind === 'file' ? [-1, -1] : [ent.line_start, ent.line_end], undefined, { show: false });
   }, [sel]);
+
+  // Two wheel gestures React Flow gets wrong on macOS are handled before
+  // the pane sees them. Shift+wheel: React Flow only remaps it to a sideways
+  // pan on non-Mac platforms and expects Chrome to send a horizontal delta,
+  // which it does not, so the graph would scroll up and down. Ctrl+wheel:
+  // React Flow multiplies the delta by ten because browsers also flag
+  // trackpad pinches with ctrlKey, which makes one mouse tick a 4x jump. A
+  // pinch never comes with a real Control keydown, so that is how the two
+  // are told apart; the pinch keeps React Flow's handling.
+  const ctrlHeldRef = useRef(false);
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    const onKey = (e) => { if (e.key === 'Control') ctrlHeldRef.current = e.type === 'keydown'; };
+    const onBlur = () => { ctrlHeldRef.current = false; };
+    const onWheel = (e) => {
+      if (e.metaKey || e.deltaY === 0) return;
+      const v = getViewport();
+      if (e.shiftKey && !e.ctrlKey && e.deltaX === 0) {
+        e.preventDefault(); e.stopPropagation();
+        setViewport({ x: v.x - e.deltaY * (e.deltaMode === 1 ? 20 : 1), y: v.y, zoom: v.zoom });
+      } else if (e.ctrlKey && ctrlHeldRef.current) {
+        e.preventDefault(); e.stopPropagation();
+        const zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, v.zoom * Math.pow(2, -e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0025))));
+        const r = el.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
+        setViewport({ x: px - (px - v.x) * (zoom / v.zoom), y: py - (py - v.y) * (zoom / v.zoom), zoom });
+      }
+    };
+    el.addEventListener('wheel', onWheel, { capture: true, passive: false });
+    window.addEventListener('keydown', onKey); window.addEventListener('keyup', onKey); window.addEventListener('blur', onBlur);
+    return () => {
+      el.removeEventListener('wheel', onWheel, { capture: true });
+      window.removeEventListener('keydown', onKey); window.removeEventListener('keyup', onKey); window.removeEventListener('blur', onBlur);
+    };
+  }, []);
 
   const startResize = (e) => {
     e.preventDefault();
@@ -446,7 +495,7 @@ function App() {
           panOnScroll=${true} panOnScrollMode="free" zoomOnScroll=${false} zoomOnPinch=${true}
           zoomActivationKeyCode="Control" zoomOnDoubleClick=${false}
           panOnDrag=${[1, 2]} selectionOnDrag=${true} selectionMode="partial"
-          onlyRenderVisibleElements=${true} minZoom=${0.05} proOptions=${{ hideAttribution: true }}
+          onlyRenderVisibleElements=${true} minZoom=${MIN_ZOOM} maxZoom=${MAX_ZOOM} proOptions=${{ hideAttribution: true }}
         >
           <${Controls} showInteractive=${false} />
           <${Background} gap=${20} color="#dcdfe4" />
@@ -459,7 +508,11 @@ function App() {
       </div>
       <div class=${'divider' + (resizing ? ' active' : '')} onMouseDown=${startResize}></div>
       <div class="panel" style=${{ width: panelW }}>
-        <div class=${'panel-top' + (code ? ' with-code' : '')}>
+        <div class="panel-tabs">
+          <button class=${tab === 'inspect' ? 'on' : ''} onClick=${() => setTab('inspect')}>Inspector</button>
+          <button class=${tab === 'code' ? 'on' : ''} disabled=${!code} title=${code ? (sources.get(code.fileId)?.path || '') : 'Select a node inside a file to open its code'} onClick=${() => setTab('code')}>Code${code && sources.get(code.fileId)?.path ? html` <span class="tab-file">${sources.get(code.fileId).path.split('/').pop()}</span>` : ''}</button>
+        </div>
+        <div class="panel-top" hidden=${tab !== 'inspect'}>
         <${Inspector}
           graph=${graph} nodes=${nodes} edges=${edges} view=${view} coalesced=${coalesced}
           sel=${sel} setSelectedId=${setSelectedId} showTests=${showTests} byChange=${byChange} isDiff=${isDiff}
@@ -467,7 +520,7 @@ function App() {
           hiddenIds=${hiddenIds} sources=${sources} loadSource=${loadSource}
         />
         </div>
-        ${code && html`<${CodePane} src=${sources.get(code.fileId)} line=${code.line} range=${code.range} side=${code.side} onClose=${closeCode} />`}
+        ${code && tab === 'code' && html`<${CodePane} src=${sources.get(code.fileId)} line=${code.line} range=${code.range} side=${code.side} onClose=${closeCode} />`}
       </div>
     </div>
   </div>`;

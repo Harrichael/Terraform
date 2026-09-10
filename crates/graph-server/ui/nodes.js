@@ -2,8 +2,8 @@ import { useEffect, useRef } from 'react';
 import { Handle, BaseEdge, getBezierPath, useInternalNode } from '@xyflow/react';
 import { html, actions, fmtChurn, fmtLoc, statusClass } from './common.js';
 
-export function ZoomButton({ glyph, title, onClick, on, cls }) {
-  return html`<button class=${'zoom nodrag nopan' + (on ? ' on' : '') + (cls ? ' ' + cls : '')} title=${title}
+export function ZoomButton({ glyph, title, onClick, on }) {
+  return html`<button class=${'zoom nodrag nopan' + (on ? ' on' : '')} title=${title}
     onClick=${(e) => { e.stopPropagation(); onClick(); }}>${glyph}</button>`;
 }
 
@@ -15,8 +15,10 @@ export function EntityNode({ data, sourcePosition, targetPosition }) {
     <div class="ent-name">${data.name}</div>
     <div class="ent-sub">${data.kind}${churn ? html` · ${churn}` : loc ? ` · ${loc}` : lines}</div>
     <${Handle} type="source" position=${sourcePosition} />
-    <${ZoomButton} glyph="×" cls="hide" title="Hide this node" onClick=${() => actions.hide(data.id)} />
-    ${data.zoomable && html`<${ZoomButton} glyph="+" title="Zoom in" onClick=${() => actions.zoomIn(data.id)} />`}
+    <div class="ent-actions">
+      ${data.zoomable && html`<${ZoomButton} glyph="+" title="Zoom in" onClick=${() => actions.zoomIn(data.id)} />`}
+      <${ZoomButton} glyph="×" title="Hide this node" onClick=${() => actions.hide(data.id)} />
+    </div>
   </div>`;
 }
 

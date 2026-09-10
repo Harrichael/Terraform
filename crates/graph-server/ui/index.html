@@ -29,10 +29,15 @@
   .canvas { flex: 1; min-width: 0; position: relative; }
   .panel { flex: none; background: var(--panel); border-left: 1px solid var(--line); overflow: hidden; display: flex; flex-direction: column; min-width: 240px; }
   .panel-top { overflow: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; flex: 1 1 auto; min-height: 0; }
-  .panel-top.with-code { flex: 0 0 auto; max-height: 45%; }
+  .panel-tabs { display: flex; flex: none; background: var(--bg); border-bottom: 1px solid var(--line); }
+  .panel-tabs button { border: 0; border-bottom: 2px solid transparent; background: none; color: var(--muted); padding: 6px 14px; font: inherit; cursor: pointer; }
+  .panel-tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
+  .panel-tabs button:disabled { opacity: .5; cursor: default; }
+  .panel-tabs .tab-file { color: var(--muted); font-size: 11px; }
+  .panel-top[hidden] { display: none; }
   .divider { width: 5px; flex: none; cursor: col-resize; background: var(--line); }
   .divider:hover, .divider.active { background: var(--accent); }
-  .code { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; border-top: 1px solid var(--line); }
+  .code { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
   .code-head { display: flex; gap: 8px; align-items: baseline; padding: 6px 12px; font-size: 12px; background: var(--bg); border-bottom: 1px solid var(--line); }
   .code-head b { word-break: break-all; }
   .code-head .meta { margin-left: auto; white-space: nowrap; }
@@ -74,11 +79,13 @@
   .legend { margin-top: auto; display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: var(--muted); }
   .legend i { display: inline-block; width: 14px; height: 3px; vertical-align: middle; margin-right: 4px; border-radius: 2px; }
 
-  .ent { position: relative; border: 1.5px solid #999; border-radius: 6px; padding: 5px 10px; background: #fff; min-width: 90px; max-width: 320px; box-shadow: 0 1px 2px rgba(0,0,0,.08); box-sizing: border-box; height: 100%; }
+  .ent { position: relative; border: 1.5px solid #999; border-radius: 6px; padding: 5px 44px 5px 10px; background: #fff; min-width: 90px; max-width: 320px; box-shadow: 0 1px 2px rgba(0,0,0,.08); box-sizing: border-box; height: 100%; }
   .zoom { position: absolute; top: -8px; right: -8px; width: 18px; height: 18px; border-radius: 50%; border: 1px solid #b8bcc4; background: #fff; color: var(--text); font: 13px/16px monospace; padding: 0; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.15); }
   .zoom:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
   .box-actions { position: absolute; top: 2px; right: 4px; display: flex; gap: 4px; }
   .box-actions .zoom { position: static; }
+  .ent-actions { position: absolute; top: -8px; right: -8px; display: flex; gap: 4px; }
+  .ent-actions .zoom { position: static; }
   .zoom.on { background: var(--text); color: #fff; border-color: var(--text); }
   .edge-count { font: 600 10px sans-serif; text-anchor: middle; dominant-baseline: middle; paint-order: stroke; stroke: #fff; stroke-width: 3px; pointer-events: none; }
   .ent-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -121,7 +128,6 @@
      cannot escape the transformed wrapper it sits in, so the portal layer is
      lifted above the nodes (a selected node is at 1000). */
   .react-flow__viewport-portal { z-index: 2000; }
-  .zoom.hide { right: -30px; }
   .bundle-pop {
     position: absolute; top: 22px; right: 0;
     display: flex; flex-direction: column; gap: 6px;
