@@ -36,6 +36,7 @@ const CSS: &str = "text/css; charset=utf-8";
 const UI_MODULES: &[(&str, &str)] = &[
     ("common.js", include_str!("../ui/common.js")),
     ("nodes.js", include_str!("../ui/nodes.js")),
+    ("bundling.js", include_str!("../ui/bundling.js")),
     ("model.js", include_str!("../ui/model.js")),
     ("layout.js", include_str!("../ui/layout.js")),
     ("code.js", include_str!("../ui/code.js")),

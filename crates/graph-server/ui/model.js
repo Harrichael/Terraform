@@ -1,5 +1,6 @@
 import { Position, MarkerType } from '@xyflow/react';
 import { PRECEDENCE, edgeColor, changeColor, estWidth, NODE_H, LEAF_ACTIONS_W } from './common.js';
+import { bundleEnds } from './bundling.js';
 
 export const rank = (kind) => { const i = PRECEDENCE.indexOf(kind); return i < 0 ? PRECEDENCE.length : i; };
 export function collapseByPrecedence(edges) {
@@ -124,36 +125,18 @@ export function buildModel(graph, coalesced, view, dir, onePerPair, { byChange =
       // hidden; hiding it would change what its box means.
       className: unchanged(n) ? 'faded' : undefined,
     }));
-  // Lift each leaf-to-leaf edge to the pair of siblings at the level where the
-  // two sides meet (a box and a node, or two boxes), then bundle per kind. Every
-  // drawn edge then lives inside one layout level, so it can be routed there
-  // instead of crossing whatever lies between two distant leaves.
-  //
-  // From there each endpoint may descend. A box carries three levels, each
-  // 0 (off), 1 (one level) or 2 (recursive): `in` and `out` say how far an
-  // edge crossing the box's border reaches inside it; `inward` says how far
-  // an edge ending at one of its sub boxes reaches into that sub box. An
-  // endpoint enters the next box down while that box's own side level, or a
-  // grant from the box above (its `inward`, or a recursive level still in
-  // force), allows it.
+  // Each leaf-to-leaf edge is lifted to the pair of siblings where the two
+  // sides meet (a box and a node, or two boxes) and bundled per kind there,
+  // so by default an edge is routed at one layout level instead of crossing
+  // whatever lies between two distant leaves. The per-box levels in
+  // `bundling` then pull either end back toward its leaf; bundling.js owns
+  // that policy.
   const chain = (leaf) => {
-    const out = [{ id: String(leaf), ent: leaf, parent: boxId(graph.nodes[leaf].parent) ?? null }];
-    for (let p = graph.nodes[leaf].parent; p != null && containers.has(p); p = graph.nodes[p].parent) {
-      out.push({ id: `c${p}`, ent: p, parent: boxId(graph.nodes[p].parent) ?? null });
-    }
+    const out = [leaf];
+    for (let p = graph.nodes[leaf].parent; p != null && containers.has(p); p = graph.nodes[p].parent) out.push(p);
     return out;
   };
-  const level = (ent, key) => bundling.get(ent)?.[key] || 0;
-  const descend = (ch, i, dir) => {
-    let grant = i + 1 < ch.length ? level(ch[i + 1].ent, 'inward') : 0;
-    while (i > 0) {
-      const own = level(ch[i].ent, dir);
-      if (!own && !grant) break;
-      grant = Math.max(own === 2 || grant === 2 ? 2 : 0, level(ch[i].ent, 'inward'));
-      i--;
-    }
-    return ch[i].id;
-  };
+  const drawnId = (ch, i) => (i === 0 ? String(ch[0]) : `c${ch[i]}`);
   // A coalesced edge between two shown leaves can still be carried partly by
   // test or user-hidden entities nested inside them (e.g. a file's `mod
   // tests` calling another file, or a hidden function deep in a still-shown
@@ -170,12 +153,9 @@ export function buildModel(graph, coalesced, view, dir, onePerPair, { byChange =
     const e = visibleRefs(raw);
     if (!e) continue;
     const cf = chain(e.from), ct = chain(e.to);
-    let pair = null;
-    for (let ia = 0; ia < cf.length && !pair; ia++) {
-      const ib = ct.findIndex((x) => x.parent === cf[ia].parent);
-      if (ib >= 0) pair = [descend(cf, ia, 'out'), descend(ct, ib, 'in')];
-    }
-    if (!pair || pair[0] === pair[1]) continue;
+    const ends = bundleEnds(cf, ct, bundling);
+    if (!ends) continue;
+    const pair = [drawnId(cf, ends[0]), drawnId(ct, ends[1])];
     const key = `${pair[0]}|${pair[1]}|${e.kind}|${e.status || ''}`;
     const b = bundles.get(key) || bundles.set(key, { source: pair[0], target: pair[1], kind: e.kind, status: e.status, members: [] }).get(key);
     b.members.push(e);
