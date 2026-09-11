@@ -39,6 +39,7 @@ const UI_MODULES: &[(&str, &str)] = &[
     ("model.js", include_str!("../ui/model.js")),
     ("layout.js", include_str!("../ui/layout.js")),
     ("code.js", include_str!("../ui/code.js")),
+    ("goto.js", include_str!("../ui/goto.js")),
     ("panel.js", include_str!("../ui/panel.js")),
     ("search.js", include_str!("../ui/search.js")),
     ("app.js", include_str!("../ui/app.js")),

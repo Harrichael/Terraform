@@ -18,7 +18,8 @@ rename is a removed entity plus an added one, never a modified one.
 ## GET /
 The UI shell (`ui/index.html`), embedded in the binary. It loads its logic as
 ES modules from `/ui/*.js` (`common.js`, `nodes.js`, `model.js`, `layout.js`,
-`code.js`, `panel.js`, `search.js`, `app.js`), also embedded in the binary.
+`code.js`, `goto.js`, `panel.js`, `search.js`, `app.js`), also embedded in the
+binary.
 
 Its third-party modules (React, xyflow, dagre, htm, highlight.js and its
 grammars) and the xyflow stylesheet are embedded too, under `/ui/vendor/`,
@@ -59,6 +60,18 @@ served extensionless (`/ui/vendor/hljs/rust`) to match the import-map prefix
 - `sites` are the 0-indexed lines, in the `from` entity's file, of every
   occurrence that produced the reference; sorted, no duplicates. Producers
   always record at least one; hand-built graphs may leave it empty.
+  Besides listing them, the UI reads sites for **go-to from the code pane**
+  (`goto.js`): a click on an identifier at line L of the open file takes the
+  references sited at L whose `from` lies in that file (matched on the File
+  entity's id, never on `path`, whose shape differs from `/source`'s), keeps
+  those whose `to` is *named* by the clicked token (whole token, not
+  substring), and selects the target's nearest drawn node — itself, or the
+  leaf or box it is collapsed into — through the same selection as a click
+  on the graph; the pane does not move. A target whose name is not on the
+  line at all (an alias) is reached from any identifier there. Two targets
+  that still resolve to different drawn nodes, or no target at all, select
+  nothing. Under tree-sitter this is as approximate as the producer's
+  name-based resolution; under SCIP it is precise.
 - Containment is `parent` on the node; there is no separate edge list.
 - `nodes` is sorted by `id` and dense (`nodes[i].id == i`).
 - `generation` starts at 1 and grows by one per successful rebuild. `remap`

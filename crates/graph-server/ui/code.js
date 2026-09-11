@@ -81,7 +81,26 @@ function highlightLines(text, lang) {
   }
 }
 
-export const CodePane = React.memo(function CodePane({ src, line, range, side, onClose }) {
+// The column a click landed on within a code cell, or null off the text.
+// hljs wraps pieces of a line in nested spans and can cut a token across
+// two of them, so the offset comes from the caret the browser places under
+// the point, summed over the cell's text nodes, not from the span hit. The
+// cell's text is the row's text verbatim (hljs only escapes), so the column
+// indexes the row.
+function caretColumn(td, x, y) {
+  const pos = document.caretPositionFromPoint ? document.caretPositionFromPoint(x, y) : document.caretRangeFromPoint?.(x, y);
+  const node = pos?.offsetNode ?? pos?.startContainer;
+  if (!node || node.nodeType !== Node.TEXT_NODE || !td.contains(node)) return null;
+  let col = pos.offset ?? pos.startOffset;
+  const walk = document.createTreeWalker(td, NodeFilter.SHOW_TEXT);
+  for (let t = walk.nextNode(); t && t !== node; t = walk.nextNode()) col += t.length;
+  return col;
+}
+
+// `onClickAt(row, col)` is told where in the listing a click landed. It must
+// be a stable callback: this component is memoized against per-frame App
+// re-renders.
+export const CodePane = React.memo(function CodePane({ src, line, range, side, onClose, onClickAt }) {
   const bodyRef = useRef(null);
   useEffect(() => {
     bodyRef.current?.querySelector('tr.hl')?.scrollIntoView({ block: 'center' });
@@ -111,11 +130,21 @@ export const CodePane = React.memo(function CodePane({ src, line, range, side, o
   const ins = rows.filter((r) => r.k === 'ins').length, del = rows.filter((r) => r.k === 'del').length;
   const ln = (i) => (i == null ? '' : i + 1);
   const lineHtml = (r) => (diff ? (r.n != null ? newLines?.[r.n] : oldLines?.[r.o]) : newLines?.[r.n]);
+  // A drag-select ends in a click too; a selection left non-collapsed is how
+  // the two are told apart.
+  const onBodyClick = (e) => {
+    if (!onClickAt || !window.getSelection()?.isCollapsed) return;
+    const td = e.target.closest?.('td:not(.ln)');
+    if (!td) return;
+    const col = caretColumn(td, e.clientX, e.clientY);
+    const row = rows[td.parentElement.sectionRowIndex];
+    if (col != null && row) onClickAt(row, col);
+  };
   return html`<div class="code">
     <div class="code-head"><b>${src.path}</b>
       ${diff && html`<span class="churn"><span class="add">+${ins}</span> <span class="del">−${del}</span></span>`}
       <span class="meta">${diff ? `${rows.length} rows` : `${rows.length} lines`} · at ${side === 'old' ? 'old ' : ''}${line + 1}</span>${close}</div>
-    <div class="code-body" ref=${bodyRef}><table class=${diff ? 'diff' : ''}><tbody>
+    <div class="code-body" ref=${bodyRef}><table class=${diff ? 'diff' : ''}><tbody onClick=${onBodyClick}>
       ${rows.map((r, i) => { const hl = lineHtml(r); return html`<tr key=${i} class=${cls(r)}>${diff && html`<td class="ln o">${ln(r.o)}</td>`}<td class="ln">${ln(r.n)}</td>${hl != null ? html`<td dangerouslySetInnerHTML=${{ __html: hl }}></td>` : html`<td>${r.t}</td>`}</tr>`; })}
     </tbody></table></div>
   </div>`;

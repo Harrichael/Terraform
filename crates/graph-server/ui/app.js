@@ -9,6 +9,7 @@ import { nodeTypes, edgeTypes, BundlePopover } from './nodes.js';
 import { buildModel } from './model.js';
 import { layout, withRouting, incrementalLayout, absolutePositions, interpolate, easeInOut, resolveDrag, rerouteEdges } from './layout.js';
 import { CodePane } from './code.js';
+import { drawnTarget } from './goto.js';
 import { Inspector } from './panel.js';
 import { Search } from './search.js';
 
@@ -46,6 +47,7 @@ function App() {
   }, []);
   // The code pane: which file is open and which lines to mark.
   const [code, setCode] = useState(null);
+  const codeRef = useRef(code); codeRef.current = code;
   const [sources, setSources] = useState(() => new Map());
   const [panelW, setPanelW] = useState(460);
   // Diff mode only: colour edges by change instead of kind; hide (raw) or
@@ -111,6 +113,12 @@ function App() {
   // move at all (hiding a node removes what the user was looking at, and
   // refitting the whole graph would yank everything else away).
   const STAY = 'stay';
+  // Whether a drawn node, at absolute position `a`, is entirely in the viewport.
+  const onScreen = (n, a) => {
+    const el = canvasRef.current, cur = getViewport();
+    const seen = { x: -cur.x / cur.zoom, y: -cur.y / cur.zoom, w: (el?.clientWidth || 800) / cur.zoom, h: (el?.clientHeight || 600) / cur.zoom };
+    return a.x >= seen.x && a.y >= seen.y && a.x + n.width <= seen.x + seen.w && a.y + n.height <= seen.y + seen.h;
+  };
   const transitionTo = (finalNodes, finalEdges, focusIds) => {
     const token = ++animRef.current;
     const prevNodes = new Map(nodesRef.current.map((n) => [n.id, n]));
@@ -124,13 +132,11 @@ function App() {
     if (focus) {
       const a = abs(focus.id);
       const cur = getViewport();
-      const seen = { x: -cur.x / cur.zoom, y: -cur.y / cur.zoom, w: W / cur.zoom, h: H / cur.zoom };
-      const inView = a.x >= seen.x && a.y >= seen.y && a.x + focus.width <= seen.x + seen.w && a.y + focus.height <= seen.y + seen.h;
       // A target already fully on screen is left alone: panning to centre
       // it would move everything the user was looking at. Otherwise never
       // zoom out past what is needed to show it, and zoom in no further
       // than 1:1 so a small collapsed node does not fill the screen.
-      if (!inView) vp = getViewportForBounds({ x: a.x, y: a.y, width: focus.width, height: focus.height }, W, H, 0.05, Math.max(cur.zoom, 1), 0.3);
+      if (!onScreen(focus, a)) vp = getViewportForBounds({ x: a.x, y: a.y, width: focus.width, height: focus.height }, W, H, 0.05, Math.max(cur.zoom, 1), 0.3);
     } else if (finalNodes.length && focusIds !== STAY) {
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
       for (const n of finalNodes) {
@@ -237,10 +243,15 @@ function App() {
     loadSource(fileId);
   };
   const closeCode = useCallback(() => { setCode(null); setTab('inspect'); }, []);
+  // Set by a click in the code pane: the selection it makes must not move
+  // the pane the user is reading in.
+  const holdCodeRef = useRef(false);
   // Selecting anything inside a file opens it at that entity; selecting a
   // folder leaves whatever is open alone.
   useEffect(() => {
-    if (sel?.type !== 'node') return;
+    const hold = holdCodeRef.current;
+    holdCodeRef.current = false;
+    if (sel?.type !== 'node' || hold) return;
     const ent = nodes.find((n) => n.id === sel.id)?.data;
     if (!ent) return;
     // A search hit on a specific line is consumed here rather than acted on
@@ -478,6 +489,22 @@ function App() {
     const vp = getViewportForBounds({ x: a.x, y: a.y, width: n.width, height: n.height }, el?.clientWidth || 800, el?.clientHeight || 600, 0.05, Math.max(cur.zoom, 1), 0.3);
     setViewport(vp, { duration: ANIM_MS });
   };
+  // Clicking an identifier in the code pane highlights what it refers to:
+  // the node drawn for that entity or, when it sits inside a collapsed leaf
+  // or a box, that leaf or box. The pane stays where it is (holdCodeRef), so
+  // the calls in one function can be clicked through one after another; an
+  // identifier that resolves to nothing changes nothing. Stable because
+  // CodePane is memoized; everything it reads is a ref.
+  const onCodeClick = useCallback((row, col) => {
+    const graph = graphRef.current, file = codeRef.current?.fileId;
+    if (!graph || file == null) return;
+    const rf = drawnTarget(graph, file, row, col, (id) => nodesRef.current.some((n) => n.id === id));
+    if (rf == null) return;
+    holdCodeRef.current = true;
+    setSelectedId(rf);
+    const n = nodesRef.current.find((x) => x.id === rf);
+    if (!onScreen(n, absolutePositions(nodesRef.current)(rf))) panTo(rf);
+  }, []);
   // Bring a searched-for entity on screen. In the coalesced view that means
   // zooming into every ancestor that is still a leaf, one request each; the
   // selection waits for the final layout (pendingSelectRef). Anything that
@@ -610,7 +637,7 @@ function App() {
           hiddenIds=${hiddenIds} sources=${sources} loadSource=${loadSource}
         />
         </div>
-        ${code && tab === 'code' && html`<${CodePane} src=${sources.get(code.fileId)} line=${code.line} range=${code.range} side=${code.side} onClose=${closeCode} />`}
+        ${code && tab === 'code' && html`<${CodePane} src=${sources.get(code.fileId)} line=${code.line} range=${code.range} side=${code.side} onClose=${closeCode} onClickAt=${onCodeClick} />`}
       </div>
     </div>
   </div>`;
