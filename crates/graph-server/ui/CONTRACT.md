@@ -101,6 +101,10 @@ In diff mode only, three additions:
   its children are.
 - node `added`/`removed` are churn: lines inserted and deleted inside the
   node's range. A File counts its whole diff, a Folder sums its children.
+- `loc`/`test_loc` stay the **current** size: a Folder sums only the
+  children that still exist, so a `removed` child is not counted in any
+  ancestor, while an `added` one is. A `removed` node itself keeps its old
+  size (a deleted file or folder reads as what it was, never as 0).
 - reference `status` ∈ `same | added | removed`, never `modified`. `sites`
   come from the side that has the reference (new when both do), so the sites
   of a `removed` reference are lines in the **old** file.

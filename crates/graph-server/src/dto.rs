@@ -245,7 +245,13 @@ fn node_dto(e: &Entity, (loc, test_loc): (usize, usize)) -> NodeDto {
 /// is how much of that is test code, so a view hiding tests can subtract it.
 /// Post-order over the forest so every child is settled before its parent is
 /// read.
-fn loc_per_entity(graph: &EntityGraph) -> Vec<(usize, usize)> {
+///
+/// In diff mode the graph is the union of both sides, but a folder's total is
+/// what the working tree holds now, so a child the diff removed is left out
+/// of its parent's sum. A removed entity itself is entirely old side and keeps
+/// its old size, folder or file alike, rather than reading as empty.
+fn loc_per_entity(graph: &EntityGraph, entity_status: Option<&[Status]>) -> Vec<(usize, usize)> {
+    let removed = |id: EntityId| entity_status.is_some_and(|s| s[id.0] == Status::Removed);
     let mut loc = vec![(0, 0); graph.entities.len()];
     let mut stack: Vec<(EntityId, bool)> =
         graph.entities.iter().filter(|e| e.parent.is_none()).map(|e| (e.id, false)).collect();
@@ -256,12 +262,13 @@ fn loc_per_entity(graph: &EntityGraph) -> Vec<(usize, usize)> {
             stack.extend(e.children.iter().map(|&c| (c, false)));
             continue;
         }
+        let current = || e.children.iter().filter(|&&c| removed(id) || !removed(c)).map(|c| loc[c.0]);
         let own = if e.line_range != (0..0) {
             e.line_range.end - e.line_range.start + 1
         } else {
-            e.children.iter().map(|c| loc[c.0].0).sum()
+            current().map(|l| l.0).sum()
         };
-        let test = if e.is_test { own } else { e.children.iter().map(|c| loc[c.0].1).sum() };
+        let test = if e.is_test { own } else { current().map(|l| l.1).sum() };
         loc[id.0] = (own, test);
     }
     loc
@@ -280,7 +287,16 @@ impl From<&Reference> for ReferenceDto {
 }
 
 pub fn graph_dto(graph: &EntityGraph, generation: u64, remap: Option<RemapDto>) -> GraphDto {
-    let loc = loc_per_entity(graph);
+    plain_graph_dto(graph, generation, remap, None)
+}
+
+fn plain_graph_dto(
+    graph: &EntityGraph,
+    generation: u64,
+    remap: Option<RemapDto>,
+    entity_status: Option<&[Status]>,
+) -> GraphDto {
+    let loc = loc_per_entity(graph, entity_status);
     GraphDto {
         root: root_name(graph).to_string(),
         generation,
@@ -301,7 +317,7 @@ pub fn graph_dto_with_diff(
     generation: u64,
     remap: Option<RemapDto>,
 ) -> GraphDto {
-    let mut dto = graph_dto(graph, generation, remap);
+    let mut dto = plain_graph_dto(graph, generation, remap, Some(view.entity_status));
     dto.diff =
         Some(DiffDto { base: view.base.to_string(), base_commit: view.base_commit.to_string() });
     for node in &mut dto.nodes {
@@ -396,5 +412,51 @@ mod tests {
         assert!(by_name("check").is_test && !by_name("work").is_test);
         let json = serde_json::to_value(by_name("work")).unwrap();
         assert!(json.get("is_test").is_none() && json.get("test_loc").is_none(), "false/zero are omitted: {json}");
+    }
+
+    /// In diff mode the graph is the union of both sides, but a folder's
+    /// `loc`/`test_loc` is what the working tree holds now: an added child
+    /// counts, a removed one does not. A removed entity itself still reports
+    /// its old size, so a deleted folder is not shown as empty.
+    #[test]
+    fn diff_folder_loc_is_the_new_side() {
+        use Status::*;
+        let mut g = graph_from_parents(
+            &[
+                ("proj", Folder, None),
+                ("src", Folder, Some(0)),
+                ("keep.rs", File, Some(1)),
+                ("gone.rs", File, Some(1)),
+                ("same.rs", File, Some(1)),
+                ("new.rs", File, Some(1)),
+                ("old", Folder, Some(0)),
+                ("dead.rs", File, Some(6)),
+            ],
+            &[],
+        );
+        let ranges = [(2, 0..6), (3, 0..2), (4, 0..1), (5, 0..3), (7, 0..9)];
+        for (id, r) in ranges {
+            g.entities[id].line_range = r;
+        }
+        for id in [3, 5] {
+            g.entities[id].is_test = true;
+        }
+        let entity_status = [Modified, Modified, Modified, Removed, Same, Added, Removed, Removed];
+        let churn = vec![(0, 0); g.entities.len()];
+        let view = DiffView {
+            base: "HEAD",
+            base_commit: "0123abcd",
+            entity_status: &entity_status,
+            reference_status: &[],
+            churn: &churn,
+        };
+
+        let dto = graph_dto_with_diff(&g, &view, 1, None);
+        let by_name = |n: &str| dto.nodes.iter().find(|x| x.name == n).unwrap();
+        let counts = |n: &str| (by_name(n).loc, by_name(n).test_loc);
+        assert_eq!(counts("src"), (7 + 2 + 4, 4), "keep + same + new, not gone");
+        assert_eq!(counts("proj"), (13, 4), "the deleted folder adds nothing");
+        assert_eq!(counts("gone.rs"), (3, 3), "a removed file keeps its old size");
+        assert_eq!(counts("old"), (10, 0), "so does a removed folder");
     }
 }

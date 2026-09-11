@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { Handle, BaseEdge, getBezierPath, useInternalNode } from '@xyflow/react';
-import { html, actions, fmtChurn, fmtLoc, statusClass } from './common.js';
+import { html, actions, fmtChurn, fmtLoc, leafRange, statusClass } from './common.js';
 
 export function ZoomButton({ glyph, title, onClick, on, cls = '' }) {
   return html`<button class=${'zoom nodrag nopan ' + cls + (on ? ' on' : '')} title=${title}
@@ -8,12 +8,12 @@ export function ZoomButton({ glyph, title, onClick, on, cls = '' }) {
 }
 
 export function EntityNode({ data, sourcePosition, targetPosition }) {
-  const lines = data.kind !== 'folder' ? ` · ${data.line_start + 1}–${data.line_end + 1}` : '';
-  const loc = fmtLoc(data), churn = fmtChurn(data);
+  // Same parts as leafSubText, which sizes the node for this line.
+  const size = fmtLoc(data) || leafRange(data), churn = fmtChurn(data);
   return html`<div class=${'ent kind-' + data.kind + statusClass(data)} title=${data.path}>
     <${Handle} type="target" position=${targetPosition} />
     <div class="ent-name">${data.name}</div>
-    <div class="ent-sub">${data.kind}${churn ? html` · ${churn}` : loc ? ` · ${loc}` : lines}</div>
+    <div class="ent-sub">${data.kind}${size && ` · ${size}`}${churn && html` · ${churn}`}</div>
     <${Handle} type="source" position=${sourcePosition} />
     <div class="ent-actions">
       ${data.zoomable && html`<${ZoomButton} glyph="+" title="Zoom in" onClick=${() => actions.zoomIn(data.id)} />`}
@@ -57,12 +57,12 @@ export function BundlePopover({ id, levels }) {
 }
 
 export function ContainerNode({ data, sourcePosition, targetPosition }) {
-  const churn = fmtChurn(data);
+  const loc = fmtLoc(data), churn = fmtChurn(data);
   const b = data.bundling;
   const bundlingOn = !!(b && (b.in || b.out || b.inward));
   return html`<div class=${'box kind-' + data.kind + statusClass(data)} title=${data.path}>
     <${Handle} type="target" position=${targetPosition} />
-    <div class="box-label">${data.name}${churn ? html` <span class="loc">·</span> ${churn}` : fmtLoc(data) && html` <span class="loc">· ${fmtLoc(data)}</span>`}</div>
+    <div class="box-label">${data.name}${loc && html` <span class="loc">· ${loc}</span>`}${churn && html` <span class="loc">·</span> ${churn}`}</div>
     <div class="box-actions">
       <${ZoomButton} glyph=${bundlingOn ? '⇶' : '⇉'} on=${bundlingOn} cls="bundle-toggle"
         title=${bundlingOn ? 'Some edges are drawn to the nodes inside this box; click to change' : 'Edges into and out of this box are bundled at the box; click to change'}

@@ -1,5 +1,5 @@
 import { Position, MarkerType } from '@xyflow/react';
-import { PRECEDENCE, edgeColor, changeColor, estWidth, NODE_H, LEAF_ACTIONS_W } from './common.js';
+import { PRECEDENCE, edgeColor, changeColor, leafWidth, NODE_H } from './common.js';
 import { bundleEnds } from './bundling.js';
 
 export const rank = (kind) => { const i = PRECEDENCE.indexOf(kind); return i < 0 ? PRECEDENCE.length : i; };
@@ -40,7 +40,7 @@ export function mkNode(ent, dir) {
     // Explicit dimensions make every node "initialized" up front. Without
     // them, onlyRenderVisibleElements leaves off-screen nodes unmeasured and
     // fitView (which skips unmeasured nodes) frames only what is on screen.
-    width: estWidth(ent.name) + LEAF_ACTIONS_W, height: NODE_H,
+    width: leafWidth(ent), height: NODE_H,
     sourcePosition: dir === 'LR' ? Position.Right : Position.Bottom,
     targetPosition: dir === 'LR' ? Position.Left : Position.Top,
   };
