@@ -1,5 +1,6 @@
 {
   "root": "demo",
+  "generation": 1,
   "nodes": [
     { "id": 0, "kind": "folder", "name": "demo", "path": "demo", "line_start": 0, "line_end": 0, "parent": null, "loc": 138 },
     { "id": 1, "kind": "folder", "name": "src", "path": "demo/src", "line_start": 0, "line_end": 0, "parent": 0, "loc": 112 },

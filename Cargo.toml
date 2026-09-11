@@ -17,6 +17,8 @@ scip-producer = { path = "crates/scip-producer" }
 coalesce = { path = "crates/coalesce" }
 graph-diff = { path = "crates/graph-diff" }
 tempfile = "3"
+notify = "8"
+rayon = "1"
 
 [package]
 name = "terraform-tui"

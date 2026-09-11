@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use tree_sitter::{Language, Node, Parser};
 
 use crate::tree::{CodeTree, NodeKind, ReferenceKind};
@@ -45,26 +46,26 @@ impl SourceLanguage {
 
 /// Parse a single source file into a standalone `CodeTree`.
 pub fn parse_source(source: &str, lang: &SourceLanguage, file_name: &str) -> Result<CodeTree> {
+    let parsed = parse_file(source, lang)?;
     let mut tree = CodeTree::new();
-    let root_id = tree.add_node(
-        NodeKind::File,
-        file_name,
-        (0, source.len()),
-        (0, source.lines().count().saturating_sub(1)),
-        0,
-        None,
-    );
-    parse_into_tree(&mut tree, source, lang, root_id, 1)?;
+    splice_file(&mut tree, file_name, &parsed, 0, None);
     Ok(tree)
 }
 
 /// Walk a directory and build a hierarchical `CodeTree` (Folder → File → constructs).
 ///
-/// After building the contains topology the parser performs a second pass to
-/// populate the [`ReferenceGraph`] with call and import edges extracted from
-/// each source file.  These edges represent the *symbolic* relationships
-/// between constructs (function calls, type usages, imports) and are
-/// independent of the directory containment structure.
+/// After building the contains topology the parser resolves the call and
+/// import references extracted from each source file into the
+/// [`ReferenceGraph`]. These edges represent the *symbolic* relationships
+/// between constructs and are independent of the directory containment
+/// structure.
+///
+/// Node ids are arena indices and downstream consumers treat them as the
+/// identity of an entity across rebuilds, so the id assignment is part of
+/// this producer's contract: a File node is immediately followed by its
+/// constructs, then the next sibling, in directories-first alphabetical
+/// order. Parsing runs on a thread pool, but only the pure per-file work
+/// does; the tree itself is assembled sequentially in walk order.
 pub fn parse_directory(dir: &Path) -> Result<CodeTree> {
     let mut tree = CodeTree::new();
 
@@ -73,36 +74,30 @@ pub fn parse_directory(dir: &Path) -> Result<CodeTree> {
         .and_then(|n| n.to_str())
         .unwrap_or(".")
         .to_string();
+    let root_id = add_folder(&mut tree, dir_name, 0, None);
 
-    let root_id = tree.add_node(
-        NodeKind::Folder,
-        dir_name,
-        (0, 0),
-        (0, 0),
-        0,
-        None,
-    );
-
-    // Start the root folder at File-level granularity so only folders/files
-    // are shown until the user explicitly drills down.
-    if let Some(n) = tree.get_mut(root_id) {
-        n.granularity_limit = Some(NodeKind::File);
-    }
-
-    // Phase 1: build the contains topology (folder → file → constructs).
-    // Collect (file_id, source, lang) so we can do reference extraction after.
-    let mut file_sources: Vec<(usize, String, SourceLanguage)> = Vec::new();
-    walk_dir(dir, &mut tree, root_id, 1, &mut file_sources)?;
+    // Phase 1: list the tree, parse every file in parallel, then splice the
+    // parsed files into the tree in walk order.
+    let listing = list_dir(dir)?;
+    let mut paths = Vec::new();
+    collect_file_paths(&listing, &mut paths);
+    let parses = paths
+        .par_iter()
+        .map(|path| read_and_parse(path))
+        .collect::<Result<Vec<ParsedFile>>>()?;
+    let mut files = Vec::with_capacity(parses.len());
+    splice_dir(&mut tree, &listing, root_id, 1, &mut parses.into_iter(), &mut files);
 
     // Phase 2: build a name → node_id map from the completed tree.
     let name_to_id = build_name_to_id_map(&tree);
 
-    // Phase 3: for each file extract raw references and resolve them to node IDs.
-    for (file_id, source, lang) in &file_sources {
-        for (from_id, ref_name, kind, line) in extract_raw_refs(source, lang, &tree, *file_id) {
-            if let Some(&to_id) = name_to_id.get(&ref_name) {
+    // Phase 3: resolve each file's raw references to node ids, in file order.
+    for (file_id, parsed) in &files {
+        for r in &parsed.refs {
+            let from_id = construct_id(*file_id, r.from);
+            if let Some(&to_id) = name_to_id.get(&r.name) {
                 if from_id != to_id {
-                    tree.add_reference_at(from_id, to_id, kind, line);
+                    tree.add_reference_at(from_id, to_id, r.kind.clone(), r.line);
                 }
             }
         }
@@ -111,30 +106,67 @@ pub fn parse_directory(dir: &Path) -> Result<CodeTree> {
     Ok(tree)
 }
 
-// ─── Internal helpers ────────────────────────────────────────────────────────
+// ─── Directory walk and splice ───────────────────────────────────────────────
 
-/// Recursively build folder/file nodes for `dir` under `parent_id`.
-///
-/// Each processed file's source text is appended to `file_sources` for the
-/// subsequent reference-extraction pass.
-fn walk_dir(
-    dir: &Path,
-    tree: &mut CodeTree,
-    parent_id: usize,
+/// One directory entry the walker decided to keep, in walk order.
+enum Entry {
+    Folder { name: String, children: Vec<Entry> },
+    File { name: String, path: PathBuf },
+}
+
+/// Everything a single file contributes, expressed without tree ids so it
+/// can be produced off-thread. Constructs are in `add_node` order with
+/// parents as indices into the same list (`None` meaning the File itself),
+/// which lets [`splice_file`] map them onto contiguous tree ids.
+struct ParsedFile {
+    byte_len: usize,
+    last_line: usize,
+    constructs: Vec<Construct>,
+    refs: Vec<RawRef>,
+}
+
+struct Construct {
+    kind: NodeKind,
+    name: String,
+    byte_range: (usize, usize),
+    line_range: (usize, usize),
+    /// Nesting below the File: 0 for a top-level item.
     depth: usize,
-    file_sources: &mut Vec<(usize, String, SourceLanguage)>,
-) -> Result<()> {
+    parent: Option<usize>,
+}
+
+/// A reference site whose target is still a bare name; resolution needs the
+/// project-wide name table, which exists only once every file is in the tree.
+struct RawRef {
+    from: Option<usize>,
+    name: String,
+    kind: ReferenceKind,
+    line: usize,
+}
+
+fn add_folder(tree: &mut CodeTree, name: impl Into<String>, depth: usize, parent: Option<usize>) -> usize {
+    let id = tree.add_node(NodeKind::Folder, name, (0, 0), (0, 0), depth, parent);
+    // Folders start at File-level granularity so only folders/files are shown
+    // until the user explicitly drills down.
+    if let Some(n) = tree.get_mut(id) {
+        n.granularity_limit = Some(NodeKind::File);
+    }
+    id
+}
+
+/// List `dir` recursively: directories first, then files, both alphabetical,
+/// skipping hidden entries and common build/dependency directories.
+fn list_dir(dir: &Path) -> Result<Vec<Entry>> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("Cannot read directory: {}", dir.display()))?
         .filter_map(|e| e.ok())
         .collect();
 
-    // Sort: directories first, then files — both alphabetically.
-    entries.sort_by_key(|e| {
-        let is_file = e.path().is_file();
-        (is_file, e.file_name())
-    });
+    // `is_file()` follows symlinks, as do the `is_dir()`/`is_file()` checks
+    // below; `DirEntry::file_type()` would not, and the two must agree.
+    entries.sort_by_cached_key(|e| (e.path().is_file(), e.file_name()));
 
+    let mut out = Vec::new();
     for entry in entries {
         let path = entry.path();
         let name = path
@@ -143,64 +175,138 @@ fn walk_dir(
             .unwrap_or("?")
             .to_string();
 
-        // Skip hidden files/dirs and common build/dependency directories.
         if name.starts_with('.') || matches!(name.as_str(), "target" | "node_modules" | "__pycache__") {
             continue;
         }
 
         if path.is_dir() {
-            let folder_id = tree.add_node(
-                NodeKind::Folder,
-                &name,
-                (0, 0),
-                (0, 0),
-                depth,
-                Some(parent_id),
-            );
-            // Sub-folders also start at File-level granularity.
-            if let Some(n) = tree.get_mut(folder_id) {
-                n.granularity_limit = Some(NodeKind::File);
-            }
-            walk_dir(&path, tree, folder_id, depth + 1, file_sources)?;
+            let children = list_dir(&path)?;
+            out.push(Entry::Folder { name, children });
         } else if path.is_file() {
-            let lang = SourceLanguage::from_path(&path);
-            let source = std::fs::read_to_string(&path).unwrap_or_default();
-
-            let file_id = tree.add_node(
-                NodeKind::File,
-                &name,
-                (0, source.len()),
-                (0, source.lines().count().saturating_sub(1)),
-                depth,
-                Some(parent_id),
-            );
-
-            parse_into_tree(tree, &source, &lang, file_id, depth + 1)?;
-            file_sources.push((file_id, source, lang));
+            out.push(Entry::File { name, path });
         }
     }
-
-    Ok(())
+    Ok(out)
 }
 
-/// Parse source text and add code constructs directly into `tree` under `parent_id`.
-fn parse_into_tree(
-    tree: &mut CodeTree,
-    source: &str,
-    lang: &SourceLanguage,
-    parent_id: usize,
-    depth: usize,
-) -> Result<()> {
-    match lang {
-        SourceLanguage::PlainText => {
-            // Plain text files get no children (just the file node itself)
-        }
-        _ => {
-            let ts_lang = ts_language(lang);
-            add_ts_constructs(tree, source, ts_lang, parent_id, depth)?;
+fn collect_file_paths<'a>(entries: &'a [Entry], out: &mut Vec<&'a Path>) {
+    for entry in entries {
+        match entry {
+            Entry::Folder { children, .. } => collect_file_paths(children, out),
+            Entry::File { path, .. } => out.push(path),
         }
     }
-    Ok(())
+}
+
+fn read_and_parse(path: &Path) -> Result<ParsedFile> {
+    let lang = SourceLanguage::from_path(path);
+    // Unreadable or non-UTF-8 files still get a File node, just an empty one.
+    let source = std::fs::read_to_string(path).unwrap_or_default();
+    parse_file(&source, &lang)
+}
+
+/// Add Folder and File nodes for `entries` under `parent_id`, consuming one
+/// parse per file from `parses` (which holds them in the same walk order).
+fn splice_dir(
+    tree: &mut CodeTree,
+    entries: &[Entry],
+    parent_id: usize,
+    depth: usize,
+    parses: &mut impl Iterator<Item = ParsedFile>,
+    files: &mut Vec<(usize, ParsedFile)>,
+) {
+    for entry in entries {
+        match entry {
+            Entry::Folder { name, children } => {
+                let folder_id = add_folder(tree, name, depth, Some(parent_id));
+                splice_dir(tree, children, folder_id, depth + 1, parses, files);
+            }
+            Entry::File { name, .. } => {
+                let parsed = parses.next().expect("one parse per listed file");
+                let file_id = splice_file(tree, name, &parsed, depth, Some(parent_id));
+                files.push((file_id, parsed));
+            }
+        }
+    }
+}
+
+/// Add the File node and, directly after it, every construct of `parsed`.
+fn splice_file(
+    tree: &mut CodeTree,
+    name: &str,
+    parsed: &ParsedFile,
+    depth: usize,
+    parent: Option<usize>,
+) -> usize {
+    let file_id = tree.add_node(
+        NodeKind::File,
+        name,
+        (0, parsed.byte_len),
+        (0, parsed.last_line),
+        depth,
+        parent,
+    );
+    for (i, c) in parsed.constructs.iter().enumerate() {
+        let id = tree.add_node(
+            c.kind,
+            &c.name,
+            c.byte_range,
+            c.line_range,
+            depth + 1 + c.depth,
+            Some(construct_id(file_id, c.parent)),
+        );
+        debug_assert_eq!(id, construct_id(file_id, Some(i)));
+    }
+    file_id
+}
+
+/// Tree id of a file-local construct index; `None` is the File itself.
+/// Valid because [`splice_file`] adds a file's constructs contiguously.
+fn construct_id(file_id: usize, local: Option<usize>) -> usize {
+    match local {
+        Some(i) => file_id + 1 + i,
+        None => file_id,
+    }
+}
+
+// ─── Per-file parse ──────────────────────────────────────────────────────────
+
+/// Parse one file's source: constructs and raw references from a single
+/// tree-sitter pass, with no dependency on the surrounding tree.
+fn parse_file(source: &str, lang: &SourceLanguage) -> Result<ParsedFile> {
+    let mut parsed = ParsedFile {
+        byte_len: source.len(),
+        last_line: source.lines().count().saturating_sub(1),
+        constructs: Vec::new(),
+        refs: Vec::new(),
+    };
+    if matches!(lang, SourceLanguage::PlainText) {
+        return Ok(parsed);
+    }
+
+    let mut parser = Parser::new();
+    parser
+        .set_language(&ts_language(lang))
+        .context("Failed to set tree-sitter language")?;
+    let ts_tree = parser
+        .parse(source, None)
+        .context("Tree-sitter failed to parse source")?;
+
+    let source_bytes = source.as_bytes();
+    let lines: Vec<&str> = source.lines().collect();
+    walk_ts_node(ts_tree.root_node(), source_bytes, &lines, &mut parsed.constructs, None, 0);
+
+    if !matches!(lang, SourceLanguage::Sql) {
+        let scope_nodes: Vec<(usize, (usize, usize))> = parsed
+            .constructs
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c.kind, NodeKind::Function | NodeKind::Class))
+            .map(|(i, c)| (i, c.byte_range))
+            .collect();
+        collect_ref_edges(ts_tree.root_node(), source_bytes, &scope_nodes, &mut parsed.refs);
+    }
+    Ok(parsed)
 }
 
 // ─── Reference extraction ─────────────────────────────────────────────────────
@@ -222,126 +328,67 @@ fn build_name_to_id_map(tree: &CodeTree) -> HashMap<String, usize> {
     map
 }
 
-/// Extract raw symbolic references from one file's source.
-///
-/// Returns `(from_node_id, ref_name, ref_kind, line)` where `from_node_id`
-/// is the innermost Function/Class/File node that textually contains the
-/// reference site (determined by byte-range containment) and `line` is the
-/// 0-indexed row of the referencing identifier.
-fn extract_raw_refs(
-    source: &str,
-    lang: &SourceLanguage,
-    tree: &CodeTree,
-    file_id: usize,
-) -> Vec<(usize, String, ReferenceKind, usize)> {
-    if matches!(lang, SourceLanguage::PlainText | SourceLanguage::Sql) {
-        return Vec::new();
-    }
-    let ts_lang = ts_language(lang);
-    let mut parser = Parser::new();
-    if parser.set_language(&ts_lang).is_err() {
-        return Vec::new();
-    }
-    let ts_tree = match parser.parse(source, None) {
-        Some(t) => t,
-        None => return Vec::new(),
-    };
-
-    // Build (node_id, byte_range) pairs for each Function/Class under this file.
-    let scope_nodes = collect_scope_nodes(tree, file_id);
-
-    let source_bytes = source.as_bytes();
-    let mut result = Vec::new();
-    collect_ref_edges(
-        ts_tree.root_node(),
-        source_bytes,
-        &scope_nodes,
-        file_id,
-        &mut result,
-    );
-    result
-}
-
-/// Collect all Function and Class node IDs with their byte ranges under `file_id`.
-fn collect_scope_nodes(tree: &CodeTree, file_id: usize) -> Vec<(usize, (usize, usize))> {
-    let mut out = Vec::new();
-    let mut stack = vec![file_id];
-    while let Some(id) = stack.pop() {
-        if let Some(node) = tree.get(id) {
-            if id != file_id && matches!(node.kind, NodeKind::Function | NodeKind::Class) {
-                out.push((id, node.byte_range));
-            }
-            for &child in &node.children {
-                stack.push(child);
-            }
-        }
-    }
-    out
-}
-
-/// Find the innermost scope node (smallest byte range) that contains `byte_offset`,
-/// falling back to `file_id` when no function/class scope contains it.
+/// Find the innermost scope (smallest byte range) among `scope_nodes` —
+/// `(construct index, byte range)` pairs — that contains `byte_offset`;
+/// `None` when no function/class scope does, i.e. the site is file-level.
 ///
 /// This is O(n) in the number of scope nodes per call-site.  For typical
 /// source files the number of functions is small enough that this is fast.
 /// A future optimisation could sort `scope_nodes` by start position and use
 /// binary search to find candidates before the linear containment filter.
-fn find_containing_scope(
-    byte_offset: usize,
-    scope_nodes: &[(usize, (usize, usize))],
-    file_id: usize,
-) -> usize {
+fn find_containing_scope(byte_offset: usize, scope_nodes: &[(usize, (usize, usize))]) -> Option<usize> {
     scope_nodes
         .iter()
         .filter(|(_, (start, end))| *start <= byte_offset && byte_offset < *end)
         .min_by_key(|(_, (start, end))| end - start)
         .map(|(id, _)| *id)
-        .unwrap_or(file_id)
 }
 
 /// Recursively walk a tree-sitter AST to collect call and import references.
+///
+/// A call is attributed to the innermost Function/Class construct textually
+/// containing it; imports always belong to the file.
 fn collect_ref_edges(
     node: Node<'_>,
     source: &[u8],
     scope_nodes: &[(usize, (usize, usize))],
-    file_id: usize,
-    result: &mut Vec<(usize, String, ReferenceKind, usize)>,
+    result: &mut Vec<RawRef>,
 ) {
     let kind = node.kind();
 
     // Call expressions (Rust, JS/TS) and plain calls (Python).
     if kind == "call_expression" || kind == "call" {
-        let from_id = find_containing_scope(node.start_byte(), scope_nodes, file_id);
+        let from = find_containing_scope(node.start_byte(), scope_nodes);
         if let Some(fn_node) = node.child_by_field_name("function") {
             if let Some(name) = extract_leaf_ident(fn_node, source) {
                 if !is_trivial_name(&name) {
                     let line = fn_node.start_position().row;
-                    result.push((from_id, name, ReferenceKind::Call, line));
+                    result.push(RawRef { from, name, kind: ReferenceKind::Call, line });
                 }
             }
         }
     }
 
-    // Rust `use` declarations → Import from the file node.
+    // Rust `use` declarations.
     if kind == "use_declaration" {
         for (name, line) in extract_use_leaf_names(node, source) {
             if !is_trivial_name(&name) {
-                result.push((file_id, name, ReferenceKind::Import, line));
+                result.push(RawRef { from: None, name, kind: ReferenceKind::Import, line });
             }
         }
     }
 
-    // Python / JS / TS import statements → Import from the file node.
+    // Python / JS / TS import statements.
     if kind == "import_statement" || kind == "import_from_statement" {
         for (name, line) in extract_import_leaf_names(node, source) {
             if !is_trivial_name(&name) {
-                result.push((file_id, name, ReferenceKind::Import, line));
+                result.push(RawRef { from: None, name, kind: ReferenceKind::Import, line });
             }
         }
     }
 
     for child in node.children(&mut node.walk()) {
-        collect_ref_edges(child, source, scope_nodes, file_id, result);
+        collect_ref_edges(child, source, scope_nodes, result);
     }
 }
 
@@ -577,66 +624,39 @@ fn ts_language(lang: &SourceLanguage) -> Language {
     }
 }
 
-fn add_ts_constructs(
-    tree: &mut CodeTree,
-    source: &str,
-    ts_lang: Language,
-    parent_id: usize,
-    depth: usize,
-) -> Result<()> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&ts_lang)
-        .context("Failed to set tree-sitter language")?;
-
-    let ts_tree = parser
-        .parse(source, None)
-        .context("Tree-sitter failed to parse source")?;
-
-    let source_bytes = source.as_bytes();
-    let lines: Vec<&str> = source.lines().collect();
-
-    walk_ts_node(ts_tree.root_node(), source_bytes, &lines, tree, parent_id, depth);
-
-    Ok(())
-}
-
-/// Recursively walk a tree-sitter node, lifting out interesting constructs.
+/// Recursively walk a tree-sitter node, lifting out interesting constructs
+/// under `parent` (an index into `out`, or `None` for the file) in pre-order.
 fn walk_ts_node(
     node: Node<'_>,
     source: &[u8],
     lines: &[&str],
-    tree: &mut CodeTree,
-    parent_id: usize,
+    out: &mut Vec<Construct>,
+    parent: Option<usize>,
     depth: usize,
 ) {
     for child in node.children(&mut node.walk()) {
-        if let Some((our_kind, name_node)) = classify_ts_node(&child) {
-            let start_byte = child.start_byte();
-            let end_byte = child.end_byte();
-            let start_line = child.start_position().row;
-            let end_line = child.end_position().row;
-
-            let display_name = name_node
+        if let Some((kind, name_node)) = classify_ts_node(&child) {
+            let name = name_node
                 .map(|n| extract_node_text(n, source))
                 .unwrap_or_else(|| first_line_preview(&child, source, lines));
 
-            let node_id = tree.add_node(
-                our_kind.clone(),
-                display_name,
-                (start_byte, end_byte),
-                (start_line, end_line),
+            let index = out.len();
+            out.push(Construct {
+                kind,
+                name,
+                byte_range: (child.start_byte(), child.end_byte()),
+                line_range: (child.start_position().row, child.end_position().row),
                 depth,
-                Some(parent_id),
-            );
+                parent,
+            });
 
             // Recurse into containers (only Module/Class/Function, not Block/Line)
-            if matches!(our_kind, NodeKind::Module | NodeKind::Class | NodeKind::Function) {
-                walk_ts_node(child, source, lines, tree, node_id, depth + 1);
+            if matches!(kind, NodeKind::Module | NodeKind::Class | NodeKind::Function) {
+                walk_ts_node(child, source, lines, out, Some(index), depth + 1);
             }
         } else {
             // Not interesting itself — pass the current parent through.
-            walk_ts_node(child, source, lines, tree, parent_id, depth);
+            walk_ts_node(child, source, lines, out, parent, depth);
         }
     }
 }

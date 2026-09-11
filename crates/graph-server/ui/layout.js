@@ -126,9 +126,11 @@ export function withRouting(edges, routed) {
 // siblings move only as far as its growth forces them, and every ancestor is
 // refit around its children. Boxes that already existed keep their positions
 // and orientation. The price is that upper levels drift from rank-optimal
-// over many steps; Re-layout is the way back. Returns null when a node
-// appears that has no place to inherit (a new leaf in an old box), which
-// means the change was not a zoom and a full layout is due.
+// over many steps; Re-layout is the way back. A leaf new to a level that
+// already existed (a file added while its folder is open) starts at that
+// level's content origin and is pushed into place. Returns null when a node
+// appears that has no place to inherit at all (a fresh box replacing
+// nothing), which means a full layout is due.
 const PUSH_GAP = 24;
 export function incrementalLayout(prevNodes, prevEdges, nodes, rankEdges, edges, dir) {
   const prev = new Map(prevNodes.map((n) => [n.id, n]));
@@ -138,9 +140,10 @@ export function incrementalLayout(prevNodes, prevEdges, nodes, rankEdges, edges,
   const newBoxes = fresh.filter((n) => n.type === 'container' && prev.has(entityOf(n.id)));
   const newBoxIds = new Set(newBoxes.map((n) => n.id));
   const enclosingNewBox = (n) => { for (let p = n.parentId; p; p = byId.get(p)?.parentId) if (newBoxIds.has(p)) return p; return null; };
+  const hadLevel = (n) => (n.parentId ? prev.has(n.parentId) : prevNodes.some((p) => !p.parentId));
   for (const n of fresh) {
     if (newBoxIds.has(n.id) || enclosingNewBox(n)) continue;
-    if (n.type !== 'container' && prev.has(`c${n.id}`)) continue;
+    if (n.type !== 'container' && (prev.has(`c${n.id}`) || hadLevel(n))) continue;
     return null;
   }
 
@@ -151,11 +154,14 @@ export function incrementalLayout(prevNodes, prevEdges, nodes, rankEdges, edges,
   }
   const dirty = new Set();
   const centered = (n, old) => ({ x: old.position.x + (old.width - n.width) / 2, y: old.position.y + (old.height - n.height) / 2 });
-  // A collapsed box becomes a leaf sitting where the box's centre was.
+  // A collapsed box becomes a leaf sitting where the box's centre was; a leaf
+  // with nothing to replace takes its level's orientation from a sibling.
   for (const n of fresh) {
     if (n.type === 'container' || enclosingNewBox(n)) continue;
     const box = prev.get(`c${n.id}`);
-    state.set(n.id, { ...n, position: centered(n, box), sourcePosition: box.sourcePosition, targetPosition: box.targetPosition });
+    const like = box || prevNodes.find((p) => (p.parentId ?? null) === (n.parentId ?? null)) || n;
+    const position = box ? centered(n, box) : n.parentId ? { x: PAD, y: LABEL_H + PAD } : { x: 0, y: 0 };
+    state.set(n.id, { ...n, position, sourcePosition: like.sourcePosition, targetPosition: like.targetPosition });
     dirty.add(n.id);
   }
   // Each outermost new box is laid out on its own, as if it were the whole

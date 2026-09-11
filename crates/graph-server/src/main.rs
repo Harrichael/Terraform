@@ -4,18 +4,24 @@ mod dto;
 mod handlers;
 #[cfg(feature = "scip")]
 mod index;
+mod reload;
 mod text_index;
+mod watch;
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::thread;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use entity_graph::EntityGraph;
 use tempfile::TempDir;
-use tiny_http::{Header, Response, Server as HttpServer};
+use tiny_http::{Header, Request, Response, Server as HttpServer};
 
-use crate::handlers::Server;
+use crate::handlers::{Mode, Server};
+use crate::reload::{Loaded, Loader};
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 
@@ -35,14 +41,20 @@ struct Args {
     /// Serve the union of this git ref and the working tree, tagged by change.
     #[arg(long, value_name = "ref", conflicts_with = "scip")]
     diff: Option<String>,
+    /// Start in Auto Update mode: rebuild the graph whenever sources change
+    /// (the default, Static, only flags the change and waits for Reload).
+    #[arg(long)]
+    auto_update: bool,
     /// Project root (or single file) to load.
     path: PathBuf,
 }
 
-fn load_graph(args: &Args, root: &Path) -> Result<EntityGraph> {
-    match &args.scip {
+fn load_graph(scip: Option<&Path>, scip_index: bool, root: &Path) -> Result<EntityGraph> {
+    match scip {
         Some(index) => load_scip(index, root),
-        None if args.scip_index => load_scip(&working_tree_index(root)?, root),
+        // Not a cached index path: `working_tree_index`'s freshness rule is
+        // what makes a rebuild re-index after an edit.
+        None if scip_index => load_scip(&working_tree_index(root)?, root),
         None => load_treesitter(root),
     }
 }
@@ -130,30 +142,45 @@ fn base_commit(repo: &Path, base_ref: &str) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
-fn load_diff(base_ref: &str, root: PathBuf, scip_index: bool) -> Result<Server> {
+/// The base side is fixed for the process: extracted and indexed here, once,
+/// and owned by the loader. Each call re-indexes only the working tree and
+/// re-diffs it against that base.
+fn diff_loader(base_ref: &str, root: PathBuf, scip_index: bool) -> Result<Loader> {
     if !root.is_dir() {
         bail!("--diff needs a project directory; {} is a file", root.display());
     }
     let name = root.file_name().map(Path::new).context("the project root has no name")?;
     let commit = base_commit(&root, base_ref)?;
     let (tree, old_root) = extract_base(&root, base_ref, name)?;
-
-    let (old, new) = if scip_index {
-        // The base index first: it is the one that can be reused across runs,
-        // so a failure there is reported before the working tree is rebuilt.
-        let old = load_scip(&base_index(&old_root, &commit, &root)?, &old_root)?;
-        (old, load_scip(&working_tree_index(&root)?, &root)?)
+    let old = if scip_index {
+        load_scip(&base_index(&old_root, &commit, &root)?, &old_root)?
     } else {
-        (load_treesitter(&old_root)?, load_treesitter(&root)?)
+        load_treesitter(&old_root)?
     };
-    println!(
-        "Diffing {base_ref} ({commit}) → working tree: base {} entities, working {} entities",
-        old.entities.len(),
-        new.entities.len(),
-    );
-    let diff = graph_diff::diff(&old, &old_root, &new, &root)?;
-    let base = base_ref.to_string();
-    Ok(Server::with_diff(diff, base, commit, Some(tree), root, INDEX_HTML))
+    println!("Diffing {base_ref} ({commit}) → working tree: base {} entities", old.entities.len());
+    let base_label = base_ref.to_string();
+    Ok(Box::new(move || {
+        // The graph's paths name the extracted tree and `/source` reads
+        // removed files from it, so `tree` must outlive every generation.
+        let old_root = tree.path().join(root.file_name().expect("checked above"));
+        let new = if scip_index {
+            load_scip(&working_tree_index(&root)?, &root)?
+        } else {
+            load_treesitter(&root)?
+        };
+        let diff = graph_diff::diff(&old, &old_root, &new, &root)?;
+        Ok(Loaded::Diff { diff, base_label: base_label.clone(), base_commit: commit.clone() })
+    }))
+}
+
+fn make_loader(args: &Args, root: PathBuf) -> Result<Loader> {
+    match &args.diff {
+        Some(base_ref) => diff_loader(base_ref, root, args.scip_index),
+        None => {
+            let (scip, scip_index) = (args.scip.clone(), args.scip_index);
+            Ok(Box::new(move || load_graph(scip.as_deref(), scip_index, &root).map(Loaded::Graph)))
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -162,39 +189,125 @@ fn main() -> Result<()> {
         .path
         .canonicalize()
         .with_context(|| format!("resolving {}", args.path.display()))?;
-    let server = match &args.diff {
-        Some(base_ref) => load_diff(base_ref, root, args.scip_index)?,
-        None => Server::new(load_graph(&args, &root)?, root, INDEX_HTML),
-    };
+    let mode = if args.auto_update { Mode::Auto } else { Mode::Static };
+    let loader = make_loader(&args, root.clone())?;
+    let server = Arc::new(Server::new(loader, root.clone(), INDEX_HTML, mode)?);
+    if let Err(e) = watch::spawn(root.clone(), server.clone()) {
+        eprintln!(
+            "warning: not watching {} for changes ({e:#}); the graph will stay as loaded",
+            root.display()
+        );
+    }
 
     let addr = format!("127.0.0.1:{}", args.port);
     let http = HttpServer::http(&addr).map_err(|e| anyhow::anyhow!("binding {addr}: {e}"))?;
+    let snapshot = server.snapshot();
     println!(
         "Serving {} ({} entities, {} references) at http://{addr}/",
-        dto::root_name(server.graph()),
-        server.graph().entities.len(),
-        server.graph().references.len(),
+        dto::root_name(&snapshot.graph),
+        snapshot.graph.entities.len(),
+        snapshot.graph.references.len(),
     );
+    drop(snapshot);
 
-    for request in http.incoming_requests() {
-        let method = request.method().as_str().to_string();
-        let url = request.url().to_string();
-        let resp = server.respond(&method, &url);
-        let header = Header::from_bytes("Content-Type", resp.content_type)
-            .expect("static content-type strings are valid header values");
-        let http_resp = Response::from_data(resp.body)
-            .with_status_code(resp.status)
-            .with_header(header);
-        if let Err(e) = request.respond(http_resp) {
-            eprintln!("failed to write response for {method} {url}: {e}");
-        }
+    // A small pool so a slow /search or a large /source cannot head-of-line
+    // block the status poll; the main thread serves too rather than idling.
+    let http = Arc::new(http);
+    for i in 0..WORKERS {
+        let (http, server) = (http.clone(), server.clone());
+        thread::Builder::new()
+            .name(format!("http-worker-{i}"))
+            .spawn(move || serve_forever(&http, |method, url| server.respond(method, url)))
+            .with_context(|| format!("spawning http-worker-{i}"))?;
     }
+    serve_forever(&http, |method, url| server.respond(method, url));
     Ok(())
+}
+
+const WORKERS: usize = 4;
+
+/// `recv` fails for exactly two reasons, the accept thread died or `unblock`
+/// told one waiter to stop, and neither is transient: retrying would park the
+/// worker forever, so an `Err` ends the loop.
+fn serve_forever(http: &HttpServer, respond: impl Fn(&str, &str) -> handlers::Response) {
+    while let Ok(request) = http.recv() {
+        serve(request, &respond);
+    }
+}
+
+fn serve(request: Request, respond: &impl Fn(&str, &str) -> handlers::Response) {
+    let method = request.method().as_str().to_string();
+    let url = request.url().to_string();
+    // Without this a panicking request would silently kill its worker, and
+    // one that panicked while holding a handler mutex would leave it poisoned
+    // for every later request. The panic hook has already printed the
+    // message and location; this names the request it belonged to.
+    let resp = match catch_unwind(AssertUnwindSafe(|| respond(&method, &url))) {
+        Ok(resp) => resp,
+        Err(_) => {
+            eprintln!("panic while handling {method} {url}; answering 500");
+            handlers::error(500, "internal server error")
+        }
+    };
+    let header = Header::from_bytes("Content-Type", resp.content_type)
+        .expect("static content-type strings are valid header values");
+    let http_resp = Response::from_data(resp.body).with_status_code(resp.status).with_header(header);
+    if let Err(e) = request.respond(http_resp) {
+        eprintln!("failed to write response for {method} {url}: {e}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     use super::*;
+
+    /// A panicking request costs exactly that request: it gets a 500, the
+    /// worker that caught it serves the next one, and an `Err` from `recv`
+    /// ends the loop instead of being retried.
+    #[test]
+    fn a_panicking_request_gets_a_500_and_the_worker_lives_on() {
+        let http = Arc::new(HttpServer::http("127.0.0.1:0").unwrap());
+        let port = http.server_addr().to_ip().unwrap().port();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = {
+            let http = http.clone();
+            thread::spawn(move || {
+                serve_forever(&http, |_, url| {
+                    if url == "/boom" {
+                        panic!("handler exploded on purpose");
+                    }
+                    handlers::Response { status: 200, content_type: "text/plain", body: b"still here".to_vec() }
+                });
+                done_tx.send(()).unwrap();
+            })
+        };
+
+        let boom = get(port, "/boom");
+        assert!(boom.starts_with("HTTP/1.1 500 "), "{boom}");
+        assert!(boom.ends_with(r#"{"error":"internal server error"}"#), "{boom}");
+        let after = get(port, "/after");
+        assert!(after.starts_with("HTTP/1.1 200 "), "{after}");
+        assert!(after.ends_with("still here"), "{after}");
+
+        http.unblock();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("serve_forever must return once recv fails");
+        worker.join().unwrap();
+    }
+
+    fn get(port: u16, path: &str) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(s, "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    }
 
     /// A SCIP index is one build of one tree, so there is no base side to
     /// diff against; clap rejects the pair rather than the loader.

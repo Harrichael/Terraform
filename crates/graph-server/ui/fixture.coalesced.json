@@ -1,1 +1,1 @@
-{ "leaves": [1, 11], "edges": [ { "from": 11, "to": 1, "kind": "import", "sites": [], "refs": [6] }, { "from": 11, "to": 1, "kind": "call", "sites": [], "refs": [7] } ] }
+{ "generation": 1, "leaves": [1, 11], "edges": [ { "from": 11, "to": 1, "kind": "import", "sites": [], "refs": [6] }, { "from": 11, "to": 1, "kind": "call", "sites": [], "refs": [7] } ] }

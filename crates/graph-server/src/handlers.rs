@@ -1,17 +1,23 @@
 //! Request handling as a pure function of (method, path) -> response, so the
 //! whole contract is testable without opening a socket. `main.rs` is the only
 //! thing that knows about `tiny_http`.
+//!
+//! `Server` is the long-lived shell around a sequence of `Snapshot`
+//! generations. Requests only read the live snapshot and flip flags; the
+//! watcher thread (`watch.rs`) is the only caller of `rebuild` in production,
+//! so no request ever waits on a re-index.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use coalesce::Cursor;
 use entity_graph::{EntityGraph, EntityId};
-use graph_diff::{FileDiff, GraphDiff, Status};
-use tempfile::TempDir;
+use graph_diff::FileDiff;
 
-use crate::dto::{self, DiffView, ErrorDto, GraphDto, SourceDto};
+use crate::dto::{self, ErrorDto, SourceDto, StatusDto};
+use crate::reload::{self, DiffState, Loaded, Loader, RemapHistory, Snapshot};
 use crate::text_index::{Limits, TextIndex};
 
 pub struct Response {
@@ -23,6 +29,7 @@ pub struct Response {
 const JSON: &str = "application/json";
 const HTML: &str = "text/html; charset=utf-8";
 const JS: &str = "application/javascript; charset=utf-8";
+const CSS: &str = "text/css; charset=utf-8";
 
 /// The ES modules `index.html` imports, served at `/ui/<name>` and embedded
 /// in the binary the same way `index_html` is.
@@ -37,6 +44,49 @@ const UI_MODULES: &[(&str, &str)] = &[
     ("app.js", include_str!("../ui/app.js")),
 ];
 
+/// Third-party modules the import map in `index.html` points at, fetched by
+/// `ui/fetch-vendor.sh` and served at `/ui/<name>` like `UI_MODULES`. Every
+/// module's own imports are rewritten to `./` siblings in this table, so a
+/// page load never leaves localhost.
+///
+/// Grammars have no extension because `code.js` imports them through the
+/// import-map prefix `highlight.js/lib/languages/` + bare language name.
+const VENDOR: &[(&str, &str)] = &[
+    ("vendor/react.js", include_str!("../ui/vendor/react.js")),
+    ("vendor/react-jsx-runtime.js", include_str!("../ui/vendor/react-jsx-runtime.js")),
+    ("vendor/react-dom.js", include_str!("../ui/vendor/react-dom.js")),
+    ("vendor/react-dom-client.js", include_str!("../ui/vendor/react-dom-client.js")),
+    ("vendor/scheduler.js", include_str!("../ui/vendor/scheduler.js")),
+    ("vendor/xyflow-react.js", include_str!("../ui/vendor/xyflow-react.js")),
+    ("vendor/xyflow-react.css", include_str!("../ui/vendor/xyflow-react.css")),
+    ("vendor/dagre.js", include_str!("../ui/vendor/dagre.js")),
+    ("vendor/graphlib.js", include_str!("../ui/vendor/graphlib.js")),
+    ("vendor/graphlib-alg.js", include_str!("../ui/vendor/graphlib-alg.js")),
+    ("vendor/graphlib-json.js", include_str!("../ui/vendor/graphlib-json.js")),
+    ("vendor/htm.js", include_str!("../ui/vendor/htm.js")),
+    ("vendor/hljs-core.js", include_str!("../ui/vendor/hljs-core.js")),
+    ("vendor/hljs/rust", include_str!("../ui/vendor/hljs/rust")),
+    ("vendor/hljs/go", include_str!("../ui/vendor/hljs/go")),
+    ("vendor/hljs/typescript", include_str!("../ui/vendor/hljs/typescript")),
+    ("vendor/hljs/javascript", include_str!("../ui/vendor/hljs/javascript")),
+    ("vendor/hljs/python", include_str!("../ui/vendor/hljs/python")),
+    ("vendor/hljs/ini", include_str!("../ui/vendor/hljs/ini")),
+    ("vendor/hljs/json", include_str!("../ui/vendor/hljs/json")),
+    ("vendor/hljs/markdown", include_str!("../ui/vendor/hljs/markdown")),
+    ("vendor/hljs/xml", include_str!("../ui/vendor/hljs/xml")),
+    ("vendor/hljs/css", include_str!("../ui/vendor/hljs/css")),
+    ("vendor/hljs/bash", include_str!("../ui/vendor/hljs/bash")),
+    ("vendor/hljs/yaml", include_str!("../ui/vendor/hljs/yaml")),
+    ("vendor/hljs/sql", include_str!("../ui/vendor/hljs/sql")),
+    ("vendor/hljs/c", include_str!("../ui/vendor/hljs/c")),
+    ("vendor/hljs/cpp", include_str!("../ui/vendor/hljs/cpp")),
+    ("vendor/hljs/java", include_str!("../ui/vendor/hljs/java")),
+    ("vendor/hljs/ruby", include_str!("../ui/vendor/hljs/ruby")),
+    ("vendor/hljs/kotlin", include_str!("../ui/vendor/hljs/kotlin")),
+    ("vendor/hljs/swift", include_str!("../ui/vendor/hljs/swift")),
+    ("vendor/hljs/lua", include_str!("../ui/vendor/hljs/lua")),
+];
+
 /// Largest source file `/source` will serve; the viewer renders the whole
 /// file in one `<pre>`, so anything bigger is refused rather than truncated.
 const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
@@ -44,73 +94,142 @@ const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 /// `/search` result caps, one per kind.
 const SEARCH_LIMITS: Limits = Limits { file: 30, path: 30, content: 100 };
 
-/// Everything diff mode adds: the change tags for the union graph the server
-/// is serving, and both texts of every changed file.
-struct DiffState {
-    base_label: String,
-    base_commit: String,
-    entity_status: Vec<Status>,
-    reference_status: Vec<Status>,
-    churn: Vec<(usize, usize)>,
-    files: HashMap<EntityId, FileDiff>,
-    // The extracted base tree is only read while diffing, but the graph's
-    // paths still name it, so it is kept for the server's lifetime rather
-    // than deleted under a running process. Absent when the caller owns it.
-    _base_tree: Option<TempDir>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Static,
+    Auto,
+}
+
+impl Mode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Mode::Static => "static",
+            Mode::Auto => "auto",
+        }
+    }
 }
 
 pub struct Server {
-    graph: EntityGraph,
-    // The graph never changes after load, so its JSON is rendered once; on a
-    // real repo it is by far the largest payload.
-    graph_json: String,
-    cursor: Mutex<Cursor>,
-    // The project directory (or single file) the graph was loaded from;
+    // The project directory (or single file) the graph is loaded from;
     // `EntityGraph::file_path` results are resolved against it.
     root: PathBuf,
-    diff: Option<DiffState>,
-    index: TextIndex,
     index_html: &'static str,
+    loader: Loader,
+    live: RwLock<Arc<Snapshot>>,
+    remaps: Mutex<RemapHistory>,
+    mode: AtomicU8,
+    // Sources changed since the live generation was loaded: static mode's
+    // signal to offer a manual reload.
+    dirty: AtomicBool,
+    // A rebuild has been asked for (`/reload`, or `/watch?mode=auto` while
+    // dirty) and the watcher has not picked it up yet.
+    pending: AtomicBool,
+    rebuilding: AtomicBool,
+    last_error: Mutex<Option<String>>,
+    wake: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl Server {
-    pub fn new(graph: EntityGraph, root: PathBuf, index_html: &'static str) -> Self {
-        let graph_json = serde_json::to_string(&GraphDto::from(&graph))
-            .expect("GraphDto serialization is infallible");
-        let cursor = Mutex::new(Cursor::new(&graph));
-        let index = build_text_index(&graph, &root, None);
-        Server { graph, graph_json, cursor, root, diff: None, index, index_html }
-    }
-
-    /// Serve a diff: the union graph is the graph, the change tags ride along
-    /// as side tables. `base_label` is the ref as the user typed it.
-    pub fn with_diff(
-        diff: GraphDiff,
-        base_label: String,
-        base_commit: String,
-        base_tree: Option<TempDir>,
+    /// Runs the loader once; the result is generation 1.
+    pub fn new(
+        loader: Loader,
         root: PathBuf,
         index_html: &'static str,
-    ) -> Self {
-        let GraphDiff { graph, entity_status, reference_status, churn, files } = diff;
-        let index = build_text_index(&graph, &root, Some(&files));
-        let state = DiffState {
-            base_label,
-            base_commit,
-            entity_status,
-            reference_status,
-            churn,
-            files,
-            _base_tree: base_tree,
-        };
-        let graph_json = serde_json::to_string(&dto::graph_dto_with_diff(&graph, &state.view()))
-            .expect("GraphDto serialization is infallible");
-        let cursor = Mutex::new(Cursor::new(&graph));
-        Server { graph, graph_json, cursor, root, diff: Some(state), index, index_html }
+        mode: Mode,
+    ) -> anyhow::Result<Server> {
+        let first = Snapshot::build(1, loader()?, &root, None);
+        Ok(Server {
+            root,
+            index_html,
+            loader,
+            live: RwLock::new(Arc::new(first)),
+            remaps: Mutex::new(RemapHistory::new()),
+            mode: AtomicU8::new(mode as u8),
+            dirty: AtomicBool::new(false),
+            pending: AtomicBool::new(false),
+            rebuilding: AtomicBool::new(false),
+            last_error: Mutex::new(None),
+            wake: Mutex::new(None),
+        })
     }
 
-    pub fn graph(&self) -> &EntityGraph {
-        &self.graph
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        self.live.read().unwrap().clone()
+    }
+
+    pub fn mode(&self) -> Mode {
+        match self.mode.load(Ordering::Relaxed) {
+            0 => Mode::Static,
+            _ => Mode::Auto,
+        }
+    }
+
+    pub fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    pub fn request_rebuild(&self) {
+        self.pending.store(true, Ordering::Relaxed);
+        if let Some(wake) = self.wake.lock().unwrap().as_ref() {
+            wake();
+        }
+    }
+
+    /// Watcher only: consumes a pending request.
+    pub fn take_request(&self) -> bool {
+        self.pending.swap(false, Ordering::Relaxed)
+    }
+
+    /// Called whenever a rebuild is requested, so the watcher thread can wake
+    /// up early instead of waiting for a file event.
+    pub fn set_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
+        *self.wake.lock().unwrap() = Some(Box::new(wake));
+    }
+
+    /// Watcher thread only. Loads the next generation and swaps it in with
+    /// the current zoom migrated across. On error the live snapshot is
+    /// untouched and `/status` reports the failure until the next success.
+    pub fn rebuild(&self) -> anyhow::Result<()> {
+        self.rebuilding.store(true, Ordering::Relaxed);
+        // Cleared before the load rather than after: an edit landing during
+        // the load must leave the graph dirty again.
+        self.dirty.store(false, Ordering::Relaxed);
+        let result = self.rebuild_inner();
+        self.rebuilding.store(false, Ordering::Relaxed);
+        match &result {
+            Ok(()) => *self.last_error.lock().unwrap() = None,
+            Err(e) => {
+                *self.last_error.lock().unwrap() = Some(format!("{e:#}"));
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+        result
+    }
+
+    fn rebuild_inner(&self) -> anyhow::Result<()> {
+        // A clone, not a guard: std's RwLock cannot be upgraded, so holding
+        // the read guard here would deadlock the write below.
+        let old = self.snapshot();
+        let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.loader)()))
+            .map_err(|_| anyhow::anyhow!("the loader panicked"))??;
+        let new_graph = match &loaded {
+            Loaded::Graph(g) => g,
+            Loaded::Diff { diff, .. } => &diff.graph,
+        };
+        let map = reload::id_map(&old.graph, new_graph);
+        let next = Snapshot::build(old.generation + 1, loaded, &self.root, Some(&map));
+
+        // Held from reading the old leaves through the swap: a zoom served
+        // in between would be acknowledged and then silently thrown away.
+        let old_cursor = old.cursor.lock().unwrap();
+        *next.cursor.lock().unwrap() =
+            reload::migrate_cursor(&old.graph, &old_cursor.leaves, &map, &next.graph);
+        // Recorded before the swap, so no request ever sees the new
+        // generation without the step that leads to it.
+        self.remaps.lock().unwrap().push(old.generation, map);
+        *self.live.write().unwrap() = Arc::new(next);
+        drop(old_cursor);
+        Ok(())
     }
 
     pub fn respond(&self, method: &str, path_and_query: &str) -> Response {
@@ -118,141 +237,208 @@ impl Server {
             Some((p, q)) => (p, Some(q)),
             None => (path_and_query, None),
         };
+        let snap = self.snapshot();
 
         match path {
-            "/" | "/graph.json" | "/coalesced.json" | "/source" | "/search" if method != "GET" => {
+            "/" | "/graph.json" | "/coalesced.json" | "/source" | "/search" | "/status"
+                if method != "GET" =>
+            {
                 error(405, "method not allowed; use GET")
             }
             "/" => ok(HTML, self.index_html.as_bytes().to_vec()),
-            "/graph.json" => ok(JSON, self.graph_json.clone().into_bytes()),
-            "/coalesced.json" => self.coalesced_response(),
+            "/graph.json" => self.graph_json(&snap, query),
+            "/coalesced.json" => coalesced_response(&snap, &snap.cursor.lock().unwrap()),
             "/source" => match parse_id(query) {
-                Ok(id) => self.source(id),
+                Ok(id) => source(&snap, &self.root, id),
                 Err(msg) => error(400, msg),
             },
-            "/search" => self.search(query),
+            "/search" => search(&snap, query),
+            "/status" => self.status(&snap),
             p if p.starts_with("/ui/") && method != "GET" => {
                 error(405, "method not allowed; use GET")
             }
             p if p.starts_with("/ui/") => ui_module(p),
 
-            "/coalesced/zoom-in" | "/coalesced/zoom-out" | "/coalesced/reset"
+            "/coalesced/zoom-in" | "/coalesced/zoom-out" | "/coalesced/reset" | "/watch"
+            | "/reload"
                 if method != "POST" =>
             {
                 error(405, "method not allowed; use POST")
             }
-            "/coalesced/reset" => {
-                *self.cursor.lock().unwrap() = Cursor::new(&self.graph);
-                self.coalesced_response()
+            "/watch" => self.watch(&snap, query),
+            "/reload" => {
+                self.request_rebuild();
+                self.status(&snap)
             }
-            "/coalesced/zoom-in" => match parse_id(query) {
-                Ok(id) => self.zoom(id, true),
-                Err(msg) => error(400, msg),
+            "/coalesced/reset" => match check_generation(&snap, query) {
+                Ok(()) => {
+                    let mut cursor = snap.cursor.lock().unwrap();
+                    *cursor = Cursor::new(&snap.graph);
+                    coalesced_response(&snap, &cursor)
+                }
+                Err(resp) => resp,
             },
-            "/coalesced/zoom-out" => match parse_id(query) {
-                Ok(id) => self.zoom(id, false),
-                Err(msg) => error(400, msg),
-            },
+            "/coalesced/zoom-in" | "/coalesced/zoom-out" => {
+                let target = check_generation(&snap, query)
+                    .and_then(|()| parse_id(query).map_err(|msg| error(400, msg)));
+                match target {
+                    Ok(id) => zoom(&snap, id, path == "/coalesced/zoom-in"),
+                    Err(resp) => resp,
+                }
+            }
 
             _ => error(404, &format!("no route for {method} {path}")),
         }
     }
 
-    fn source(&self, id: EntityId) -> Response {
-        let Some(rel) = self.graph.file_path(id) else {
-            return error(404, &format!("entity {} has no source file", id.0));
+    /// `?from=G` asks for `remap` relative to generation G instead of the
+    /// previous one. Anything the history cannot answer (too old, not behind
+    /// the live generation) gets the cached payload, whose `remap.from` then
+    /// tells the client it has to reset.
+    fn graph_json(&self, snap: &Snapshot, query: Option<&str>) -> Response {
+        let cached = || ok(JSON, snap.graph_json.clone().into_bytes());
+        let Some(raw) = param(query, "from") else { return cached() };
+        let Ok(from) = raw.parse::<u64>() else {
+            return error(400, "query parameter `from` must be a generation number");
         };
-        let file_id = file_ancestor(&self.graph, id);
-        match self.diff.as_ref().filter(|d| d.files.contains_key(&file_id)) {
-            Some(d) => self.diff_source(file_id, &rel, d),
-            None => match read_source(&self.root, &rel) {
-                Ok(text) => {
-                    let path = wire_path(&rel);
-                    let dto = SourceDto { id: file_id.0, path, text, old_text: None, ops: None };
-                    ok(JSON, serde_json::to_vec(&dto).unwrap())
-                }
-                Err(resp) => resp,
-            },
+        if from + 1 >= snap.generation {
+            return cached();
+        }
+        match self.remaps.lock().unwrap().compose(from, snap.generation) {
+            Some(ids) => ok(JSON, snap.render_graph_json(Some(reload::remap_dto(from, &ids))).into_bytes()),
+            None => cached(),
         }
     }
 
-    /// Both sides of a changed file, plus the line ops that interleave them.
-    /// The texts come from the diff computed at load, not from disk: the ops
-    /// only line up with the exact texts they were computed from, and the
-    /// working tree may have moved on since. The side a one-sided file does
-    /// not have is empty rather than an error.
-    fn diff_source(&self, file_id: EntityId, rel: &Path, d: &DiffState) -> Response {
-        let file = &d.files[&file_id];
-        let dto = SourceDto {
-            id: file_id.0,
-            path: wire_path(rel),
-            text: file.new_text.clone().unwrap_or_default(),
-            old_text: Some(file.old_text.clone().unwrap_or_default()),
-            ops: Some(file.ops.iter().map(dto::op_dto).collect()),
+    fn status(&self, snap: &Snapshot) -> Response {
+        let dto = StatusDto {
+            generation: snap.generation,
+            mode: self.mode().as_str(),
+            dirty: self.dirty.load(Ordering::Relaxed),
+            rebuilding: self.pending.load(Ordering::Relaxed) || self.rebuilding.load(Ordering::Relaxed),
+            error: self.last_error.lock().unwrap().clone(),
         };
         ok(JSON, serde_json::to_vec(&dto).unwrap())
     }
 
-    /// `q` is percent-encoded, as query values are; a missing or non-UTF-8
-    /// `q` is the only way this 400s, since an empty needle is a valid (if
-    /// empty) search.
-    fn search(&self, query: Option<&str>) -> Response {
-        let raw = query.unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("q="));
-        let Some(raw) = raw else { return error(400, "missing query parameter `q`") };
-        let q = match percent_decode(raw) {
-            Ok(q) => q,
-            Err(()) => return error(400, "query parameter `q` is not valid UTF-8"),
+    fn watch(&self, snap: &Snapshot, query: Option<&str>) -> Response {
+        let mode = match param(query, "mode") {
+            Some("static") => Mode::Static,
+            Some("auto") => Mode::Auto,
+            Some(_) => return error(400, "query parameter `mode` must be `static` or `auto`"),
+            None => return error(400, "missing query parameter `mode`"),
         };
-        let result = self.index.search(&q, SEARCH_LIMITS);
-        ok(JSON, serde_json::to_vec(&dto::search_dto(&result)).unwrap())
-    }
-
-    fn coalesced_response(&self) -> Response {
-        let coalesced = self.cursor.lock().unwrap().coalesced();
-        let status = self.diff.as_ref().map(|d| d.reference_status.as_slice());
-        ok(JSON, serde_json::to_vec(&dto::coalesced_dto(&coalesced, status)).unwrap())
-    }
-
-    // A no-op move is a 409 rather than a 200 with the unchanged payload so the
-    // UI can tell "nothing to expand here" apart from a successful zoom
-    // without diffing leaf sets.
-    fn zoom(&self, id: EntityId, down: bool) -> Response {
-        let mut cursor = self.cursor.lock().unwrap();
-        let moved = if down {
-            cursor.move_down(id, &self.graph)
-        } else {
-            cursor.move_up(id, &self.graph)
-        };
-        if moved {
-            drop(cursor);
-            return self.coalesced_response();
+        self.mode.store(mode as u8, Ordering::Relaxed);
+        if mode == Mode::Auto && self.dirty.load(Ordering::Relaxed) {
+            self.request_rebuild();
         }
-
-        let Some(entity) = self.graph.get(id) else {
-            return error(409, &format!("unknown entity id {}", id.0));
-        };
-        if !cursor.leaves.contains(&id) {
-            return error(409, &format!("entity {} is not a current leaf", id.0));
-        }
-        if down {
-            error(409, &format!("entity {} has no children", id.0))
-        } else {
-            debug_assert!(entity.parent.is_none());
-            error(409, &format!("entity {} is a root", id.0))
-        }
+        self.status(snap)
     }
 }
 
-impl DiffState {
-    fn view(&self) -> DiffView<'_> {
-        DiffView {
-            base: &self.base_label,
-            base_commit: &self.base_commit,
-            entity_status: &self.entity_status,
-            reference_status: &self.reference_status,
-            churn: &self.churn,
-        }
+fn source(snap: &Snapshot, root: &Path, id: EntityId) -> Response {
+    let Some(rel) = snap.graph.file_path(id) else {
+        return error(404, &format!("entity {} has no source file", id.0));
+    };
+    let file_id = file_ancestor(&snap.graph, id);
+    match snap.diff.as_ref().filter(|d| d.files.contains_key(&file_id)) {
+        Some(d) => diff_source(snap.generation, file_id, &rel, d),
+        None => match read_source(root, &rel) {
+            Ok(text) => {
+                let dto = SourceDto {
+                    generation: snap.generation,
+                    id: file_id.0,
+                    path: wire_path(&rel),
+                    text,
+                    old_text: None,
+                    ops: None,
+                };
+                ok(JSON, serde_json::to_vec(&dto).unwrap())
+            }
+            Err(resp) => resp,
+        },
     }
+}
+
+/// Both sides of a changed file, plus the line ops that interleave them.
+/// The texts come from the diff computed for this generation, not from disk:
+/// the ops only line up with the exact texts they were computed from, and
+/// the working tree may have moved on since. The side a one-sided file does
+/// not have is empty rather than an error.
+fn diff_source(generation: u64, file_id: EntityId, rel: &Path, d: &DiffState) -> Response {
+    let file = &d.files[&file_id];
+    let dto = SourceDto {
+        generation,
+        id: file_id.0,
+        path: wire_path(rel),
+        text: file.new_text.clone().unwrap_or_default(),
+        old_text: Some(file.old_text.clone().unwrap_or_default()),
+        ops: Some(file.ops.iter().map(dto::op_dto).collect()),
+    };
+    ok(JSON, serde_json::to_vec(&dto).unwrap())
+}
+
+/// `q` is percent-encoded, as query values are; a missing or non-UTF-8 `q`
+/// is the only way this 400s, since an empty needle is a valid (if empty)
+/// search.
+fn search(snap: &Snapshot, query: Option<&str>) -> Response {
+    let Some(raw) = param(query, "q") else { return error(400, "missing query parameter `q`") };
+    let q = match percent_decode(raw) {
+        Ok(q) => q,
+        Err(()) => return error(400, "query parameter `q` is not valid UTF-8"),
+    };
+    let result = snap.index.search(&q, SEARCH_LIMITS);
+    ok(JSON, serde_json::to_vec(&dto::search_dto(&result, snap.generation)).unwrap())
+}
+
+// Takes the caller's cursor guard rather than locking itself: a zoom or
+// reset that dropped the lock before rendering could answer with some other
+// request's move once requests are served concurrently.
+fn coalesced_response(snap: &Snapshot, cursor: &Cursor) -> Response {
+    let coalesced = cursor.coalesced();
+    let status = snap.diff.as_ref().map(|d| d.reference_status.as_slice());
+    ok(JSON, serde_json::to_vec(&dto::coalesced_dto(&coalesced, status, snap.generation)).unwrap())
+}
+
+// A no-op move is a 409 rather than a 200 with the unchanged payload so the
+// UI can tell "nothing to expand here" apart from a successful zoom without
+// diffing leaf sets.
+fn zoom(snap: &Snapshot, id: EntityId, down: bool) -> Response {
+    let mut cursor = snap.cursor.lock().unwrap();
+    let moved = if down { cursor.move_down(id, &snap.graph) } else { cursor.move_up(id, &snap.graph) };
+    if moved {
+        return coalesced_response(snap, &cursor);
+    }
+
+    let Some(entity) = snap.graph.get(id) else {
+        return error(409, &format!("unknown entity id {}", id.0));
+    };
+    if !cursor.leaves.contains(&id) {
+        return error(409, &format!("entity {} is not a current leaf", id.0));
+    }
+    if down {
+        error(409, &format!("entity {} has no children", id.0))
+    } else {
+        debug_assert!(entity.parent.is_none());
+        error(409, &format!("entity {} is a root", id.0))
+    }
+}
+
+/// A zoom names an entity by id, and ids are per generation, so a request
+/// that crossed a rebuild would act on some other entity: the caller must say
+/// which generation it meant.
+fn check_generation(snap: &Snapshot, query: Option<&str>) -> Result<(), Response> {
+    let requested = param(query, "generation")
+        .ok_or_else(|| error(400, "missing query parameter `generation`"))?
+        .parse::<u64>()
+        .map_err(|_| error(400, "query parameter `generation` must be a non-negative integer"))?;
+    if requested != snap.generation {
+        return Err(error(
+            409,
+            &format!("graph changed (generation {}, request was for {requested})", snap.generation),
+        ));
+    }
+    Ok(())
 }
 
 /// Read `rel` under `base`, refusing anything the viewer cannot render. The
@@ -296,7 +482,7 @@ fn read_source(base: &Path, rel: &Path) -> Result<String, Response> {
 /// new side, or the old side for a file that only exists on the base tree
 /// (its line numbers are then old-side line numbers, matching where the code
 /// pane opens a removed entity).
-fn build_text_index(
+pub(crate) fn build_text_index(
     graph: &EntityGraph,
     root: &Path,
     diff_files: Option<&HashMap<EntityId, FileDiff>>,
@@ -365,12 +551,12 @@ fn percent_decode(s: &str) -> Result<String, ()> {
     String::from_utf8(out).map_err(|_| ())
 }
 
+fn param<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
+    query.unwrap_or("").split('&').find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+}
+
 fn parse_id(query: Option<&str>) -> Result<EntityId, &'static str> {
-    let raw = query
-        .unwrap_or("")
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("id="))
-        .ok_or("missing query parameter `id`")?;
+    let raw = param(query, "id").ok_or("missing query parameter `id`")?;
     raw.parse::<usize>().map(EntityId).map_err(|_| "query parameter `id` must be a non-negative integer")
 }
 
@@ -380,13 +566,16 @@ fn ok(content_type: &'static str, body: Vec<u8>) -> Response {
 
 fn ui_module(path: &str) -> Response {
     let name = path.trim_start_matches("/ui/");
-    match UI_MODULES.iter().find(|(n, _)| *n == name) {
-        Some((_, src)) => ok(JS, src.as_bytes().to_vec()),
+    match UI_MODULES.iter().chain(VENDOR).find(|(n, _)| *n == name) {
+        Some((_, src)) => {
+            let content_type = if name.ends_with(".css") { CSS } else { JS };
+            ok(content_type, src.as_bytes().to_vec())
+        }
         None => error(404, &format!("no route for GET {path}")),
     }
 }
 
-fn error(status: u16, message: &str) -> Response {
+pub(crate) fn error(status: u16, message: &str) -> Response {
     let body = serde_json::to_vec(&ErrorDto { error: message.to_string() }).unwrap();
     Response { status, content_type: JSON, body }
 }
@@ -399,7 +588,7 @@ mod tests {
     use entity_graph::ReferenceKind::*;
     use entity_graph::Site;
     use entity_graph::test_support::graph_from_parents;
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -447,8 +636,27 @@ mod tests {
 
     const INDEX: &str = "<!doctype html><title>t</title>";
 
+    fn fixture_loader() -> Loader {
+        Box::new(|| Ok(Loaded::Graph(fixture_graph())))
+    }
+
+    /// Re-parses both trees with tree-sitter on every call, so a rebuild sees
+    /// whatever the test wrote to disk in between.
+    fn diff_loader(old_root: PathBuf, new_root: PathBuf) -> Loader {
+        Box::new(move || {
+            let old = treesitter_producer::graph_from_path(&old_root)?;
+            let new = treesitter_producer::graph_from_path(&new_root)?;
+            let diff = graph_diff::diff(&old, &old_root, &new, &new_root)?;
+            Ok(Loaded::Diff { diff, base_label: "HEAD~1".into(), base_commit: "0123abcd".into() })
+        })
+    }
+
+    fn server_at(loader: Loader, root: PathBuf) -> Server {
+        Server::new(loader, root, INDEX, Mode::Static).unwrap()
+    }
+
     fn server() -> Server {
-        Server::new(fixture_graph(), PathBuf::from("/nonexistent/demo"), INDEX)
+        server_at(fixture_loader(), PathBuf::from("/nonexistent/demo"))
     }
 
     fn json(resp: &Response) -> Value {
@@ -456,9 +664,23 @@ mod tests {
         serde_json::from_slice(&resp.body).unwrap()
     }
 
+    /// The node at a wire `path` in a `/graph.json` payload.
+    fn node<'a>(graph: &'a Value, path: &str) -> &'a Value {
+        graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["path"] == path)
+            .unwrap_or_else(|| panic!("no node at {path}"))
+    }
+
+    fn id_of(graph: &Value, path: &str) -> u64 {
+        node(graph, path)["id"].as_u64().unwrap()
+    }
+
     #[test]
     fn graph_dto_matches_frontend_fixture() {
-        let actual = serde_json::to_value(GraphDto::from(&fixture_graph())).unwrap();
+        let actual = serde_json::to_value(dto::graph_dto(&fixture_graph(), 1, None)).unwrap();
         let expected: Value = serde_json::from_str(include_str!("../ui/fixture.json")).unwrap();
         assert_eq!(actual, expected);
     }
@@ -470,44 +692,45 @@ mod tests {
     #[test]
     fn zoom_sequence_follows_contract() {
         let s = server();
+        let at_root = json!({ "generation": 1, "leaves": [0], "edges": [] });
 
         let root = s.respond("GET", "/coalesced.json");
         assert_eq!(root.status, 200);
-        assert_eq!(json(&root), serde_json::json!({ "leaves": [0], "edges": [] }));
+        assert_eq!(json(&root), at_root);
 
-        let zoomed = s.respond("POST", "/coalesced/zoom-in?id=0");
+        let zoomed = s.respond("POST", "/coalesced/zoom-in?id=0&generation=1");
         assert_eq!(zoomed.status, 200);
         let expected: Value =
             serde_json::from_str(include_str!("../ui/fixture.coalesced.json")).unwrap();
         assert_eq!(json(&zoomed), expected);
 
-        let again = s.respond("POST", "/coalesced/zoom-in?id=0");
+        let again = s.respond("POST", "/coalesced/zoom-in?id=0&generation=1");
         assert_eq!(again.status, 409);
         assert!(json(&again)["error"].as_str().unwrap().contains("not a current leaf"));
 
-        let out = s.respond("POST", "/coalesced/zoom-out?id=1");
+        let out = s.respond("POST", "/coalesced/zoom-out?id=1&generation=1");
         assert_eq!(out.status, 200);
-        assert_eq!(json(&out), serde_json::json!({ "leaves": [0], "edges": [] }));
+        assert_eq!(json(&out), at_root);
 
-        let root_out = s.respond("POST", "/coalesced/zoom-out?id=0");
+        let root_out = s.respond("POST", "/coalesced/zoom-out?id=0&generation=1");
         assert_eq!(root_out.status, 409);
         assert!(json(&root_out)["error"].as_str().unwrap().contains("root"));
 
-        let unknown = s.respond("POST", "/coalesced/zoom-in?id=999");
+        let unknown = s.respond("POST", "/coalesced/zoom-in?id=999&generation=1");
         assert_eq!(unknown.status, 409);
         assert!(json(&unknown)["error"].as_str().unwrap().contains("unknown"));
 
-        assert_eq!(s.respond("POST", "/coalesced/zoom-in").status, 400);
-        assert_eq!(s.respond("POST", "/coalesced/zoom-in?id=abc").status, 400);
+        assert_eq!(s.respond("POST", "/coalesced/zoom-in?generation=1").status, 400);
+        assert_eq!(s.respond("POST", "/coalesced/zoom-in?id=abc&generation=1").status, 400);
         assert_eq!(s.respond("GET", "/nope").status, 404);
-        assert_eq!(s.respond("GET", "/coalesced/zoom-in?id=0").status, 405);
+        assert_eq!(s.respond("GET", "/coalesced/zoom-in?id=0&generation=1").status, 405);
         assert_eq!(s.respond("POST", "/graph.json").status, 405);
 
-        s.respond("POST", "/coalesced/zoom-in?id=0");
-        s.respond("POST", "/coalesced/zoom-in?id=1");
-        let reset = s.respond("POST", "/coalesced/reset");
+        s.respond("POST", "/coalesced/zoom-in?id=0&generation=1");
+        s.respond("POST", "/coalesced/zoom-in?id=1&generation=1");
+        let reset = s.respond("POST", "/coalesced/reset?generation=1");
         assert_eq!(reset.status, 200);
-        assert_eq!(json(&reset), serde_json::json!({ "leaves": [0], "edges": [] }));
+        assert_eq!(json(&reset), at_root);
     }
 
     /// `/source` resolves any entity to its File ancestor's path under the
@@ -520,14 +743,14 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/main.rs"), "fn main() {}\nfn helper() {}\n").unwrap();
         std::fs::write(root.join("src/lib.rs"), [0xffu8, 0xfe, b'x']).unwrap();
-        let s = Server::new(fixture_graph(), root, INDEX);
+        let s = server_at(fixture_loader(), root);
 
         // A function id resolves to its file (id 2) and its path.
         let by_fn = s.respond("GET", "/source?id=4");
         assert_eq!(by_fn.status, 200);
         assert_eq!(
             json(&by_fn),
-            serde_json::json!({ "id": 2, "path": "src/main.rs", "text": "fn main() {}\nfn helper() {}\n" })
+            json!({ "generation": 1, "id": 2, "path": "src/main.rs", "text": "fn main() {}\nfn helper() {}\n" })
         );
         assert_eq!(json(&s.respond("GET", "/source?id=2")), json(&by_fn));
 
@@ -554,12 +777,14 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let file = dir.path().join("only.rs");
         std::fs::write(&file, "fn f() {}\n").unwrap();
-        let graph = graph_from_parents(&[("only.rs", File, None), ("f", Function, Some(0))], &[]);
-        let s = Server::new(graph, file, INDEX);
+        let loader: Loader = Box::new(|| {
+            Ok(Loaded::Graph(graph_from_parents(&[("only.rs", File, None), ("f", Function, Some(0))], &[])))
+        });
+        let s = server_at(loader, file);
 
         let resp = s.respond("GET", "/source?id=1");
         assert_eq!(resp.status, 200);
-        assert_eq!(json(&resp), serde_json::json!({ "id": 0, "path": "", "text": "fn f() {}\n" }));
+        assert_eq!(json(&resp), json!({ "generation": 1, "id": 0, "path": "", "text": "fn f() {}\n" }));
     }
 
     /// `/search` end to end over a temp tree matching `fixture_graph()`'s
@@ -583,7 +808,7 @@ mod tests {
             ("src/main.rs", &main_rs),
             ("src/lib.rs", "// calls main eventually\nfn lib_fn() {}\n"),
         ]);
-        let s = Server::new(fixture_graph(), root, INDEX);
+        let s = server_at(fixture_loader(), root);
 
         // Unrestricted "main": the file hit for main.rs leads, with offsets
         // matching the contract example exactly; its path hit is suppressed
@@ -595,16 +820,14 @@ mod tests {
         let hits = main["hits"].as_array().unwrap();
         assert_eq!(
             hits[0],
-            serde_json::json!(
-                { "kind": "file", "id": 2, "path": "src/main.rs", "text": "main.rs", "start": 0, "end": 4 }
-            )
+            json!({ "kind": "file", "id": 2, "path": "src/main.rs", "text": "main.rs", "start": 0, "end": 4 })
         );
         assert!(hits.iter().all(|h| h["kind"] != "path"), "main.rs's path hit must be suppressed: {hits:?}");
         let content: Vec<_> = hits.iter().filter(|h| h["kind"] == "content").collect();
         assert_eq!(content.len(), 100);
         assert_eq!((content[0]["path"].as_str(), content[0]["line"].as_i64()), (Some("src/lib.rs"), Some(0)));
         assert_eq!((content[1]["path"].as_str(), content[1]["line"].as_i64()), (Some("src/main.rs"), Some(0)));
-        assert_eq!(main["more"], serde_json::json!({ "file": 0, "path": 0, "content": 4 }));
+        assert_eq!(main["more"], json!({ "file": 0, "path": 0, "content": 4 }));
 
         // A match confined to a directory segment ("src") is a different
         // occurrence from any filename tail and is kept, unlike above.
@@ -660,8 +883,8 @@ mod tests {
 
         assert_eq!(s.respond("GET", "/search").status, 400);
         assert_eq!(s.respond("POST", "/search?q=main").status, 405);
-        assert_eq!(json(&s.respond("GET", "/search?q=")), serde_json::json!({
-            "query": "", "hits": [], "more": { "file": 0, "path": 0, "content": 0 }
+        assert_eq!(json(&s.respond("GET", "/search?q=")), json!({
+            "generation": 1, "query": "", "hits": [], "more": { "file": 0, "path": 0, "content": 0 }
         }));
     }
 
@@ -689,79 +912,92 @@ mod tests {
             ("src/gone.rs", "fn gone() {\n    alpha();\n}\n"),
         ]);
         write_tree(&new_root, &[("src/lib.rs", LIB_EDITED), ("src/util.rs", UTIL_EDITED)]);
-        let old = treesitter_producer::graph_from_path(&old_root).unwrap();
-        let new = treesitter_producer::graph_from_path(&new_root).unwrap();
-        let diff = graph_diff::diff(&old, &old_root, &new, &new_root).unwrap();
-        let s = Server::with_diff(
-            diff,
-            "HEAD~1".into(),
-            "0123abcd".into(),
-            None,
-            new_root,
-            INDEX,
-        );
+        let s = server_at(diff_loader(old_root, new_root.clone()), new_root);
 
         let graph = json(&s.respond("GET", "/graph.json"));
-        assert_eq!(
-            graph["diff"],
-            serde_json::json!({ "base": "HEAD~1", "base_commit": "0123abcd" })
-        );
-        let node = |path: &str| {
-            graph["nodes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|n| n["path"] == path)
-                .unwrap_or_else(|| panic!("no node at {path}"))
-                .clone()
-        };
-        let alpha = node("proj/src/lib.rs/alpha");
+        assert_eq!(graph["diff"], json!({ "base": "HEAD~1", "base_commit": "0123abcd" }));
+        let alpha = node(&graph, "proj/src/lib.rs/alpha");
         assert_eq!(alpha["status"], "modified");
         assert_eq!(alpha["added"], 1);
         assert_eq!(alpha["removed"], 0);
-        assert_eq!(node("proj/src/lib.rs/beta")["status"], "same");
-        assert_eq!(node("proj/src/gone.rs")["status"], "removed");
-        assert_eq!(node("proj/src/gone.rs")["removed"], 3);
-        assert_eq!(node("proj/src")["status"], "modified");
+        assert_eq!(node(&graph, "proj/src/lib.rs/beta")["status"], "same");
+        assert_eq!(node(&graph, "proj/src/gone.rs")["status"], "removed");
+        assert_eq!(node(&graph, "proj/src/gone.rs")["removed"], 3);
+        assert_eq!(node(&graph, "proj/src")["status"], "modified");
 
         // Zoom to the file level: every edge names its member references, and
         // the util.rs -> lib.rs bundle holds an unchanged and an added call.
-        s.respond("POST", "/coalesced/zoom-in?id=0");
-        let src_id = node("proj/src")["id"].clone();
-        let view = json(&s.respond("POST", &format!("/coalesced/zoom-in?id={src_id}")));
+        s.respond("POST", "/coalesced/zoom-in?id=0&generation=1");
+        let src_id = id_of(&graph, "proj/src");
+        let view = json(&s.respond("POST", &format!("/coalesced/zoom-in?id={src_id}&generation=1")));
         let edges = view["edges"].as_array().unwrap();
         assert!(edges.iter().all(|e| !e["refs"].as_array().unwrap().is_empty()), "{edges:?}");
         let edge = |from: &str, to: &str| {
             edges
                 .iter()
-                .find(|e| e["from"] == node(from)["id"] && e["to"] == node(to)["id"])
+                .find(|e| e["from"] == id_of(&graph, from) && e["to"] == id_of(&graph, to))
                 .unwrap_or_else(|| panic!("no edge {from} -> {to} in {edges:?}"))
         };
         assert_eq!(edge("proj/src/util.rs", "proj/src/lib.rs")["status"], "mixed");
         assert_eq!(edge("proj/src/gone.rs", "proj/src/lib.rs")["status"], "removed");
 
-        let lib_id = node("proj/src/lib.rs")["id"].as_u64().unwrap();
+        let lib_id = id_of(&graph, "proj/src/lib.rs");
         let source = json(&s.respond("GET", &format!("/source?id={lib_id}")));
         assert_eq!(source["text"], LIB_EDITED);
         assert_eq!(source["old_text"], LIB);
-        assert_eq!(
-            source["ops"],
-            serde_json::json!([["=", 0, 3, 0, 3], ["+", 3, 0, 3, 1], ["=", 3, 5, 4, 5]])
-        );
+        assert_eq!(source["ops"], json!([["=", 0, 3, 0, 3], ["+", 3, 0, 3, 1], ["=", 3, 5, 4, 5]]));
 
         // The removed file only exists in the base tree.
-        let gone_id = node("proj/src/gone.rs")["id"].as_u64().unwrap();
+        let gone_id = id_of(&graph, "proj/src/gone.rs");
         let removed = json(&s.respond("GET", &format!("/source?id={gone_id}")));
         assert_eq!(removed["text"], "");
         assert_eq!(removed["old_text"], "fn gone() {\n    alpha();\n}\n");
-        assert_eq!(removed["ops"], serde_json::json!([["-", 0, 3, 0, 0]]));
+        assert_eq!(removed["ops"], json!([["-", 0, 3, 0, 0]]));
 
         // An unchanged file keeps the plain shape, so the UI reads absent ops
         // as "nothing to interleave".
-        let util_id = node("proj/src/util.rs")["id"].clone();
+        let util_id = id_of(&graph, "proj/src/util.rs");
         let util = json(&s.respond("GET", &format!("/source?id={util_id}")));
         assert!(util.get("ops").is_some(), "util.rs did change");
         assert_eq!(util["old_text"], UTIL);
+    }
+
+    /// A rebuild in diff mode re-diffs the working tree against the same
+    /// base: a function untouched at load and edited since flips to
+    /// `modified`, and `/source` serves the text the new ops were computed
+    /// from.
+    #[test]
+    fn diff_mode_rebuild_retags_the_working_side() {
+        const LIB: &str = "fn alpha() {\n    let x = 1;\n}\n\nfn beta() {\n    alpha();\n}\n";
+        const LIB_EDITED: &str =
+            "fn alpha() {\n    let x = 1;\n}\n\nfn beta() {\n    alpha();\n    alpha();\n}\n";
+
+        let trees = tempfile::TempDir::new().unwrap();
+        let old_root = trees.path().join("base/proj");
+        let new_root = trees.path().join("work/proj");
+        write_tree(&old_root, &[("src/lib.rs", LIB)]);
+        write_tree(&new_root, &[("src/lib.rs", LIB)]);
+        let s = server_at(diff_loader(old_root, new_root.clone()), new_root.clone());
+
+        let before = json(&s.respond("GET", "/graph.json"));
+        assert_eq!(node(&before, "proj/src/lib.rs/beta")["status"], "same");
+        assert!(json(&s.respond("GET", &format!("/source?id={}", id_of(&before, "proj/src/lib.rs"))))
+            .get("ops")
+            .is_none());
+
+        write_tree(&new_root, &[("src/lib.rs", LIB_EDITED)]);
+        s.rebuild().unwrap();
+
+        let after = json(&s.respond("GET", "/graph.json"));
+        assert_eq!(after["generation"], 2);
+        assert_eq!(after["diff"], before["diff"]);
+        assert_eq!(node(&after, "proj/src/lib.rs/beta")["status"], "modified");
+        assert_eq!(node(&after, "proj/src/lib.rs/alpha")["status"], "same");
+        let source = json(&s.respond("GET", &format!("/source?id={}", id_of(&after, "proj/src/lib.rs"))));
+        assert_eq!(source["generation"], 2);
+        assert_eq!(source["text"], LIB_EDITED);
+        assert_eq!(source["old_text"], LIB);
+        assert!(source["ops"].as_array().is_some_and(|ops| ops.iter().any(|op| op[0] == "+")));
     }
 
     /// `/search` indexes the same diff-aware text `/source` does: a removed
@@ -777,10 +1013,7 @@ mod tests {
         let new_root = trees.path().join("work/proj");
         write_tree(&old_root, &[("src/lib.rs", LIB), ("src/gone.rs", GONE)]);
         write_tree(&new_root, &[("src/lib.rs", LIB_EDITED)]);
-        let old = treesitter_producer::graph_from_path(&old_root).unwrap();
-        let new = treesitter_producer::graph_from_path(&new_root).unwrap();
-        let diff = graph_diff::diff(&old, &old_root, &new, &new_root).unwrap();
-        let s = Server::with_diff(diff, "HEAD~1".into(), "0123abcd".into(), None, new_root, INDEX);
+        let s = server_at(diff_loader(old_root, new_root.clone()), new_root);
 
         let gone = json(&s.respond("GET", "/search?q=content:gone"));
         let texts: Vec<_> =
@@ -792,6 +1025,177 @@ mod tests {
         let texts: Vec<_> =
             edited["hits"].as_array().unwrap().iter().map(|h| h["text"].as_str().unwrap()).collect();
         assert!(texts.iter().any(|t| t.contains("let y = 2;")), "{texts:?}");
+    }
+
+    /// The live-update contract across one real rebuild of a tree-sitter
+    /// tree: a zoom into `src` survives an edit that grows `a.rs`, adds
+    /// `c.rs` and deletes `b.rs`; `/graph.json` carries the id remap from the
+    /// previous generation; a zoom posted for the old generation is refused;
+    /// `/search` sees the new text and stamps the generation; `/status`
+    /// reports the shape the UI polls. Then a failing loader leaves the live
+    /// generation in place and reports the error until the next success.
+    #[test]
+    fn live_rebuild_keeps_zoom_and_remaps_ids() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("proj");
+        write_tree(&root, &[("src/a.rs", "fn a_one() {}\n"), ("src/b.rs", "fn b_one() {}\n")]);
+        let fail = Arc::new(Mutex::new(false));
+        let loader: Loader = {
+            let (fail, root) = (fail.clone(), root.clone());
+            Box::new(move || {
+                if *fail.lock().unwrap() {
+                    anyhow::bail!("indexer exploded");
+                }
+                Ok(Loaded::Graph(treesitter_producer::graph_from_path(&root)?))
+            })
+        };
+        let s = server_at(loader, root.clone());
+
+        let g1 = json(&s.respond("GET", "/graph.json"));
+        assert_eq!(g1["generation"], 1);
+        assert!(g1.get("remap").is_none());
+        let (old_src, old_a, old_b) =
+            (id_of(&g1, "proj/src"), id_of(&g1, "proj/src/a.rs"), id_of(&g1, "proj/src/b.rs"));
+        assert_eq!(s.respond("POST", &format!("/coalesced/zoom-in?id={}&generation=1", id_of(&g1, "proj"))).status, 200);
+        let zoomed = json(&s.respond("POST", &format!("/coalesced/zoom-in?id={old_src}&generation=1")));
+        assert_eq!(zoomed["generation"], 1);
+        assert_eq!(leaf_set(&zoomed), [old_a, old_b].into_iter().collect());
+
+        write_tree(&root, &[("src/a.rs", "fn a_one() {}\nfn a_two() {}\n"), ("src/c.rs", "fn c_one() {}\n")]);
+        std::fs::remove_file(root.join("src/b.rs")).unwrap();
+        s.rebuild().unwrap();
+
+        let g2 = json(&s.respond("GET", "/graph.json"));
+        assert_eq!(g2["generation"], 2);
+        assert_eq!(g2["remap"]["from"], 1);
+        let ids = g2["remap"]["ids"].as_array().unwrap();
+        assert_eq!(ids.len(), g1["nodes"].as_array().unwrap().len());
+        assert_eq!(ids[old_a as usize], id_of(&g2, "proj/src/a.rs"));
+        assert_eq!(ids[old_b as usize], Value::Null);
+        assert_eq!(ids[old_src as usize], id_of(&g2, "proj/src"));
+
+        let view = json(&s.respond("GET", "/coalesced.json"));
+        assert_eq!(view["generation"], 2);
+        assert_eq!(
+            leaf_set(&view),
+            [id_of(&g2, "proj/src/a.rs"), id_of(&g2, "proj/src/c.rs")].into_iter().collect(),
+            "the zoom into src survives with its new file set"
+        );
+
+        let stale = s.respond("POST", &format!("/coalesced/zoom-in?id={old_a}&generation=1"));
+        assert_eq!(stale.status, 409);
+        assert_eq!(json(&stale)["error"], "graph changed (generation 2, request was for 1)");
+        assert_eq!(s.respond("POST", &format!("/coalesced/zoom-in?id={}&generation=2", id_of(&g2, "proj/src/a.rs"))).status, 200);
+
+        let found = json(&s.respond("GET", "/search?q=a_two"));
+        assert_eq!(found["generation"], 2);
+        assert!(found["hits"].as_array().unwrap().iter().any(|h| h["text"] == "fn a_two() {}"));
+
+        assert_eq!(
+            json(&s.respond("GET", "/status")),
+            json!({ "generation": 2, "mode": "static", "dirty": false, "rebuilding": false, "error": null })
+        );
+
+        *fail.lock().unwrap() = true;
+        assert!(s.rebuild().is_err());
+        let status = json(&s.respond("GET", "/status"));
+        assert_eq!(status["generation"], 2);
+        assert_eq!(status["dirty"], true, "a failed rebuild leaves the sources unreflected");
+        assert!(status["error"].as_str().unwrap().contains("indexer exploded"));
+        assert_eq!(json(&s.respond("GET", "/graph.json"))["generation"], 2);
+
+        *fail.lock().unwrap() = false;
+        s.rebuild().unwrap();
+        let status = json(&s.respond("GET", "/status"));
+        assert_eq!((status["generation"].as_u64(), &status["error"]), (Some(3), &Value::Null));
+    }
+
+    /// A client two generations behind asks `/graph.json?from=1` and gets a
+    /// remap composed across both rebuilds: `a.rs` follows its shifting id,
+    /// `b.rs` (deleted in the first rebuild) is null. Asking from the
+    /// previous, the live or an unparsable generation degrades to the cached
+    /// payload or a 400.
+    #[test]
+    fn graph_json_remaps_from_an_older_generation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("proj");
+        write_tree(&root, &[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
+        let loader: Loader = {
+            let root = root.clone();
+            Box::new(move || Ok(Loaded::Graph(treesitter_producer::graph_from_path(&root)?)))
+        };
+        let s = server_at(loader, root.clone());
+        let g1 = json(&s.respond("GET", "/graph.json"));
+        let (a1, b1) = (id_of(&g1, "proj/src/a.rs"), id_of(&g1, "proj/src/b.rs"));
+
+        std::fs::remove_file(root.join("src/b.rs")).unwrap();
+        s.rebuild().unwrap();
+        write_tree(&root, &[("src/0.rs", "fn zero() {}\n")]);
+        s.rebuild().unwrap();
+
+        let g3 = json(&s.respond("GET", "/graph.json?from=1"));
+        assert_eq!(g3["generation"], 3);
+        assert_eq!(g3["remap"]["from"], 1);
+        let ids = g3["remap"]["ids"].as_array().unwrap();
+        assert_eq!(ids.len(), g1["nodes"].as_array().unwrap().len());
+        assert_eq!(ids[a1 as usize], id_of(&g3, "proj/src/a.rs"));
+        assert_eq!(ids[b1 as usize], Value::Null);
+
+        let cached = json(&s.respond("GET", "/graph.json"));
+        assert_eq!(cached["remap"]["from"], 2);
+        assert_eq!(json(&s.respond("GET", "/graph.json?from=2")), cached);
+        assert_eq!(json(&s.respond("GET", "/graph.json?from=3")), cached);
+        assert_eq!(json(&s.respond("GET", "/graph.json?from=0")), cached, "never recorded: the client resets");
+        assert_eq!(s.respond("GET", "/graph.json?from=abc").status, 400);
+    }
+
+    /// The flag routes: `/status` defaults to static, `/watch` switches mode
+    /// (and asks for a rebuild when switching to auto while dirty), the
+    /// watcher's `mark_dirty` shows up, `/reload` shows `rebuilding` until a
+    /// `rebuild()` clears both flags and bumps the generation; plus the
+    /// rejection classes.
+    #[test]
+    fn watch_mode_and_reload_routes() {
+        let s = server();
+        let status = |s: &Server| json(&s.respond("GET", "/status"));
+        assert_eq!(
+            status(&s),
+            json!({ "generation": 1, "mode": "static", "dirty": false, "rebuilding": false, "error": null })
+        );
+
+        let auto = json(&s.respond("POST", "/watch?mode=auto"));
+        assert_eq!(auto["mode"], "auto");
+        assert_eq!(s.mode(), Mode::Auto);
+        assert!(!s.take_request(), "switching to auto while clean requests nothing");
+        assert_eq!(json(&s.respond("POST", "/watch?mode=static"))["mode"], "static");
+
+        s.mark_dirty();
+        assert_eq!(status(&s)["dirty"], true);
+        assert_eq!(json(&s.respond("POST", "/watch?mode=auto"))["dirty"], true);
+        assert!(s.take_request(), "switching to auto while dirty asks the watcher to rebuild");
+        s.respond("POST", "/watch?mode=static");
+
+        let reload = json(&s.respond("POST", "/reload"));
+        assert_eq!((reload["rebuilding"].as_bool(), reload["dirty"].as_bool()), (Some(true), Some(true)));
+        assert!(s.take_request());
+        s.rebuild().unwrap();
+        assert_eq!(
+            status(&s),
+            json!({ "generation": 2, "mode": "static", "dirty": false, "rebuilding": false, "error": null })
+        );
+
+        assert_eq!(s.respond("POST", "/watch?mode=fast").status, 400);
+        assert_eq!(s.respond("POST", "/watch").status, 400);
+        assert_eq!(s.respond("GET", "/watch?mode=auto").status, 405);
+        assert_eq!(s.respond("GET", "/reload").status, 405);
+        assert_eq!(s.respond("POST", "/status").status, 405);
+        assert_eq!(s.respond("POST", "/coalesced/zoom-in?id=0").status, 400);
+        assert_eq!(s.respond("POST", "/coalesced/zoom-in?id=0&generation=x").status, 400);
+        assert_eq!(s.respond("POST", "/coalesced/reset").status, 400);
+    }
+
+    fn leaf_set(view: &Value) -> std::collections::HashSet<u64> {
+        view["leaves"].as_array().unwrap().iter().map(|l| l.as_u64().unwrap()).collect()
     }
 
     fn write_tree(root: &std::path::Path, files: &[(&str, &str)]) {
@@ -821,10 +1225,117 @@ mod tests {
         assert_eq!(module.content_type, JS);
         assert!(!module.body.is_empty());
 
+        let vendored = s.respond("GET", "/ui/vendor/react.js");
+        assert_eq!(vendored.status, 200);
+        assert_eq!(vendored.content_type, JS);
+
+        let grammar = s.respond("GET", "/ui/vendor/hljs/rust");
+        assert_eq!(grammar.status, 200);
+        assert_eq!(grammar.content_type, JS);
+
+        let stylesheet = s.respond("GET", "/ui/vendor/xyflow-react.css");
+        assert_eq!(stylesheet.status, 200);
+        assert_eq!(stylesheet.content_type, CSS);
+
         let missing = s.respond("GET", "/ui/nope.js");
         assert_eq!(missing.status, 404);
+        assert_eq!(s.respond("GET", "/ui/vendor/hljs/cobol").status, 404);
 
         let wrong_method = s.respond("POST", "/ui/app.js");
         assert_eq!(wrong_method.status, 405);
+    }
+
+    /// Every static string a module imports: `from "x"`, `import "x"`,
+    /// `import("x")`, single- or double-quoted. The keyword must sit at a
+    /// token boundary and the string must look like a specifier, because
+    /// minified grammars carry `"import"` in keyword lists and xyflow's hint
+    /// text says `import '@xyflow/${e}/dist/style.css'`.
+    fn module_specifiers(src: &str) -> Vec<String> {
+        let ident = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.' | '"' | '\'' | '`');
+        let spec_char =
+            |c: char| c.is_ascii_alphanumeric() || matches!(c, '@' | '/' | '.' | '_' | '~' | '^' | '?' | '=' | '&' | ':' | '+' | '-');
+        let mut out = Vec::new();
+        for kw in ["from", "import"] {
+            for (at, _) in src.match_indices(kw) {
+                if src[..at].chars().next_back().is_some_and(ident) {
+                    continue;
+                }
+                let mut rest = src[at + kw.len()..].trim_start();
+                if kw == "import" {
+                    if let Some(r) = rest.strip_prefix('(') {
+                        rest = r.trim_start();
+                    }
+                }
+                let Some(quote) = rest.chars().next().filter(|c| matches!(c, '"' | '\'')) else { continue };
+                let Some(spec) = rest[1..].split(quote).next() else { continue };
+                if !spec.is_empty() && spec.chars().all(spec_char) {
+                    out.push(spec.to_string());
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The vendored dependency graph is closed over localhost: the page never
+    /// asks esm.sh for anything, and every import inside a vendored module is
+    /// either a bare name the import map resolves or a `./` sibling in
+    /// `VENDOR`. A tree of esm.sh stubs (whose inner targets are root-relative
+    /// paths nothing in the import map covers) would pass a plain "every
+    /// import-map target is 200" check, which is why this walks the bytes.
+    #[test]
+    fn vendored_modules_form_a_closure_over_the_import_map() {
+        let index = include_str!("../ui/index.html");
+        assert!(!index.contains("esm.sh"), "index.html still references esm.sh");
+
+        let map_json = index
+            .split_once(r#"<script type="importmap">"#)
+            .and_then(|(_, rest)| rest.split_once("</script>"))
+            .map(|(json, _)| json)
+            .expect("index.html has an import map");
+        let map: Value = serde_json::from_str(map_json).unwrap();
+        let imports = map["imports"].as_object().unwrap();
+        let served = |name: &str| VENDOR.iter().any(|(n, _)| *n == name);
+
+        for (key, target) in imports {
+            let target = target.as_str().unwrap();
+            let name = target.strip_prefix("./ui/").unwrap_or_else(|| panic!("{key} -> {target} is not under /ui/"));
+            if key.ends_with('/') {
+                assert!(target.ends_with('/') && VENDOR.iter().any(|(n, _)| n.starts_with(name)), "prefix {key} -> {target} serves nothing");
+            } else {
+                assert!(served(name), "{key} -> {target} is not vendored");
+            }
+        }
+        let stylesheet = index.split("href=\"").skip(1).map(|s| s.split('"').next().unwrap()).find(|h| h.ends_with(".css")).unwrap();
+        assert!(served(stylesheet.strip_prefix("./ui/").unwrap()), "stylesheet {stylesheet} is not vendored");
+
+        let bare_resolves = |spec: &str| {
+            imports.iter().any(|(k, _)| k == spec || (k.ends_with('/') && spec.starts_with(k.as_str())))
+        };
+        // Pins the extractor to the two shapes that matter (a rewritten
+        // sibling and a bare import-map name), so the loop below cannot pass
+        // by finding nothing.
+        let vendored = |name: &str| VENDOR.iter().find(|(n, _)| *n == name).unwrap().1;
+        assert_eq!(module_specifiers(vendored("vendor/react-dom.js")), ["./react.js", "./scheduler.js"]);
+        assert_eq!(module_specifiers(vendored("vendor/xyflow-react.js")), ["react", "react-dom", "react/jsx-runtime"]);
+        for (name, src) in VENDOR {
+            if name.ends_with(".css") {
+                assert!(!src.contains("url(") && !src.contains("@import"), "{name} pulls in other files");
+                continue;
+            }
+            let dir = &name[..name.rfind('/').unwrap()];
+            for spec in module_specifiers(src) {
+                if let Some(rel) = spec.strip_prefix("./") {
+                    assert!(!rel.contains('/') && served(&format!("{dir}/{rel}")), "{name} imports {spec}, not in VENDOR");
+                } else {
+                    assert!(
+                        !spec.starts_with(['/', '.']) && !spec.starts_with("http"),
+                        "{name} imports {spec}, which is not local"
+                    );
+                    assert!(bare_resolves(&spec), "{name} imports {spec}, not in the import map");
+                }
+            }
+        }
     }
 }

@@ -15,10 +15,21 @@ use crate::text_index::SearchResult;
 #[derive(Serialize)]
 pub struct GraphDto {
     pub root: String,
+    pub generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remap: Option<RemapDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<DiffDto>,
     pub nodes: Vec<NodeDto>,
     pub references: Vec<ReferenceDto>,
+}
+
+/// Old id -> new id across one rebuild, indexed by the previous generation's
+/// ids; `null` where an entity has no counterpart.
+#[derive(Serialize)]
+pub struct RemapDto {
+    pub from: u64,
+    pub ids: Vec<Option<usize>>,
 }
 
 #[derive(Serialize)]
@@ -74,6 +85,7 @@ pub struct EdgeDto {
 
 #[derive(Serialize)]
 pub struct CoalescedDto {
+    pub generation: u64,
     pub leaves: Vec<usize>,
     pub edges: Vec<EdgeDto>,
 }
@@ -83,6 +95,7 @@ pub type OpDto = (&'static str, usize, usize, usize, usize);
 
 #[derive(Serialize)]
 pub struct SourceDto {
+    pub generation: u64,
     pub id: usize,
     pub path: String,
     pub text: String,
@@ -99,6 +112,7 @@ pub struct ErrorDto {
 
 #[derive(Serialize)]
 pub struct SearchDto {
+    pub generation: u64,
     pub query: String,
     pub hits: Vec<HitDto>,
     pub more: MoreDto,
@@ -123,8 +137,20 @@ pub struct MoreDto {
     pub content: usize,
 }
 
-pub fn search_dto(r: &SearchResult) -> SearchDto {
+/// `error` is always present (`null` when the last rebuild succeeded) so the
+/// UI can bind to it without an existence check.
+#[derive(Serialize)]
+pub struct StatusDto {
+    pub generation: u64,
+    pub mode: &'static str,
+    pub dirty: bool,
+    pub rebuilding: bool,
+    pub error: Option<String>,
+}
+
+pub fn search_dto(r: &SearchResult, generation: u64) -> SearchDto {
     SearchDto {
+        generation,
         query: r.query.clone(),
         hits: r
             .hits
@@ -253,24 +279,29 @@ impl From<&Reference> for ReferenceDto {
     }
 }
 
-impl From<&EntityGraph> for GraphDto {
-    fn from(graph: &EntityGraph) -> Self {
-        let loc = loc_per_entity(graph);
-        GraphDto {
-            root: root_name(graph).to_string(),
-            diff: None,
-            // The arena index is the id, so iterating in order yields the
-            // dense, id-sorted `nodes` the contract promises.
-            nodes: graph.entities.iter().zip(&loc).map(|(e, &l)| node_dto(e, l)).collect(),
-            references: graph.references.iter().map(ReferenceDto::from).collect(),
-        }
+pub fn graph_dto(graph: &EntityGraph, generation: u64, remap: Option<RemapDto>) -> GraphDto {
+    let loc = loc_per_entity(graph);
+    GraphDto {
+        root: root_name(graph).to_string(),
+        generation,
+        remap,
+        diff: None,
+        // The arena index is the id, so iterating in order yields the
+        // dense, id-sorted `nodes` the contract promises.
+        nodes: graph.entities.iter().zip(&loc).map(|(e, &l)| node_dto(e, l)).collect(),
+        references: graph.references.iter().map(ReferenceDto::from).collect(),
     }
 }
 
 /// The union graph plus the change tags every node and reference carries in
 /// diff mode.
-pub fn graph_dto_with_diff(graph: &EntityGraph, view: &DiffView<'_>) -> GraphDto {
-    let mut dto = GraphDto::from(graph);
+pub fn graph_dto_with_diff(
+    graph: &EntityGraph,
+    view: &DiffView<'_>,
+    generation: u64,
+    remap: Option<RemapDto>,
+) -> GraphDto {
+    let mut dto = graph_dto(graph, generation, remap);
     dto.diff =
         Some(DiffDto { base: view.base.to_string(), base_commit: view.base_commit.to_string() });
     for node in &mut dto.nodes {
@@ -285,8 +316,9 @@ pub fn graph_dto_with_diff(graph: &EntityGraph, view: &DiffView<'_>) -> GraphDto
     dto
 }
 
-pub fn coalesced_dto(c: &Coalesced, reference_status: Option<&[Status]>) -> CoalescedDto {
+pub fn coalesced_dto(c: &Coalesced, reference_status: Option<&[Status]>, generation: u64) -> CoalescedDto {
     CoalescedDto {
+        generation,
         leaves: c.leaves.iter().map(|id| id.0).collect(),
         edges: c.edges.iter().map(|e| edge_dto(e, reference_status)).collect(),
     }
@@ -356,7 +388,7 @@ mod tests {
             g.entities[id].is_test = true;
         }
 
-        let dto = GraphDto::from(&g);
+        let dto = graph_dto(&g, 1, None);
         let by_name = |n: &str| dto.nodes.iter().find(|x| x.name == n).unwrap();
         assert_eq!((by_name("lib.rs").loc, by_name("lib.rs").test_loc), (20, 10));
         assert_eq!((by_name("it.rs").loc, by_name("it.rs").test_loc), (10, 10));

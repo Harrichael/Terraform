@@ -35,6 +35,7 @@ export function Search({ graph, showTests, hiddenIds, onPick }) {
   const inputRef = useRef(null);
   const listRef = useRef(null);
   const reqRef = useRef(0);
+  const graphRef = useRef(graph); graphRef.current = graph;
 
   useEffect(() => {
     const onKey = (e) => {
@@ -47,18 +48,21 @@ export function Search({ graph, showTests, hiddenIds, onPick }) {
 
   // Debounced, request-id-guarded fetch. The previous result is left in state
   // until a newer request resolves, so the list never flickers to "no match"
-  // while a query is in flight.
+  // while a query is in flight. A result from another generation than the
+  // graph's is dropped too: ids are dense, so its hits would name other
+  // entities, which isHidden cannot tell apart.
   useEffect(() => {
     const needle = q.trim();
     const id = ++reqRef.current;
     if (!needle) { setResult({ hits: [], more: {}, error: null }); return; }
     const t = setTimeout(() => {
       fetchJson(`./search?q=${encodeURIComponent(needle)}`)
-        .then((res) => { if (reqRef.current === id) setResult({ hits: res.hits, more: res.more, error: null }); })
+        .then((res) => { if (reqRef.current === id && res.generation === graphRef.current?.generation) setResult({ hits: res.hits, more: res.more, error: null }); })
         .catch((e) => { if (reqRef.current === id) setResult({ hits: [], more: {}, error: e.message }); });
     }, DEBOUNCE_MS);
     return () => clearTimeout(t);
-  }, [q]);
+    // Re-run on a new generation: the listed hits carry ids from the old one.
+  }, [q, graph?.generation]);
 
   const rows = useMemo(
     () => (graph ? result.hits.filter((h) => !isHidden(graph, h.id, hiddenIds, showTests)) : []),

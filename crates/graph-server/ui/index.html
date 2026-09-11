@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Entity graph</title>
-<link rel="stylesheet" href="https://esm.sh/@xyflow/react@12.11.6/dist/style.css">
+<link rel="stylesheet" href="./ui/vendor/xyflow-react.css">
 <style>
   :root {
     --bg: #f4f5f7; --panel: #ffffff; --line: #d9dce1; --text: #1f2328; --muted: #6b7280;
@@ -182,17 +182,23 @@
   .search-row .where { color: var(--muted); font-size: 11px; flex: none; }
   .search-row .text { font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre; overflow: hidden; text-overflow: ellipsis; }
   .search-list { width: 560px; }
+
+  /* --- live updates --- */
+  .live-note { color: var(--muted); font-size: 12px; }
+  .live-err { color: var(--error); font-size: 12px; max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 </style>
 <script type="importmap">
 {
   "imports": {
-    "react": "https://esm.sh/react@18.3.1",
-    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?deps=react@18.3.1",
-    "@xyflow/react": "https://esm.sh/@xyflow/react@12.11.6?deps=react@18.3.1,react-dom@18.3.1",
-    "@dagrejs/dagre": "https://esm.sh/@dagrejs/dagre@1.1.8",
-    "htm": "https://esm.sh/htm@3.1.1",
-    "highlight.js/lib/core": "https://esm.sh/highlight.js@11.11.1/lib/core",
-    "highlight.js/lib/languages/": "https://esm.sh/highlight.js@11.11.1/lib/languages/"
+    "react": "./ui/vendor/react.js",
+    "react/jsx-runtime": "./ui/vendor/react-jsx-runtime.js",
+    "react-dom": "./ui/vendor/react-dom.js",
+    "react-dom/client": "./ui/vendor/react-dom-client.js",
+    "@xyflow/react": "./ui/vendor/xyflow-react.js",
+    "@dagrejs/dagre": "./ui/vendor/dagre.js",
+    "htm": "./ui/vendor/htm.js",
+    "highlight.js/lib/core": "./ui/vendor/hljs-core.js",
+    "highlight.js/lib/languages/": "./ui/vendor/hljs/"
   }
 }
 </script>

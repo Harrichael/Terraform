@@ -57,15 +57,35 @@ function App() {
   const [status, setStatus] = useState('');
   const [panelError, setPanelError] = useState('');
   const [busy, setBusy] = useState(false);
+  // The server's /status payload: which generation it serves, whether it is
+  // watching, whether a rebuild is due or running, and the last failure.
+  const [live, setLive] = useState(null);
 
+  // graph.json and coalesced.json are two requests, and a rebuild can land
+  // between them; a pair that disagrees on generation is refetched, never shown.
+  const fetchPair = async (from) => {
+    for (let i = 0; i < 3; i++) {
+      const g = await fetchJson(from == null ? './graph.json' : `./graph.json?from=${from}`);
+      const co = await fetchJson('./coalesced.json');
+      if (g.generation === co.generation) return { g, co };
+    }
+    throw new Error('graph kept changing while loading');
+  };
+  const sameStatus = (a, b) => !!a && ['generation', 'mode', 'dirty', 'rebuilding', 'error'].every((k) => a[k] === b[k]);
   useEffect(() => {
-    fetchJson('./graph.json').then(setGraph).catch((e) => setStatus(`graph.json: ${e.message}`));
-    fetchJson('./coalesced.json').then(setCoalesced).catch((e) => setStatus(`coalesced.json: ${e.message}`));
+    fetchPair().then(({ g, co }) => { setGraph(g); setCoalesced(co); }).catch((e) => setStatus(`load: ${e.message}`));
+    const poll = () => fetchJson('./status').then((s) => setLive((prev) => (sameStatus(prev, s) ? prev : s))).catch(() => {});
+    poll();
+    const t = setInterval(poll, 1500);
+    return () => clearInterval(t);
   }, []);
 
   const isDiff = !!graph?.diff;
+  // A coalesced payload from another generation must never reach buildModel:
+  // its edges index graph.nodes and graph.references unguarded.
   const model = useMemo(
-    () => (graph ? buildModel(graph, coalesced, view, dir, onePerPair, { byChange, changesOnly, hideTests: !showTests, bundling, scopeId, hiddenIds }) : null),
+    () => (graph && coalesced && coalesced.generation === graph.generation
+      ? buildModel(graph, coalesced, view, dir, onePerPair, { byChange, changesOnly, hideTests: !showTests, bundling, scopeId, hiddenIds }) : null),
     [graph, coalesced, view, dir, onePerPair, byChange, changesOnly, showTests, bundling, scopeId, hiddenIds],
   );
 
@@ -76,6 +96,8 @@ function App() {
   // animation frames never fire (background tab), so nothing is left midway.
   const nodesRef = useRef(nodes); nodesRef.current = nodes;
   const edgesRef = useRef(edges); edgesRef.current = edges;
+  const graphRef = useRef(graph); graphRef.current = graph;
+  const selRef = useRef(sel); selRef.current = sel;
   const focusRef = useRef(null);
   // Set by zoom, collapse and bundle actions: the next layout keeps every
   // existing node where it is instead of starting over.
@@ -151,10 +173,13 @@ function App() {
     setPanelError('');
     const keep = keepPlacesRef.current;
     keepPlacesRef.current = false;
-    let laid = keep && view === 'coalesced' && nodesRef.current.length
-      ? incrementalLayout(nodesRef.current, edgesRef.current, model.nodes, model.rankEdges, model.edges, dir)
-      : null;
+    const tried = keep && view === 'coalesced' && nodesRef.current.length > 0;
+    let laid = tried ? incrementalLayout(nodesRef.current, edgesRef.current, model.nodes, model.rankEdges, model.edges, dir) : null;
     if (!laid) {
+      // Places were asked for but a node has none to inherit (a fresh box
+      // after a rebuild): a frozen camera would then watch a full re-layout
+      // move the graph out from under it, so refit instead.
+      if (tried && focusRef.current === STAY) focusRef.current = null;
       const full = layout(model.nodes, model.rankEdges, dir);
       laid = { nodes: full.nodes, edges: withRouting(model.edges, full.routed) };
     }
@@ -185,12 +210,20 @@ function App() {
   const loadingRef = useRef(new Set());
   const loadSource = useCallback((fileId) => {
     if (sources.has(fileId) || loadingRef.current.has(fileId)) return;
-    loadingRef.current.add(fileId);
+    // A rebuild replaces loadingRef wholesale; this request keeps bookkeeping
+    // on the set it joined so it cannot free a slot in the new one.
+    const inflight = loadingRef.current, gen = graphRef.current?.generation;
+    inflight.add(fileId);
+    // Ids are dense, so a response from another generation is some other
+    // file's text under this id; it is dropped rather than cached.
     fetchJson(`./source?id=${fileId}`)
-      .then((src) => setSources((m) => new Map(m).set(fileId, src)))
-      .catch((e) => setSources((m) => new Map(m).set(fileId, { error: e.message })))
-      .finally(() => loadingRef.current.delete(fileId));
+      .then((src) => { if (src.generation === graphRef.current?.generation) setSources((m) => new Map(m).set(fileId, src)); })
+      .catch((e) => { if (gen === graphRef.current?.generation) setSources((m) => new Map(m).set(fileId, { error: e.message })); })
+      .finally(() => inflight.delete(fileId));
   }, [sources]);
+  // Nothing else re-fetches the open file after a rebuild: its text went with
+  // the old `sources`, and the selection may not change to trigger openCode.
+  useEffect(() => { if (code) loadSource(code.fileId); }, [graph?.generation]);
   // The right pane is two tabs. Opening code from the inspector (a site or
   // definition link) is a request to read it, so the Code tab comes forward;
   // selecting a node only refreshes what the Code tab would show and leaves
@@ -328,14 +361,76 @@ function App() {
   const onEdgeClick = useCallback((_, e) => { if (e.data.ref) { setSel({ type: 'edge', id: e.id }); setPanelError(''); } }, []);
   const onPaneClick = useCallback(() => setSel(null), []);
 
+  // Move to the generation the server now serves. Everything keyed by entity
+  // id is translated through the remap graph.json carries for our generation;
+  // with no usable remap (a restarted server, or more missed generations
+  // than it remembers) it all resets.
+  // State is read through updaters and refs, not this closure: a 409 from a
+  // click that raced the rebuild can call this from a stale render.
+  const syncingRef = useRef(false);
+  const syncGeneration = async () => {
+    if (syncingRef.current) return;
+    syncingRef.current = true;
+    try {
+      const { g: next, co } = await fetchPair(graphRef.current?.generation);
+      const old = graphRef.current;
+      if (old && next.generation === old.generation) return;
+      const remap = old && next.remap && next.remap.from === old.generation ? next.remap.ids : null;
+      const mapId = (id) => (remap ? remap[id] ?? null : null);
+      // The ids being translated are old ids, so only the old graph knows
+      // their ancestry.
+      const coarse = (id) => { for (let c = id; c != null; c = old.nodes[c]?.parent) { const m = mapId(c); if (m != null) return m; } return null; };
+      const rfMap = (rf) => { const box = rf.startsWith('c'); const m = mapId(Number(box ? rf.slice(1) : rf)); return m == null ? null : box ? `c${m}` : String(m); };
+
+      // Bundling and hiding are about one box; if it is gone there is nothing
+      // to bundle or hide, and coarsening a hidden function to its file would
+      // hide code the user never asked to hide. Only the scope coarsens.
+      setBundling((prev) => { const m = new Map(); for (const [id, lv] of prev) { const t = mapId(id); if (t != null) m.set(t, lv); } return m; });
+      setHiddenIds((prev) => new Set([...prev].map(mapId).filter((x) => x != null)));
+      setScopeId((s) => (s == null ? null : coarse(s)));
+      setOpenPopoverId((p) => (p == null ? null : mapId(p)));
+      setCode((c) => { if (!c) return null; const f = mapId(c.fileId); return f == null ? null : { ...c, fileId: f }; });
+      setSources(new Map());
+      loadingRef.current = new Set();
+      pendingLineRef.current = null;
+      // The selection is re-applied once the new nodes are drawn, not now:
+      // until then `nodes` still holds the old ids, and the liveness effect
+      // would either drop the new id or accept it as some other old node.
+      const selRf = selRef.current?.type === 'node' ? rfMap(selRef.current.id) : null;
+      pendingSelectRef.current = selRf ? [selRf, selRf.startsWith('c') ? selRf.slice(1) : `c${selRf}`] : null;
+      setSel(null);
+      // Nearly every id shifts when an entity is inserted, so the drawn nodes
+      // are renamed in place before the layout runs; otherwise every survivor
+      // would count as fresh and the incremental layout would give up.
+      setNodes((ns) => ns.flatMap((n) => {
+        const id = rfMap(n.id), parentId = n.parentId == null ? n.parentId : rfMap(n.parentId);
+        return id == null || (n.parentId != null && parentId == null) ? [] : [{ ...n, id, parentId }];
+      }));
+      setEdges((es) => es.flatMap((e) => {
+        const s = rfMap(e.source), t = rfMap(e.target);
+        return s == null || t == null ? [] : [{ ...e, id: e.id.replace(/^([rc])-c?\d+-c?\d+/, `$1-${s}-${t}`), source: s, target: t }];
+      }));
+      keepPlacesRef.current = !!remap;
+      focusRef.current = remap ? STAY : null;
+      setGraph(next); setCoalesced(co);
+    } catch (e) {
+      setStatus(`sync: ${e.message}`);
+    } finally { syncingRef.current = false; }
+  };
+  useEffect(() => { if (live && graph && live.generation !== graph.generation) syncGeneration(); }, [live, graph]);
+  const postStatus = (url) => fetchJson(url, { method: 'POST' }).then(setLive).catch((e) => setStatus(`POST ${url}: ${e.message}`));
+
   const post = async (path) => {
     setBusy(true); setPanelError(''); setStatus('');
     try {
-      const co = await fetchJson(path, { method: 'POST' });
+      const url = `${path}${path.includes('?') ? '&' : '?'}generation=${graphRef.current.generation}`;
+      const co = await fetchJson(url, { method: 'POST' });
+      if (co.generation !== graphRef.current.generation) { syncGeneration(); return null; }
       setCoalesced(co);
       return co;
     } catch (e) {
-      if (e.status === 409) setPanelError(e.message);
+      if (e.status === 409 && e.message.startsWith('graph changed')) syncGeneration();
+      else if (e.status === 409) setPanelError(e.message);
       else setStatus(`POST ${path}: ${e.message}`);
       return null;
     } finally { setBusy(false); }
@@ -442,6 +537,9 @@ function App() {
   }, [coalesced, scopeId]);
 
   const nameOf = (id) => graph?.nodes[id]?.name ?? `#${id}`;
+  // The inspector's expanded set is keyed by entity id; a new generation
+  // remounts it rather than translating it.
+  const inspectorKey = graph?.generation;
 
   return html`<div class="app">
     <div class="toolbar">
@@ -462,6 +560,13 @@ function App() {
       ${hiddenIds.size > 0 && html`<span>${hiddenIds.size} hidden · <button class="btn" onClick=${showAllHidden}>show all</button></span>`}
       <label class="chk" title=${'Keep only the strongest kind between a pair: ' + PRECEDENCE.join(' > ')}><input type="checkbox" checked=${onePerPair} onChange=${(e) => toggleOnePerPair(e.target.checked)} /> one edge per pair</label>
       <label class="chk" title="Test code: #[test] / #[cfg(test)] items, tests/ folders, *_test and *.spec files, and everything inside them. Unchecked hides them and the references they make."><input type="checkbox" checked=${showTests} onChange=${(e) => { focusRef.current = null; setShowTests(e.target.checked); }} /> tests${model?.hiddenTests ? ` (${model.hiddenTests} hidden)` : ''}</label>
+      ${live && html`<div class="seg" title="Static: the graph stays as loaded until Reload. Auto: source changes re-index and update the graph in place.">
+          <button class=${live.mode === 'static' ? 'on' : ''} onClick=${() => postStatus('./watch?mode=static')}>Static</button>
+          <button class=${live.mode === 'auto' ? 'on' : ''} onClick=${() => postStatus('./watch?mode=auto')}>Auto</button>
+        </div>
+        ${live.rebuilding ? html`<span class="live-note">Re-indexing…</span>` : html`
+          ${live.dirty && html`<button class="btn" title="sources changed since this graph was loaded" onClick=${() => postStatus('./reload')}>Reload</button>`}
+          ${live.error && html`<span class="live-err" title=${live.error}>${live.error}</span>`}`}`}
       ${isDiff && html`<div class="sep"></div>
         <span title=${graph.diff.base_commit}><b>diff</b> ${graph.diff.base} → working tree</span>
         <label class="chk"><input type="checkbox" checked=${byChange} onChange=${(e) => { focusRef.current = null; setByChange(e.target.checked); }} /> colour edges by change</label>
@@ -498,7 +603,7 @@ function App() {
           <button class=${tab === 'code' ? 'on' : ''} disabled=${!code} title=${code ? (sources.get(code.fileId)?.path || '') : 'Select a node inside a file to open its code'} onClick=${() => setTab('code')}>Code${code && sources.get(code.fileId)?.path ? html` <span class="tab-file">${sources.get(code.fileId).path.split('/').pop()}</span>` : ''}</button>
         </div>
         <div class="panel-top" hidden=${tab !== 'inspect'}>
-        <${Inspector}
+        <${Inspector} key=${inspectorKey}
           graph=${graph} nodes=${nodes} edges=${edges} view=${view} coalesced=${coalesced}
           sel=${sel} setSelectedId=${setSelectedId} showTests=${showTests} byChange=${byChange} isDiff=${isDiff}
           panelError=${panelError} openCode=${openCode} sideOf=${sideOf} fileOf=${fileOf} isUnder=${isUnder}
